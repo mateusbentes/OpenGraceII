@@ -10,11 +10,13 @@ code.
 
 ## Status
 
-The repository is at the start of its life. Milestone 1 (the Rust skeleton)
-is done: the Cargo workspace builds, the module layout is in place, the
-toolchain is pinned (rust-toolchain.toml), and the validation matrix runs
-(`cargo build`, `cargo test`, including the docs-structure rules ported
-from OpenGrace). The running record is docs/implementation-status.md.
+Milestone 1 (the Rust skeleton) is done: the Cargo workspace builds, the
+module layout is in place, the toolchain is pinned (rust-toolchain.toml),
+and the validation matrix runs. Milestone 2 (the render contract and the
+first backend) is done: the API-neutral render contract, the deterministic
+null backend and the Vulkan backend (the engine's own loader, no third-
+party Vulkan binding), validated on Linux with lavapipe; the Android
+hardware run follows. The running record is docs/implementation-status.md.
 
 ## The lessons from OpenGrace
 

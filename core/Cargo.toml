@@ -6,3 +6,17 @@ license.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+default = []
+vulkan = ["dep:libc"]
+
+[dependencies]
+# The Vulkan backend dlopen()s the platform's libvulkan.so.1 and resolves
+# vkGetInstanceProcAddr itself; libc is only the dlopen/dlsym surface, and
+# the engine never calls into a third-party Vulkan binding (lesson 3).
+libc = { version = "0.2", optional = true }
+
+[[example]]
+name = "vk_smoke"
+required-features = ["vulkan"]

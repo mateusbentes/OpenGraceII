@@ -10,3 +10,7 @@ og2-core = { path = "../core" }
 [[test]]
 name = "docs"
 path = "tests/docs.rs"
+
+[[test]]
+name = "render"
+path = "tests/render.rs"

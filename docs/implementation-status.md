@@ -14,7 +14,7 @@ The `.docx` files in this directory are generated from the `.md` sources with
 | # | Scope | Status |
 | --- | --- | --- |
 | 1 | Rust skeleton: Cargo workspace, module layout, the validation matrix (build, test, docs checks), the pinned toolchain | Done |
-| 2 | Render contract and the first backend: Vulkan on Linux (lavapipe) and on Android hardware | Planned |
+| 2 | Render contract and the first backend: Vulkan on Linux (lavapipe); the Android hardware run follows | Done |
 | 3 | The remaining backends: OpenGL (Windows/Linux), Metal (macOS/iOS), Direct3D 12 (Windows) | Planned |
 | 4 | Render foundation: math, mesh, shader, material | Planned |
 | 5 | Forward lighting: light types, shadow mapping | Planned |
@@ -69,10 +69,25 @@ cargo test
 ## Validation record
 
 Milestone 1 (Rust skeleton), Linux x86_64, Rust 1.100.0:
-
 - `cargo build`: the workspace builds, 2 crates, no warnings.
 - `cargo test`: 13 tests passed — 10 math tests and 3 docs-rule suites
   (a sound document, the eight fixtures, and the real document).
+
+Milestone 2 (render contract + the Vulkan backend), Linux x86_64, Rust
+1.100.0, lavapipe (software Vulkan):
+- `cargo build --features vulkan`: the workspace builds, no warnings.
+- `cargo test`: 10 tests passed — 3 docs-rule suites and 7 render tests
+  (the null backend's contract checks and the Vulkan smoke test).
+- The Vulkan smoke test renders the diagnostic triangle on lavapipe, reads
+  the centre pixel back and validates the clear colour, the clear depth and
+  the clear stencil values.
+- The first hardware run on Intel Iris Xe (Linux) caught a spec violation
+  the software rasterizer tolerates: a Depth|Stencil aspect mask in
+  vkCmdCopyImageToBuffer (VUID 09103). The readback now copies the depth
+  and stencil aspects in separate regions, and the Khronos validation
+  layer reports zero violations on the smoke run.
+- The Android hardware run stays open (the same milestone's validation on
+  a device follows).
 
 ---
 

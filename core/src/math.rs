@@ -234,10 +234,14 @@ impl Neg for Vec4 {
     }
 }
 
-/// A 4x4 matrix in row-major order, matching the engine's memory layout.
+/// A 4x4 matrix in the engine's memory layout: `m[c][r]` is the element
+/// at column c, row r, so the flat memory can be handed to the graphics
+/// APIs' uniform blocks as-is (the same `cols[c][r]` the engine's
+/// column-major convention follows).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Mat4 {
-    /// Row-major elements: `m[row][col]`.
+    /// Column-major elements: `m[c][r]` is the element at column c,
+    /// row r.
     pub m: [[f32; 4]; 4],
 }
 
@@ -251,28 +255,71 @@ impl Mat4 {
         ],
     };
 
+    /// Matrix product: `(a * b)(c, r) = sum_k a(k, r) * b(c, k)`.
     pub fn multiply(self, other: Mat4) -> Mat4 {
         let mut out = Mat4 { m: [[0.0; 4]; 4] };
-        for row in 0..4 {
-            for col in 0..4 {
+        for c in 0..4 {
+            for r in 0..4 {
                 let mut sum = 0.0;
                 for k in 0..4 {
-                    sum += self.m[row][k] * other.m[k][col];
+                    sum += self.m[k][r] * other.m[c][k];
                 }
-                out.m[row][col] = sum;
+                out.m[c][r] = sum;
             }
         }
         out
     }
 
-    /// Transform a point (w = 1).
+    /// Matrix-vector product treating v as a column vector.
     pub fn transform_point(self, p: Vec3) -> Vec3 {
         let m = &self.m;
         Vec3::new(
-            m[0][0] * p.x + m[0][1] * p.y + m[0][2] * p.z + m[0][3],
-            m[1][0] * p.x + m[1][1] * p.y + m[1][2] * p.z + m[1][3],
-            m[2][0] * p.x + m[2][1] * p.y + m[2][2] * p.z + m[2][3],
+            m[0][0] * p.x + m[1][0] * p.y + m[2][0] * p.z + m[3][0],
+            m[0][1] * p.x + m[1][1] * p.y + m[2][1] * p.z + m[3][1],
+            m[0][2] * p.x + m[1][2] * p.y + m[2][2] * p.z + m[3][2],
         )
+    }
+
+    /// Right-handed view matrix ("look at"): the camera sits at eye and
+    /// looks at target, with up as the approximate up direction. Maps
+    /// world space to view space where the camera looks down -Z. A point
+    /// at target ends up at view coordinates (0, 0, -distance, 1).
+    pub fn look_at(eye: Vec3, target: Vec3, up: Vec3) -> Mat4 {
+        let forward = (target - eye).normalised();
+        let right_raw = forward.cross(up);
+        let right = right_raw.normalised();
+        let real_up = right.cross(forward);
+        let mut m = Mat4::IDENTITY;
+        m.m[0][0] = right.x;
+        m.m[1][0] = right.y;
+        m.m[2][0] = right.z;
+        m.m[0][1] = real_up.x;
+        m.m[1][1] = real_up.y;
+        m.m[2][1] = real_up.z;
+        m.m[0][2] = -forward.x;
+        m.m[1][2] = -forward.y;
+        m.m[2][2] = -forward.z;
+        m.m[3][0] = -right.dot(eye);
+        m.m[3][1] = -real_up.dot(eye);
+        m.m[3][2] = forward.dot(eye);
+        m
+    }
+
+    /// Perspective projection matrix in the OpenGL clip convention: after
+    /// the perspective divide, x/y are in [-1, 1] and z (depth) is in
+    /// [-1, 1], with -1 at the near plane and +1 at the far plane.
+    /// `fov_y` is the vertical field of view in radians; `aspect` is
+    /// width / height; `near` and `far` are positive distances from the
+    /// eye with `near < far`.
+    pub fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
+        let f = 1.0 / (fov_y * 0.5).tan();
+        let mut m = Mat4 { m: [[0.0; 4]; 4] };
+        m.m[0][0] = f / aspect;
+        m.m[1][1] = f;
+        m.m[2][2] = (far + near) / (near - far);
+        m.m[3][2] = (2.0 * far * near) / (near - far);
+        m.m[2][3] = -1.0;
+        m
     }
 }
 
@@ -379,9 +426,9 @@ mod tests {
     #[test]
     fn mat4_translation() {
         let mut t = Mat4::IDENTITY;
-        t.m[0][3] = 10.0;
-        t.m[1][3] = 20.0;
-        t.m[2][3] = 30.0;
+        t.m[3][0] = 10.0;
+        t.m[3][1] = 20.0;
+        t.m[3][2] = 30.0;
         let p = Vec3::new(1.0, 1.0, 1.0);
         assert_eq!(t.transform_point(p), Vec3::new(11.0, 21.0, 31.0));
     }

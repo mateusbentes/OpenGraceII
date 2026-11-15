@@ -1,0 +1,12 @@
+[package]
+name = "og2-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+og2-core = { path = "../core" }
+
+[[test]]
+name = "docs"
+path = "tests/docs.rs"

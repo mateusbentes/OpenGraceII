@@ -10,10 +10,11 @@ code.
 
 ## Status
 
-The repository is at the start of its life. There is no engine code yet.
-The first milestone will be the architecture document, then the build
-system and the graphics layer. This README records the intent so the
-project does not lose its bearings while it grows.
+The repository is at the start of its life. Milestone 1 (the Rust skeleton)
+is done: the Cargo workspace builds, the module layout is in place, the
+toolchain is pinned (rust-toolchain.toml), and the validation matrix runs
+(`cargo build`, `cargo test`, including the docs-structure rules ported
+from OpenGrace). The running record is docs/implementation-status.md.
 
 ## The lessons from OpenGrace
 

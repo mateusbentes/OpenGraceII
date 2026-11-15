@@ -1,0 +1,5 @@
+# OpenGraceII pins the Rust toolchain so every machine reproduces the same
+# validation (lesson 5). Bump it explicitly, never implicitly.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"

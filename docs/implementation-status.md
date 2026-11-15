@@ -13,7 +13,7 @@ The `.docx` files in this directory are generated from the `.md` sources with
 
 | # | Scope | Status |
 | --- | --- | --- |
-| 1 | Rust skeleton: Cargo workspace, module layout, the validation matrix (build, test, docs checks), the pinned toolchain | Planned |
+| 1 | Rust skeleton: Cargo workspace, module layout, the validation matrix (build, test, docs checks), the pinned toolchain | Done |
 | 2 | Render contract and the first backend: Vulkan on Linux (lavapipe) and on Android hardware | Planned |
 | 3 | The remaining backends: OpenGL (Windows/Linux), Metal (macOS/iOS), Direct3D 12 (Windows) | Planned |
 | 4 | Render foundation: math, mesh, shader, material | Planned |
@@ -41,30 +41,38 @@ The `.docx` files in this directory are generated from the `.md` sources with
 
 ## Open decisions
 
-Carried from the architecture document's open decisions; each becomes a
-decision record when its milestone is specified:
+1. **Which graphics backend first?** The draft plans Vulkan first, because
+   lesson 4 demands hardware validation from the first render milestone.
+   The answer is decided by milestone 2, which implements it.
+2. **The shader toolchain.** Vulkan needs SPIR-V; the decision is a
+   build-time dependency rule, not a runtime middleware.
+3. **The scripting language.** The engine's own language and VM is a project
+   of its own.
+4. **The physics extra.** The classical layer and the extra layer are both
+   the engine's own implementation.
+5. **The editor and the network tools.** Part of the engine's own scope,
+   not a deferred scope.
+6. **SquareLine Studio.** The port is deferred until the engine's own editor
+   is far enough.
 
-- **Which graphics backend first?** The draft plans Vulkan first, because
-  lesson 4 demands hardware validation from the first render milestone.
-- **The shader toolchain.** Vulkan needs SPIR-V; the decision is a
-  build-time dependency rule, not a runtime middleware.
-- **The scripting language.** The engine's own language and VM is a project
-  of its own.
-- **The physics extra.** The classical layer and the extra layer are both
-  the engine's own implementation.
-- **The editor and the network tools.** Part of the engine's own scope,
-  not a deferred scope.
-- **SquareLine Studio.** The port is deferred until the engine's own editor
-  is far enough.
+---
+
+## Verification commands
+
+```sh
+cargo build
+cargo test
+```
 
 ---
 
 ## Validation record
 
-Empty until the first milestone lands. The record follows the same rule as
-OpenGrace: every milestone row records the suites that ran, the counts they
-measured, and the hardware that produced them, so the reader can tell what
-was proven from what was planned.
+Milestone 1 (Rust skeleton), Linux x86_64, Rust 1.100.0:
+
+- `cargo build`: the workspace builds, 2 crates, no warnings.
+- `cargo test`: 13 tests passed — 10 math tests and 3 docs-rule suites
+  (a sound document, the eight fixtures, and the real document).
 
 ---
 

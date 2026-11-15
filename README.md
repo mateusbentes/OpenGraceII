@@ -1,8 +1,8 @@
 # OpenGraceII
 
-An independent, memory-safe engine written in Rust, shaped by the lessons
-of OpenGrace — the source-only reimplementation of the GRACE 2 engine
-architecture (github.com/mateusbentes/OpenGrace).
+An independent engine written in Rust, shaped by the lessons of OpenGrace —
+the source-only reimplementation of the GRACE 2 engine architecture
+(github.com/mateusbentes/OpenGrace).
 
 OpenGraceII is not a port of OpenGrace: the code is new, and it starts
 from the lessons that the OpenGrace project recorded instead of from its
@@ -11,9 +11,9 @@ code.
 ## Status
 
 The repository is at the start of its life. There is no engine code yet.
-The first milestones will define the architecture, the build system and
-the graphics layer. This README records the intent so the project does
-not lose its bearings while it grows.
+The first milestone will be the architecture document, then the build
+system and the graphics layer. This README records the intent so the
+project does not lose its bearings while it grows.
 
 ## The lessons from OpenGrace
 
@@ -23,39 +23,45 @@ macOS and Android. It worked, and its hardware run found ten real defects
 that the desktop validation never surfaced. The lessons that shape
 OpenGraceII:
 
-1. **Minimal middlewares — preferably none.** Every middleware adds a
-   dependency, a build system and a licence surface. OpenGraceII keeps
-   the middlewares to the minimum the design actually requires.
-2. **No proprietary middlewares.** Proprietary middleware blocks the
-    licence and the reproducibility of the whole engine. OpenGraceII is
-    Apache-2.0 and depends on nothing proprietary. Platform graphics
-    APIs (Vulkan, Metal, Direct3D) are not middlewares: they are the
-    OS's own interfaces, and OpenGraceII reaches them through wgpu's
-    public backend abstraction instead of linking a vendor SDK.
-3. **Memory-safe languages at the boundary.** OpenGrace's most subtle
-   defects came from the hand-written binding layers (a loader with a
-   wrong entry point signature, a command buffer that was ended twice,
-   and state machine errors that only one hardware driver surfaced).
-   OpenGraceII is written in Rust, so the memory safety of the boundary
-   is enforced by the language instead of by audit.
+1. **Fewer middlewares, preferably none.** Every pinned submodule is a
+   build system, a version pin, a licence and a patch queue to maintain
+   for the life of the project. OpenGraceII implements each subsystem in
+   the engine's own code and treats each middleware as a cost first.
+2. **No proprietary middlewares.** Proprietary middleware can disappear
+   from distribution, change its licence, or stop building, and the
+   project cannot fix any of that. OpenGraceII is Apache-2.0 and depends
+   on nothing proprietary. Platform graphics APIs (Vulkan, Metal, Direct3D
+   12, OpenGL) are not middlewares: they are the operating systems' own
+   interfaces, and OpenGraceII reaches them through the engine's own
+   loaders.
+3. **A memory-safe language.** OpenGrace's most subtle defects came from
+   its hand-written binding layers (a loader with a wrong entry point
+   signature, a command buffer that was ended twice, a swapchain
+   recreated with a stale extent). OpenGraceII is written in Rust, so the
+   memory safety of the boundary is enforced by the language instead of
+   by audit.
 4. **Hardware runs are the only honest validation.** A clean compile and
    a software renderer's pass do not prove the engine works on a phone's
    driver. OpenGraceII plans the hardware validation from the first
-   milestone instead of bolting it on at the end.
-5. **Pinned environments.** OpenGrace's reproducibility came from a
-   pinned toolchain (NDK r27c, SDL2 2.30.12, GCC 13.3.0). OpenGraceII
-   pins its toolchain the same way from the start.
+   render milestone instead of bolting it on at the end.
+5. **Pin the environment, not the machine.** OpenGraceII pins its
+   toolchain from the first milestone, so every machine reproduces the
+   same validation.
 
-## Planned platforms
+## Platforms
 
-Linux x86_64, Windows x86_64, macOS arm64, iOS arm64 and Android
-arm64-v8a, with the graphics layer planned through wgpu. The
-first-class backends are Vulkan (Linux, Android), Metal (macOS, iOS)
-and Direct3D 12 (Windows, where it is the most reliable native path
-through wgpu). OpenGL is not a target: it is kept only as a fallback
-validation backend on Linux for machines without Vulkan, matching the
-minimal-middlewares philosophy — no GL-specific features are designed
-around it.
+| Platform | Graphics APIs |
+| --- | --- |
+| Windows x86_64 | OpenGL, Vulkan, Direct3D 12 |
+| Linux x86_64 | OpenGL, Vulkan |
+| macOS arm64 | Metal |
+| iOS arm64 | Metal |
+| Android arm64-v8a | Vulkan |
+
+Direct3D 12 is the Windows platform API (not a middleware): on Windows it
+is the most reliable native path. The backends are the engine's own code
+in Rust, not a middleware abstraction — the same approach OpenGrace took
+with its own loaders.
 
 ## Planned scope
 
@@ -63,22 +69,37 @@ OpenGraceII is planned as a full engine in the spirit of GRACE 2, not
 only a renderer. Besides the graphics layer, the milestones will cover:
 
 - **Editor.** A scene and asset editor with a live preview through the
-  same wgpu pipeline the game uses.
+  same render pipeline the game uses.
 - **Network tools.** Tools for connection, session and state
   replication, kept as a separate layer so they can run without a
   renderer.
-- **Physics.** A fixed-timestep physics subsystem with a memory-safe
-  boundary.
-- **Lighting.** The full lighting pipeline of the engine (lightmaps,
-  dynamic lights and the PBR path the renderer serves).
-- **OWD support.** A reader and writer for the OWD format used by the
-  engine, plus a standalone compression and decompression tool. The
-  format logic is reimplemented from documented behaviour; no
-  proprietary data files are committed to the repository.
+- **Physics.** The classical layer (rigid bodies, joints, buoyancy,
+  force fields) and the extra layer (cloth, soft body, particles),
+  implemented in the engine's own code.
+- **Lighting.** The full lighting pipeline: forward and deferred paths,
+  shadow maps, HDR, bloom, tonemapping, depth of field, morphological
+  anti-aliasing, SSAO-STF and global illumination by light volume
+  propagation.
+- **Audio.** The engine's own audio backend per platform, with the WAV
+  and Ogg Vorbis decoders.
+- **Video.** The engine's own playback service and the Ogg Theora decode
+  layer.
+- **Scripting.** The engine's own scripting language and VM, plus the
+  visual scripting system built on it.
+- **UI.** The retained control tree, the engine's own glyph
+  rasterisation and unicode input.
+- **OWD support.** A reader and writer for the OWD resource container,
+  plus a standalone compression and decompression tool. The format logic
+  is reimplemented from documented behaviour; no proprietary data files
+  are committed to the repository.
+- **Scene management.** Data-driven entities, selectable spatial
+  partitioning, scene queries and LOD.
+- **Animation.** Skeletal clips, the deterministic sampler, the state
+  machine, the node controllers and the blendshapes.
 
 Every subsystem follows the same lessons: minimal middlewares, no
 proprietary dependencies, a Rust-enforced memory-safe boundary and
-hardware validation from the first milestone.
+hardware validation from the first render milestone.
 
 ## License
 

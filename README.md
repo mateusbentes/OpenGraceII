@@ -27,8 +27,11 @@ OpenGraceII:
    dependency, a build system and a licence surface. OpenGraceII keeps
    the middlewares to the minimum the design actually requires.
 2. **No proprietary middlewares.** Proprietary middleware blocks the
-   licence and the reproducibility of the whole engine. OpenGraceII is
-   Apache-2.0 and depends on nothing proprietary.
+    licence and the reproducibility of the whole engine. OpenGraceII is
+    Apache-2.0 and depends on nothing proprietary. Platform graphics
+    APIs (Vulkan, Metal, Direct3D) are not middlewares: they are the
+    OS's own interfaces, and OpenGraceII reaches them through wgpu's
+    public backend abstraction instead of linking a vendor SDK.
 3. **Memory-safe languages at the boundary.** OpenGrace's most subtle
    defects came from the hand-written binding layers (a loader with a
    wrong entry point signature, a command buffer that was ended twice,
@@ -45,8 +48,37 @@ OpenGraceII:
 
 ## Planned platforms
 
-Linux x86_64, Windows x86_64, macOS arm64 and Android arm64-v8a, with
-the graphics layer planned through wgpu (Vulkan, Metal, Direct3D).
+Linux x86_64, Windows x86_64, macOS arm64, iOS arm64 and Android
+arm64-v8a, with the graphics layer planned through wgpu. The
+first-class backends are Vulkan (Linux, Android), Metal (macOS, iOS)
+and Direct3D 12 (Windows, where it is the most reliable native path
+through wgpu). OpenGL is not a target: it is kept only as a fallback
+validation backend on Linux for machines without Vulkan, matching the
+minimal-middlewares philosophy — no GL-specific features are designed
+around it.
+
+## Planned scope
+
+OpenGraceII is planned as a full engine in the spirit of GRACE 2, not
+only a renderer. Besides the graphics layer, the milestones will cover:
+
+- **Editor.** A scene and asset editor with a live preview through the
+  same wgpu pipeline the game uses.
+- **Network tools.** Tools for connection, session and state
+  replication, kept as a separate layer so they can run without a
+  renderer.
+- **Physics.** A fixed-timestep physics subsystem with a memory-safe
+  boundary.
+- **Lighting.** The full lighting pipeline of the engine (lightmaps,
+  dynamic lights and the PBR path the renderer serves).
+- **OWD support.** A reader and writer for the OWD format used by the
+  engine, plus a standalone compression and decompression tool. The
+  format logic is reimplemented from documented behaviour; no
+  proprietary data files are committed to the repository.
+
+Every subsystem follows the same lessons: minimal middlewares, no
+proprietary dependencies, a Rust-enforced memory-safe boundary and
+hardware validation from the first milestone.
 
 ## License
 

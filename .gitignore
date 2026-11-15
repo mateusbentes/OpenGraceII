@@ -1,2 +1,63 @@
-target/
+# OpenGraceII
+
+# Rust and Cargo build outputs
+/target/
 Cargo.lock
+
+# Compiled artifacts
+*.o
+*.obj
+*.a
+*.rlib
+*.rmeta
+*.so
+*.dylib
+*.dll
+*.lib
+*.exe
+*.out
+*.app/
+*.bundle/
+*.dSYM/
+*.pdb
+
+# Generated shader binaries
+*.spv
+
+# Local research and proprietary data
+/original-data/
+/game-data/
+/private-data/
+/research/
+/analysis/
+/ghidra/
+/ida/
+/dumps/
+/traces/
+/saves/
+*.dmp
+*.dump
+*.trace
+*.sav
+*.save
+
+# Assistant tooling
+.aider*
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.user
+*.user.*
+*.suo
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+
+# Signing keys
+*.keystore
+*.jks

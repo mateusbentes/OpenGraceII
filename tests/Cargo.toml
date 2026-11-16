@@ -7,6 +7,11 @@ license.workspace = true
 [dependencies]
 og2-core = { path = "../core" }
 
+[features]
+vulkan = ["og2-core/vulkan"]
+opengl = ["og2-core/opengl"]
+metal = ["og2-core/metal"]
+
 [[test]]
 name = "docs"
 path = "tests/docs.rs"

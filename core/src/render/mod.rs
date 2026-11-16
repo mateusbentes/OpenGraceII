@@ -15,11 +15,15 @@ pub mod null;
 pub mod vulkan;
 #[cfg(feature = "opengl")]
 pub mod opengl;
+#[cfg(feature = "metal")]
+pub mod metal;
 pub use null::{NullEvent, NullRenderBackend};
 #[cfg(feature = "vulkan")]
 pub use vulkan::{VulkanBackend, VulkanBackendConfig};
 #[cfg(feature = "opengl")]
 pub use opengl::{OpenGlBackend, OpenGlBackendConfig};
+#[cfg(feature = "metal")]
+pub use metal::{MetalBackend, MetalBackendConfig};
 
 use std::sync::{Arc, Mutex};
 // Re-exported so the backend modules (and the engine's other modules) reach

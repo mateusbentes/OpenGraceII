@@ -18,6 +18,13 @@ null backend and the Vulkan backend (the engine's own loader, no third-
 party Vulkan binding), validated on Linux with lavapipe; the Android
 hardware run follows. The running record is docs/implementation-status.md.
 
+Milestone 3 is in progress: the OpenGL backend is done (the engine's own
+EGL + GL 3.3 core loader, validated on Linux with llvmpipe through an EGL
+surfaceless context), and the Metal backend is implemented (the engine's
+own Objective-C runtime loader, no Apple SDK headers; the module compiles
+on any platform and the hardware run needs a Mac). Direct3D 12 (Windows)
+follows.
+
 ## The lessons from OpenGrace
 
 OpenGrace is a complete C++ reimplementation of the GRACE 2 engine

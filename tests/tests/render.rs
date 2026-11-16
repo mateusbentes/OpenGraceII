@@ -7,6 +7,8 @@ use og2_core::render::{
     ClearBuffer, ClearColor, NullRenderBackend, RenderBackend,
     VulkanBackendConfig,
 };
+#[cfg(feature = "metal")]
+use og2_core::render::metal::{MetalBackend, MetalBackendConfig};
 
 const CLEAR_COLOR: ClearColor = ClearColor {
     r: 30,
@@ -145,6 +147,44 @@ fn vulkan_backend_smoke() {
     eprintln!("vulkan centre: {:?}", centre);
     // The clear depth/stencil values reach the framebuffer (the same
     // check the C++ test_vulkan_render.cpp runs on the depth word).
+    assert!((backend.center_depth() - 0.25).abs() < 0.001);
+    assert_eq!(backend.center_stencil(), 7);
+    assert_eq!(backend.violation_count(), 0);
+    backend.shutdown();
+    assert_eq!(backend.violation_count(), 0);
+}
+
+/// The Metal backend's smoke: the backend initialises on the platform's
+/// loader (a Mac counts; the loader reports cleanly where the framework
+/// is absent, so the test skips on Linux). The same skip the Vulkan
+/// smoke follows.
+#[test]
+#[cfg(feature = "metal")]
+fn metal_backend_smoke() {
+    let config = MetalBackendConfig {
+        width: 320,
+        height: 240,
+        draw_triangle: true,
+        triangle_color: TRIANGLE_COLOR,
+        readback_center: true,
+        clear_buffers: ClearBuffer::COLOR_DEPTH_STENCIL,
+        clear_depth: 0.25,
+        clear_stencil: 7,
+    };
+    let mut backend = match MetalBackend::new(config) {
+        Ok(b) => b,
+        Err(e) => {
+            // The platform has no Metal framework: the loader reports it
+            // cleanly and the test skips (the same skip the Vulkan smoke
+            // follows; the hardware run needs a Mac).
+            eprintln!("skip: {}", e);
+            return;
+        }
+    };
+    backend.set_clear_color(CLEAR_COLOR);
+    backend.clear();
+    backend.swap_buffers();
+    assert_eq!(backend.has_center_pixel(), true);
     assert!((backend.center_depth() - 0.25).abs() < 0.001);
     assert_eq!(backend.center_stencil(), 7);
     assert_eq!(backend.violation_count(), 0);

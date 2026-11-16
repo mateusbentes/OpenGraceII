@@ -15,7 +15,7 @@ The `.docx` files in this directory are generated from the `.md` sources with
 | --- | --- | --- |
 | 1 | Rust skeleton: Cargo workspace, module layout, the validation matrix (build, test, docs checks), the pinned toolchain | Done |
 | 2 | Render contract and the first backend: Vulkan on Linux (lavapipe); the Android hardware run follows | Done |
-| 3 | The remaining backends: OpenGL (Windows/Linux), Metal (macOS/iOS), Direct3D 12 (Windows) | In progress (OpenGL done) |
+| 3 | The remaining backends: OpenGL (Windows/Linux), Metal (macOS/iOS), Direct3D 12 (Windows) | In progress (OpenGL done, Metal implemented; the D3D 12 and the Metal hardware runs follow) |
 | 4 | Render foundation: math, mesh, shader, material | Planned |
 | 5 | Forward lighting: light types, shadow mapping | Planned |
 | 6 | Deferred lighting: MRT G-buffer, the lighting pass | Planned |
@@ -63,6 +63,8 @@ The `.docx` files in this directory are generated from the `.md` sources with
 cargo build
 cargo build --features og2-core/vulkan,og2-core/opengl
 cargo test -p og2-tests --features og2-core/vulkan,og2-core/opengl
+cargo build --features og2-core/metal
+cargo test -p og2-tests --features og2-tests/vulkan,og2-tests/opengl,og2-tests/metal
 ```
 
 The render suite's source imports the backends' types, so the render
@@ -102,6 +104,22 @@ surfaceless + llvmpipe:
   engine's own EGL + GL 3.3 core loader (no third-party binding), reads
   the centre pixel back and validates the clear colour, the clear depth
   and the clear stencil values, matching the Vulkan backend's smoke run.
+
+Milestone 3 (the Metal backend), Linux x86_64, Rust 1.100.0 (build-only
+for the Apple targets):
+- `cargo check --target aarch64-apple-darwin --features metal` and
+  `cargo check --target aarch64-apple-ios --features metal`: the module
+  compiles for the Apple targets (build-only; the hardware run needs a
+  Mac, the same recorded scope the OpenGrace Metal milestone carried).
+- `cargo build --features metal`: the workspace builds, no warnings.
+- `cargo test --features vulkan,opengl,metal`: 11 tests passed — 3
+  docs-rule suites and 8 render tests (the null backend, the Vulkan
+  smoke and the Metal smoke, which skips cleanly where the platform has
+  no Metal framework and reports the loader's failure message).
+- The Metal backend is the engine's own Objective-C runtime loader
+  (objc_getClass, sel_registerName, objc_msgSend resolved through
+  dlopen of the platform's libobjc; no Apple SDK headers, no third-party
+  binding), the same rule the Vulkan and the OpenGL loaders record.
 
 ---
 

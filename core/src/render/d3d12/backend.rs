@@ -1,0 +1,2324 @@
+//! The Direct3D 12 render backend: the render contract's Windows
+//! implementation, on the platform's Direct3D 12 runtime.
+//!
+//! RULE (lesson 3): the engine's own loader, own code, no Windows SDK
+//! headers and no third-party binding. The `D3d12Loader` resolves the
+//! three dlls' published entry points (d3d12.dll, dxgi.dll,
+//! d3dcompiler_47.dll) through LoadLibraryA/GetProcAddress at runtime and
+//! calls every COM interface through the vtable pointer the object's
+//! first word carries.
+//!
+//! The backend is headless, the same rule the Vulkan, the OpenGL and the
+//! Metal backends follow: the frame target is an off-screen colour
+//! texture plus a depth/stencil texture, no swap chain and no window.
+//! The frame flow matches the other backends: `clear()` opens the frame
+//! (the colour and the depth/stencil clears are recorded into the
+//! command list), the diagnostic triangle draws into the frame, and
+//! `swap_buffers()` closes, executes and waits for the fence before the
+//! readback maps the staging buffer with the three-plane layout the Wine
+//! probes validated (colour at offset 0, the depth plane's words at
+//! offset COLOUR_BYTES, the stencil plane's bytes at offset
+//! COLOUR_BYTES + DS_WORDS).
+//!
+//! The D3D12-specific rules the Wine probes validated before this module
+//! was written: a freshly created command list must be closed once
+//! before the first Reset pair; the fence signal the wait sees is the
+//! queue's (the CPU-side Signal completes immediately), and the fence
+//! value grows each frame; the depth and the stencil planes of a D24S8
+//! texture are separate subresources, so the readback copies each plane
+//! with its own CopyTextureRegion call (the same one-plane-per-copy rule
+//! the VUID 09103 fix records on the Vulkan side); the depth plane reads
+//! as one 32-bit word per pixel with the depth in the top three bytes,
+//! the stencil plane reads as one byte per texel with its own 256-byte
+//! row pitch; the second frame's barriers bring the resources back from
+//! COPY_SOURCE into the render states before the clears (the two-frame
+//! probe validated that path).
+//!
+//! Validation scope: the module compiles on any platform (the loader
+//! declares its own types, so no Windows SDK is needed) and the hardware
+//! run needs Windows — the M3 records the Wine runs as the D3D12 path's
+//! validation; nothing here claims the hardware run happened. The
+//! loader's failure path is the one behaviour a non-Windows host can
+//! exercise: `new()` reports the missing dll in the `RenderError`
+//! message.
+
+use super::d3d12_loader::{
+    self as d3d,  call_slot_i32_0, call_slot_i32_2,
+    call_slot_i32_3, call_slot_i32_4, call_slot_i32_5, call_slot_i32_6,
+    call_slot_i32_f32, call_slot_i32_8,
+     call_slot_ptr_0,  call_slot_u64_0,
+     vtable_of,
+    D3d12ClearValue, D3d12CommandQueueDesc, D3d12CpuDescriptorHandle,
+    D3d12CachedPipelineState, D3d12Rect, D3d12ResourceBarrier,
+    D3d12DepthStencilViewDesc, D3d12DescriptorHeapDesc, D3d12DeviceHandle,
+    D3d12GraphicsCommandListHandle, D3d12HeapProperties, D3d12InputLayoutDesc,
+    D3d12FeatureDataFeatureLevels, DxgiAdapterDesc1,
+
+    D3d12InputElementDesc, D3d12PlacedFootprint, D3d12RasterizerDesc,
+    D3d12RenderTargetBlendDesc, D3d12ResourceDesc, D3d12ResourceTransitionBarrier,
+    D3d12RootConstants, D3d12RootParameter, D3d12RootSignatureDesc,
+    D3d12SampleDesc, D3d12ShaderBytecode, D3d12SubresourceFootprint,
+    D3d12StreamOutputDesc,
+    D3d12Tex2DDsv, D3d12TextureCopyLocation, D3d12Viewport,
+    D3d12GraphicsPipelineStateDesc, D3d12DepthStencilDesc,
+    D3d12DepthStencilopDesc, D3d12BlendDesc, D3d12VertexBufferView,
+    D3d12Range, D3d12Loader, D3dBlobHandle, ComObject,
+    DxgiFactoryHandle, DxgiAdapterHandle,
+    D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
+    D3D12_CULL_MODE_NONE, D3D12_COLOR_WRITE_ENABLE_ALL,
+    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_FLAG_NONE,
+    D3D12_COMMAND_QUEUE_PRIORITY_NORMAL, D3D12_CLEAR_FLAG_DEPTH,
+    D3D12_CLEAR_FLAG_STENCIL,
+    D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+    D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+    D3D12_DSV_DIMENSION_TEXTURE2D, D3D12_FILL_MODE_SOLID,
+    D3D12_FENCE_FLAG_NONE, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_TYPE_DEFAULT,
+    D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD,
+    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+
+    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+    D3D12_RESOURCE_BARRIER_FLAG_NONE,
+    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_DIMENSION_BUFFER,
+    D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON,
+    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+    D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_GENERIC_READ,
+    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+    D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+    D3D12_SHADER_VISIBILITY_ALL, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+    D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+    D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+    D3D12_FEATURE_FEATURE_LEVELS, D3D_FEATURE_LEVEL_11_0,
+    DXGI_FORMAT_D24_UNORM_S8_UINT,
+     DXGI_FORMAT_R32_FLOAT,
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT,
+    DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    DXGI_FORMAT_R32G32B32_FLOAT,
+    DXGI_FORMAT_UNKNOWN,
+     IID_ID3D12_COMMAND_ALLOCATOR_WORDS,
+    IID_ID3D12_COMMAND_QUEUE_WORDS, IID_ID3D12_DESCRIPTOR_HEAP_WORDS,
+    IID_ID3D12_DEVICE_WORDS, IID_ID3D12_FENCE_WORDS,
+    IID_ID3D12_GRAPHICS_COMMAND_LIST_WORDS, IID_ID3D12_PIPELINE_STATE_WORDS,
+    IID_ID3D12_RESOURCE_WORDS, IID_ID3D12_ROOT_SIGNATURE_WORDS,
+    IID_IDXGI_FACTORY1_WORDS,
+
+};
+use super::super::{
+    bytes_per_pixel, CameraParams, ClearBuffer, ClearColor, DrawSubmission,
+    GpuMesh, GpuMeshInner, PixelFormat, ReadbackSample, RenderBackend,
+    RenderError, RenderTarget, RenderTargetDesc, RenderTargetInner,
+    ShaderProgram, ShaderProgramInner, Texture2DDesc, TextureView,
+    TextureViewInner, VertexLayout, DEPTH_ATTACHMENT,
+};
+use crate::math::{Mat4, Vec3};
+use std::os::raw::{c_char, c_void};
+use std::sync::{Arc, Mutex};
+
+// ---------------------------------------------------------------------------
+// The vtable slots the backend calls (0-based, from the MinGW-w64 official
+// headers: every slot below was parsed from the vtable order, never
+// guessed — the same M19 rule the Vulkan loader records)
+// ---------------------------------------------------------------------------
+
+// ID3D12Device (the slot the header's vtable order carries).
+const DEVICE_CREATE_COMMAND_QUEUE: usize = 8;
+const DEVICE_CREATE_COMMAND_ALLOCATOR: usize = 9;
+const DEVICE_CREATE_GRAPHICS_PIPELINE_STATE: usize = 10;
+const DEVICE_CREATE_COMMAND_LIST: usize = 12;
+const DEVICE_CHECK_FEATURE_SUPPORT: usize = 13;
+const DEVICE_CREATE_DESCRIPTOR_HEAP: usize = 14;
+const DEVICE_CREATE_ROOT_SIGNATURE: usize = 16;
+const DEVICE_CREATE_RENDER_TARGET_VIEW: usize = 20;
+const DEVICE_CREATE_DEPTH_STENCIL_VIEW: usize = 21;
+const DEVICE_CREATE_COMMITTED_RESOURCE: usize = 27;
+const DEVICE_CREATE_FENCE: usize = 36;
+// ID3D12CommandQueue.
+const QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
+const QUEUE_SIGNAL: usize = 14;
+// ID3D12CommandAllocator.
+const ALLOCATOR_RESET: usize = 8;
+// ID3D12GraphicsCommandList.
+const COMMAND_LIST_CLOSE: usize = 9;
+const COMMAND_LIST_RESET: usize = 10;
+const COMMAND_LIST_DRAW_INSTANCED: usize = 12;
+const COMMAND_LIST_COPY_TEXTURE_REGION: usize = 16;
+const COMMAND_LIST_IASET_PRIMITIVE_TOPOLOGY: usize = 20;
+const COMMAND_LIST_RSSET_VIEWPORTS: usize = 21;
+const COMMAND_LIST_RSSET_SCISSOR_RECTS: usize = 22;
+const COMMAND_LIST_SET_PIPELINE_STATE: usize = 25;
+const COMMAND_LIST_RESOURCE_BARRIER: usize = 26;
+const COMMAND_LIST_SET_GRAPHICS_ROOT_SIGNATURE: usize = 30;
+const COMMAND_LIST_SET_GRAPHICS_ROOT_32BIT_CONSTANTS: usize = 36;
+const COMMAND_LIST_IASET_VERTEX_BUFFERS: usize = 44;
+const COMMAND_LIST_OMSET_RENDER_TARGETS: usize = 46;
+const COMMAND_LIST_CLEAR_DEPTH_STENCIL_VIEW: usize = 47;
+const COMMAND_LIST_CLEAR_RENDER_TARGET_VIEW: usize = 48;
+// ID3D12Resource.
+const RESOURCE_MAP: usize = 8;
+const RESOURCE_UNMAP: usize = 9;
+const RESOURCE_GET_GPU_VIRTUAL_ADDRESS: usize = 11;
+// ID3D12Fence.
+const FENCE_SET_EVENT_ON_COMPLETION: usize = 9;
+// ID3D12DescriptorHeap.
+const HEAP_GET_CPU_DESCRIPTOR_HANDLE: usize = 9;
+// IDXGIFactory1 / IDXGIAdapter1 (the DXGI side: SetPrivateData comes
+// before GetPrivateData, the opposite of the D3D12 side).
+const FACTORY_ENUM_ADAPTERS1: usize = 12;
+const ADAPTER_GET_DESC1: usize = 10;
+// ID3D10Blob (the d3dcompiler's blob).
+const BLOB_GET_BUFFER_POINTER: usize = 3;
+const BLOB_GET_BUFFER_SIZE: usize = 4;
+
+// ---------------------------------------------------------------------------
+// The readback staging buffer's layout (the same three-plane layout the
+// Wine probes validated)
+// ---------------------------------------------------------------------------
+
+/// The colour plane's bytes (the 320x240 RGBA8 the probes copied).
+const STAGING_COLOUR_BYTES: usize = 320 * 240 * 4;
+/// The depth plane's words (one 32-bit word per pixel).
+const STAGING_DEPTH_BYTES: usize = 320 * 240 * 4;
+/// The stencil plane's row pitch (256 * ceil(width / 256) = 512 for the
+/// 320-wide frame).
+const STAGING_STENCIL_PITCH: usize = 256 * ((320 + 255) / 256);
+/// The stencil plane's bytes (240 rows of the 256-byte pitch).
+const STAGING_STENCIL_BYTES: usize = 240 * STAGING_STENCIL_PITCH;
+/// The staging buffer's total size (the three planes).
+const STAGING_SIZE: usize =
+    STAGING_COLOUR_BYTES + STAGING_DEPTH_BYTES + STAGING_STENCIL_BYTES;
+/// The depth plane's offset inside the staging buffer.
+const STAGING_DEPTH_OFFSET: usize = STAGING_COLOUR_BYTES;
+/// The stencil plane's offset inside the staging buffer.
+const STAGING_STENCIL_OFFSET: usize =
+    STAGING_COLOUR_BYTES + STAGING_DEPTH_BYTES;
+
+/// The diagnostic triangle's uniform block (the same bytes the Vulkan,
+/// the OpenGL and the Metal blocks carry: the MVP column-major followed
+/// by the RGBA colour). The 20-word block the root signature's
+/// constants parameter reads.
+#[repr(C)]
+struct TriUniform {
+    mvp: [[f32; 4]; 4],
+    color: [f32; 4],
+}
+
+/// The D3D12 backend's configuration. The same fields the other backends'
+/// configs carry.
+#[derive(Clone, Debug)]
+pub struct D3d12BackendConfig {
+    pub width: u32,
+    pub height: u32,
+    /// Draw the diagnostic triangle each frame.
+    pub draw_triangle: bool,
+    pub triangle_color: ClearColor,
+    /// Read back the centre pixel each frame.
+    pub readback_center: bool,
+    pub clear_buffers: ClearBuffer,
+    pub clear_depth: f32,
+    pub clear_stencil: i32,
+}
+
+impl Default for D3d12BackendConfig {
+    fn default() -> Self {
+        D3d12BackendConfig {
+            width: 320,
+            height: 240,
+            draw_triangle: false,
+            triangle_color: ClearColor {
+                r: 200,
+                g: 40,
+                b: 40,
+                a: 255,
+            },
+            readback_center: false,
+            clear_buffers: ClearBuffer::COLOR_DEPTH_STENCIL,
+            clear_depth: 1.0,
+            clear_stencil: 0,
+        }
+    }
+}
+
+/// The D3D12 backend's own texture: a device resource plus the contract's
+/// shared handle state.
+// The resource handle is written at creation; the release path (the next
+// milestones) releases it.
+#[allow(dead_code)]
+struct D3d12Texture2D {
+    inner: Arc<Mutex<TextureViewInner>>,
+    resource: d3d::D3d12ResourceHandle,
+    released: bool,
+}
+
+/// The D3D12 backend's own render target: the colour attachments plus the
+/// depth/stencil attachment, each a device resource.
+// The resource handles are written at creation; the release path (the
+// next milestones) releases them.
+#[allow(dead_code)]
+struct D3d12RenderTarget {
+    inner: Arc<Mutex<RenderTargetInner>>,
+    views: Vec<D3d12Texture2D>,
+    depth_view: Option<D3d12Texture2D>,
+    released: bool,
+}
+
+/// The headless D3D12 backend.
+#[allow(dead_code)]
+pub struct D3d12Backend {
+    config: D3d12BackendConfig,
+    loader: D3d12Loader,
+    device: D3d12DeviceHandle,
+    queue: d3d::D3d12CommandQueueHandle,
+    allocator: d3d::D3d12CommandAllocatorHandle,
+    command_list: D3d12GraphicsCommandListHandle,
+    // The device's identity (the describe() reports it).
+    adapter_desc: String,
+    adapter_vendor: u32,
+    feature_level: u32,
+    // The off-screen frame target's colour and depth/stencil resources.
+    color_texture: d3d::D3d12ResourceHandle,
+    depth_texture: d3d::D3d12ResourceHandle,
+    // The RTV and DSV descriptor heaps (one descriptor each) and the
+    // handles the clears and the OMSetRenderTargets read.
+    rtv_heap: d3d::D3d12DescriptorHeapHandle,
+    dsv_heap: d3d::D3d12DescriptorHeapHandle,
+    rtv_handle: D3d12CpuDescriptorHandle,
+    dsv_handle: D3d12CpuDescriptorHandle,
+    // The diagnostic triangle's pipeline, root signature and vertex buffer.
+    tri_pipeline: d3d::D3d12PipelineStateHandle,
+    tri_root_signature: d3d::D3d12RootSignatureHandle,
+    tri_vertex_buffer: d3d::D3d12ResourceHandle,
+    tri_ready: bool,
+    // The readback staging buffer (the three-plane layout), its fence and
+    // the fence's value (the value grows each frame).
+    staging_buffer: d3d::D3d12ResourceHandle,
+    fence: d3d::D3d12FenceHandle,
+    fence_event: *mut c_void,
+    fence_value: u64,
+    // Whether the readback's copies left the colour and depth/stencil
+    // resources in COPY_SOURCE: the return barriers only record after a
+    // readback (the probe C's frame-2 rule).
+    resources_in_copy_source: bool,
+    // The clear colour and the clear state.
+    clear_color: ClearColor,
+    clear_depth: f32,
+    clear_stencil: i32,
+    depth_test_enabled: bool,
+    camera: CameraParams,
+    bound_target: Option<Arc<Mutex<RenderTargetInner>>>,
+    pass_open: bool,
+    frame_open: bool,
+    shutdown: bool,
+    violations: u64,
+    targets: Vec<D3d12RenderTarget>,
+    textures_2d: Vec<D3d12Texture2D>,
+    readback_queue: Vec<(u32, u32)>,
+    last_readback: Vec<ReadbackSample>,
+    has_center: bool,
+    center: ClearColor,
+    center_depth: f32,
+    center_stencil: i32,
+}
+
+// ---------------------------------------------------------------------------
+// The helper functions the setup path calls (the probe C's sequence,
+// step by step)
+// ---------------------------------------------------------------------------
+
+/// A vtable call's HRESULT: S_OK's 0.
+const S_OK: i32 = 0;
+
+/// Calls the published CreateDXGIFactory1 entry point: the factory the
+/// adapter enumeration walks (the probe C's first step).
+unsafe fn self_create_factory(
+    loader: &D3d12Loader,
+) -> Result<DxgiFactoryHandle, RenderError> {
+    let mut factory: *mut c_void = std::ptr::null_mut();
+    let hr = loader
+        .create_dxgi_factory1
+        .expect("the loader resolved CreateDXGIFactory1")(
+        IID_IDXGI_FACTORY1_WORDS.as_ptr() as *const u32,
+        &mut factory,
+    );
+    if hr != S_OK || factory.is_null() {
+        return Err(RenderError::from(format!(
+            "D3d12Backend: the DXGI factory could not be created \
+             (hr=0x{:08x})",
+            hr
+        )));
+    }
+    Ok(factory)
+}
+
+/// Reads the first adapter (the factory's EnumAdapters1 slot 12) and its
+/// description: the describe() report's vendor and renderer strings.
+unsafe fn self_read_adapter(
+    factory: DxgiFactoryHandle,
+) -> Result<(DxgiAdapterHandle, String, u32), RenderError> {
+    let mut adapter: *mut c_void = std::ptr::null_mut();
+    // EnumAdapters1's signature carries no IID: (Adapter: UINT,
+    // ppAdapter: *mut *mut c_void) — the Wine probe's crash recorded
+    // the write into the read-only GUID words the extra argument
+    // caused.
+    let hr = call_slot_i32_2(
+        factory as ComObject,
+        FACTORY_ENUM_ADAPTERS1,
+        0 as *mut c_void,
+        &mut adapter as *mut _ as *mut c_void,
+    );
+    if hr != S_OK || adapter.is_null() {
+        return Err(RenderError::from(format!(
+            "D3d12Backend: the first adapter could not be enumerated \
+             (hr=0x{:08x})",
+            hr
+        )));
+    }
+    let mut desc = DxgiAdapterDesc1 {
+        description: [0; 128],
+        vendor_id: 0,
+        device_id: 0,
+        sub_sys_id: 0,
+        revision: 0,
+        dedicated_video_memory: 0,
+        dedicated_system_memory: 0,
+        shared_system_memory: 0,
+        adapter_luid_low: 0,
+        adapter_luid_high: 0,
+        flags: 0,
+    };
+    let f: unsafe extern "system" fn(
+        ComObject,
+        *mut DxgiAdapterDesc1,
+    ) -> i32 = std::mem::transmute(
+        *vtable_of(adapter as ComObject)
+        .add(ADAPTER_GET_DESC1));
+    let hr = f(adapter as ComObject, &mut desc);
+    if hr != S_OK {
+        return Err(RenderError::from(format!(
+            "D3d12Backend: the adapter's description could not be read \
+             (hr=0x{:08x})",
+            hr
+        )));
+    }
+    // The WCHAR[128] description: the UTF-16 units up to the zero.
+    let units: Vec<u16> = desc
+        .description
+        .iter()
+        .take_while(|u| **u != 0)
+        .copied()
+        .collect();
+    let name = String::from_utf16_lossy(&units);
+    Ok((adapter, name, desc.vendor_id))
+}
+
+/// Calls the published D3D12CreateDevice entry point: the device at the
+/// probes' minimum feature level 11.0.
+unsafe fn self_create_device(
+    loader: &D3d12Loader,
+    adapter: DxgiAdapterHandle,
+) -> Result<D3d12DeviceHandle, RenderError> {
+    let mut device: *mut c_void = std::ptr::null_mut();
+    let hr = loader
+        .d3d12_create_device
+        .expect("the loader resolved D3D12CreateDevice")(
+        adapter,
+        D3D_FEATURE_LEVEL_11_0,
+        IID_ID3D12_DEVICE_WORDS.as_ptr() as *const u32,
+        &mut device,
+    );
+    if hr != S_OK || device.is_null() {
+        return Err(RenderError::from(format!(
+            "D3d12Backend: the D3D12 device could not be created \
+             (hr=0x{:08x})",
+            hr
+        )));
+    }
+    Ok(device)
+}
+
+/// Reads the device's highest supported feature level (the
+/// CheckFeatureSupport slot 13, the FEATURE levels query): the
+/// describe() report's feature level.
+unsafe fn self_check_feature_level(device: D3d12DeviceHandle) -> u32 {
+    let levels = [D3D_FEATURE_LEVEL_11_0];
+    let mut data = D3d12FeatureDataFeatureLevels {
+        num_feature_levels: 1,
+        feature_levels_requested: levels.as_ptr(),
+        max_supported_feature_level: 0,
+    };
+    let hr = call_slot_i32_4(
+        device as ComObject,
+        DEVICE_CHECK_FEATURE_SUPPORT,
+        D3D12_FEATURE_FEATURE_LEVELS as *mut c_void,
+        &mut data as *mut D3d12FeatureDataFeatureLevels as *mut c_void,
+        std::mem::size_of::<D3d12FeatureDataFeatureLevels>() as *mut c_void,
+        std::ptr::null_mut(),
+    );
+    if hr != S_OK {
+        return D3D_FEATURE_LEVEL_11_0;
+    }
+    data.max_supported_feature_level
+}
+
+/// Creates the RTV and the DSV descriptors (the device's slots 20 and
+/// 21): the colour view's D3D12RenderTargetViewDesc is null (the format
+/// comes from the resource), the depth view's D3D12DepthStencilViewDesc
+/// carries the D24S8 format and the TEXTURE2D dimension.
+unsafe fn self_create_rtv_dsv(
+    device: D3d12DeviceHandle,
+    color_texture: d3d::D3d12ResourceHandle,
+    depth_texture: d3d::D3d12ResourceHandle,
+    rtv_handle: D3d12CpuDescriptorHandle,
+    dsv_handle: D3d12CpuDescriptorHandle,
+) {
+    let dsv_desc = D3d12DepthStencilViewDesc {
+        format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+        view_dimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+        flags: 0,
+        texture_2d: D3d12Tex2DDsv { mip_slice: 0 },
+    };
+    call_slot_i32_4(
+        device as ComObject,
+        DEVICE_CREATE_RENDER_TARGET_VIEW,
+        color_texture,
+        std::ptr::null_mut(),
+        rtv_handle.ptr as *mut c_void,
+        std::ptr::null_mut(),
+    );
+    call_slot_i32_3(
+        device as ComObject,
+        DEVICE_CREATE_DEPTH_STENCIL_VIEW,
+        depth_texture,
+        &dsv_desc as *const D3d12DepthStencilViewDesc as *mut c_void,
+        dsv_handle.ptr as *mut c_void,
+    );
+}
+
+/// Calls the device's CreateCommandQueue (slot 8): the DIRECT
+/// queue the frame's commands execute on.
+unsafe fn self_create_queue(
+    device: D3d12DeviceHandle,
+) -> Result<d3d::D3d12CommandQueueHandle, RenderError> {
+    let desc = D3d12CommandQueueDesc {
+        type_: D3D12_COMMAND_LIST_TYPE_DIRECT,
+        priority: D3D12_COMMAND_QUEUE_PRIORITY_NORMAL,
+        flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
+        node_mask: 0,
+    };
+    let mut queue: *mut c_void = std::ptr::null_mut();
+    let hr = call_slot_i32_4(
+        device as ComObject,
+        DEVICE_CREATE_COMMAND_QUEUE,
+        &desc as *const D3d12CommandQueueDesc as *mut c_void,
+        IID_ID3D12_COMMAND_QUEUE_WORDS.as_ptr() as *mut c_void,
+        &mut queue as *mut _ as *mut c_void,
+        std::ptr::null_mut(),
+    );
+    if hr != S_OK || queue.is_null() {
+        return Err(RenderError::from(format!(
+            "D3d12Backend: the command queue could not be created \
+             (hr=0x{:08x})",
+            hr
+        )));
+    }
+    Ok(queue)
+}
+
+/// Calls the device's CreateCommandAllocator (slot 9): the DIRECT
+/// allocator the command list resets.
+unsafe fn self_create_allocator(
+    device: D3d12DeviceHandle,
+) -> Result<d3d::D3d12CommandAllocatorHandle, RenderError> {
+    let mut allocator: *mut c_void = std::ptr::null_mut();
+    let hr = call_slot_i32_4(
+        device as ComObject,
+        DEVICE_CREATE_COMMAND_ALLOCATOR,
+        D3D12_COMMAND_LIST_TYPE_DIRECT as *mut c_void,
+        IID_ID3D12_COMMAND_ALLOCATOR_WORDS.as_ptr() as *mut c_void,
+        &mut allocator as *mut _ as *mut c_void,
+        std::ptr::null_mut(),
+    );
+    if hr != S_OK || allocator.is_null() {
+        return Err(RenderError::from(format!(
+            "D3d12Backend: the command allocator could not be created \
+             (hr=0x{:08x})",
+            hr
+        )));
+    }
+    Ok(allocator)
+}
+
+/// Calls the device's CreateCommandList (slot 12) and performs the one
+/// initial Close() the Wine probe validated: a freshly created command
+/// list is in the recording state, so the first Reset pair is only legal
+/// after one Close.
+unsafe fn self_create_command_list(
+    device: D3d12DeviceHandle,
+    allocator: d3d::D3d12CommandAllocatorHandle,
+) -> Result<D3d12GraphicsCommandListHandle, RenderError> {
+    let mut list: *mut c_void = std::ptr::null_mut();
+    let hr = call_slot_i32_6(
+        device as ComObject,
+        DEVICE_CREATE_COMMAND_LIST,
+        std::ptr::null_mut(),
+        D3D12_COMMAND_LIST_TYPE_DIRECT as *mut c_void,
+        allocator,
+        std::ptr::null_mut(),
+        IID_ID3D12_GRAPHICS_COMMAND_LIST_WORDS.as_ptr() as *mut c_void,
+        &mut list as *mut _ as *mut c_void,
+    );
+    if hr != S_OK || list.is_null() {
+        return Err(RenderError::from(format!(
+            "D3d12Backend: the command list could not be created \
+             (hr=0x{:08x})",
+            hr
+        )));
+    }
+    let hr = call_slot_i32_0(list as ComObject, COMMAND_LIST_CLOSE);
+    if hr != S_OK {
+        return Err(RenderError::from(format!(
+            "D3d12Backend: the command list's initial close failed \
+             (hr=0x{:08x})",
+            hr
+        )));
+    }
+    Ok(list)
+}
+
+/// Calls the device's CreateCommittedResource (slot 27) for one off-screen
+/// texture: the DEFAULT heap, the committed resource's initial state and
+/// the clear value the clear loads read.
+unsafe fn self_create_texture(
+    device: D3d12DeviceHandle,
+    format: u32,
+    width: u32,
+    height: u32,
+    flags: u32,
+    initial_state: u32,
+    clear_value: Option<&D3d12ClearValue>,
+) -> Result<d3d::D3d12ResourceHandle, RenderError> {
+    let heap = D3d12HeapProperties {
+        type_: D3D12_HEAP_TYPE_DEFAULT,
+        cpu_page_property: 0,
+        memory_pool_preference: 0,
+        creation_node_mask: 0,
+        visible_node_mask: 0,
+    };
+    let desc = D3d12ResourceDesc {
+        dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        alignment: 0,
+        width: width as u64,
+        height,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format,
+        sample_desc: D3d12SampleDesc { count: 1, quality: 0 },
+        layout: 0,
+        flags,
+    };
+    let mut resource: *mut c_void = std::ptr::null_mut();
+    let clear_ptr = match clear_value {
+        Some(value) => value as *const D3d12ClearValue as *mut c_void,
+        None => std::ptr::null_mut(),
+    };
+    let hr = call_slot_i32_8(
+        device as ComObject,
+        DEVICE_CREATE_COMMITTED_RESOURCE,
+        &heap as *const D3d12HeapProperties as *mut c_void,
+        D3D12_HEAP_FLAG_NONE as *mut c_void,
+        &desc as *const D3d12ResourceDesc as *mut c_void,
+        initial_state as *mut c_void,
+        clear_ptr,
+        IID_ID3D12_RESOURCE_WORDS.as_ptr() as *mut c_void,
+        &mut resource as *mut _ as *mut c_void,
+        std::ptr::null_mut(),
+    );
+    if hr != S_OK || resource.is_null() {
+        return Err(RenderError::from(format!(
+            "D3d12Backend: the texture resource could not be created \
+             (hr=0x{:08x})",
+            hr
+        )));
+    }
+    Ok(resource)
+}
+
+/// Calls the device's CreateCommittedResource (slot 27) for one buffer:
+/// the READBACK heap's staging buffer or the UPLOAD heap's vertex buffer.
+unsafe fn self_create_buffer(
+    device: D3d12DeviceHandle,
+    bytes: u64,
+    heap_type: u32,
+    initial_state: u32,
+) -> Result<d3d::D3d12ResourceHandle, RenderError> {
+    let heap = D3d12HeapProperties {
+        type_: heap_type,
+        cpu_page_property: 0,
+        memory_pool_preference: 0,
+        creation_node_mask: 0,
+        visible_node_mask: 0,
+    };
+    let desc = D3d12ResourceDesc {
+        dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        alignment: 0,
+        width: bytes,
+        height: 1,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format: DXGI_FORMAT_UNKNOWN,
+        sample_desc: D3d12SampleDesc { count: 1, quality: 0 },
+        layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        flags: 0,
+    };
+    let mut resource: *mut c_void = std::ptr::null_mut();
+    let hr = call_slot_i32_8(
+        device as ComObject,
+        DEVICE_CREATE_COMMITTED_RESOURCE,
+        &heap as *const D3d12HeapProperties as *mut c_void,
+        D3D12_HEAP_FLAG_NONE as *mut c_void,
+        &desc as *const D3d12ResourceDesc as *mut c_void,
+        initial_state as *mut c_void,
+        std::ptr::null_mut(),
+        IID_ID3D12_RESOURCE_WORDS.as_ptr() as *mut c_void,
+        &mut resource as *mut _ as *mut c_void,
+        std::ptr::null_mut(),
+    );
+    if hr != S_OK || resource.is_null() {
+        return Err(RenderError::from(format!(
+            "D3d12Backend: the buffer resource could not be created \
+             (hr=0x{:08x})",
+            hr
+        )));
+    }
+    Ok(resource)
+}
+
+/// Calls the device's CreateDescriptorHeap (slot 14) for one RTV or DSV
+/// descriptor.
+unsafe fn self_create_descriptor_heap(
+    device: D3d12DeviceHandle,
+    heap_type: u32,
+) -> Result<d3d::D3d12DescriptorHeapHandle, RenderError> {
+    let desc = D3d12DescriptorHeapDesc {
+        type_: heap_type,
+        num_descriptors: 1,
+        flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+        node_mask: 0,
+    };
+    let mut heap: *mut c_void = std::ptr::null_mut();
+    let hr = call_slot_i32_4(
+        device as ComObject,
+        DEVICE_CREATE_DESCRIPTOR_HEAP,
+        &desc as *const D3d12DescriptorHeapDesc as *mut c_void,
+        IID_ID3D12_DESCRIPTOR_HEAP_WORDS.as_ptr() as *mut c_void,
+        &mut heap as *mut _ as *mut c_void,
+        std::ptr::null_mut(),
+    );
+    if hr != S_OK || heap.is_null() {
+        return Err(RenderError::from(format!(
+            "D3d12Backend: the descriptor heap could not be created \
+             (hr=0x{:08x})",
+            hr
+        )));
+    }
+    Ok(heap)
+}
+
+/// Reads the heap's CPU descriptor handle (slot 9): the hidden
+/// aggregate-return pointer the C vtable's ABI carries.
+unsafe fn self_heap_cpu_handle(
+    heap: d3d::D3d12DescriptorHeapHandle,
+) -> D3d12CpuDescriptorHandle {
+    let mut handle = D3d12CpuDescriptorHandle { ptr: 0 };
+    let f: unsafe extern "system" fn(
+        ComObject,
+        *mut D3d12CpuDescriptorHandle,
+    ) = std::mem::transmute(
+        *vtable_of(heap as ComObject).add(HEAP_GET_CPU_DESCRIPTOR_HANDLE),
+    );
+    f(heap as ComObject, &mut handle);
+    handle
+}
+
+/// Calls the device's CreateFence (slot 36): the flush fence the queue
+/// signals and the wait waits on.
+unsafe fn self_create_fence(
+    device: D3d12DeviceHandle,
+) -> Result<d3d::D3d12FenceHandle, RenderError> {
+    let mut fence: *mut c_void = std::ptr::null_mut();
+    let hr = call_slot_i32_4(
+        device as ComObject,
+        DEVICE_CREATE_FENCE,
+        0 as *mut c_void,
+        D3D12_FENCE_FLAG_NONE as *mut c_void,
+        IID_ID3D12_FENCE_WORDS.as_ptr() as *mut c_void,
+        &mut fence as *mut _ as *mut c_void,
+    );
+    if hr != S_OK || fence.is_null() {
+        return Err(RenderError::from(format!(
+            "D3d12Backend: the fence could not be created (hr=0x{:08x})",
+            hr
+        )));
+    }
+    Ok(fence)
+}
+
+/// Creates the fence's event (kernel32's CreateEventW): the manual-reset
+/// event the flush waits on.
+unsafe fn self_create_fence_event(
+    loader: &D3d12Loader,
+) -> Result<*mut c_void, RenderError> {
+    let event = loader
+        .create_event_w
+        .expect("the loader resolved CreateEventW")(
+        std::ptr::null_mut(),
+        0,
+        0,
+        std::ptr::null(),
+    );
+    if event.is_null() {
+        return Err(RenderError::from(
+            "D3d12Backend: the fence event could not be created",
+        ));
+    }
+    Ok(event)
+}
+
+// ---------------------------------------------------------------------------
+// The setup path
+// ---------------------------------------------------------------------------
+
+impl D3d12Backend {
+    /// Creates a backend instance. Throws `RenderError` when the platform
+    /// has no D3D12 runtime, no device can be created, or the frame
+    /// resources cannot be allocated.
+    pub fn new(config: D3d12BackendConfig) -> Result<Self, RenderError> {
+        let clear_depth = config.clear_depth;
+        let clear_stencil = config.clear_stencil;
+        if config.width == 0 || config.height == 0 {
+            return Err(RenderError::from(
+                "D3d12Backend: width and height must be positive",
+            ));
+        }
+        let mut loader = D3d12Loader::new();
+        let mut missing = String::new();
+        if !loader.load(&mut missing) {
+            return Err(RenderError::from(format!(
+                "D3d12Backend: the platform's Direct3D 12 runtime could \
+                 not be loaded ({})",
+                missing
+            )));
+        }
+        // The adapter and the device: the factory enumerates the first
+        // adapter, the device is created at feature level 11.0 (the
+        // probes' minimum), and the adapter's description is the
+        // describe() report.
+        let factory = unsafe { self_create_factory(&loader)? };
+        let (adapter, adapter_desc, adapter_vendor) =
+            unsafe { self_read_adapter(factory)? };
+        let device = unsafe { self_create_device(&loader, adapter)? };
+        let feature_level = unsafe {
+            self_check_feature_level(device)
+        };
+        let queue = unsafe { self_create_queue(device)? };
+        let allocator = unsafe { self_create_allocator(device)? };
+        let command_list =
+            unsafe { self_create_command_list(device, allocator)? };
+        let fence = unsafe { self_create_fence(device)? };
+        let fence_event = unsafe { self_create_fence_event(&loader)? };
+        let mut backend = D3d12Backend {
+            config,
+            loader,
+            device,
+            queue,
+            allocator,
+            command_list,
+            adapter_desc,
+            adapter_vendor,
+            feature_level,
+            color_texture: std::ptr::null_mut(),
+            depth_texture: std::ptr::null_mut(),
+            rtv_heap: std::ptr::null_mut(),
+            dsv_heap: std::ptr::null_mut(),
+            rtv_handle: D3d12CpuDescriptorHandle { ptr: 0 },
+            dsv_handle: D3d12CpuDescriptorHandle { ptr: 0 },
+            tri_pipeline: std::ptr::null_mut(),
+            tri_root_signature: std::ptr::null_mut(),
+            tri_vertex_buffer: std::ptr::null_mut(),
+            tri_ready: false,
+            staging_buffer: std::ptr::null_mut(),
+            fence,
+            fence_event,
+            fence_value: 0,
+            resources_in_copy_source: false,
+            clear_color: ClearColor {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
+            clear_depth,
+            clear_stencil,
+            depth_test_enabled: true,
+            camera: CameraParams::default(),
+            bound_target: None,
+            pass_open: false,
+            frame_open: false,
+            shutdown: false,
+            violations: 0,
+            targets: Vec::new(),
+            textures_2d: Vec::new(),
+            readback_queue: Vec::new(),
+            last_readback: Vec::new(),
+            has_center: false,
+            center: ClearColor {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
+            center_depth: 1.0,
+            center_stencil: 0,
+        };
+        backend.initialise()?;
+        Ok(backend)
+    }
+
+    /// The off-screen frame target: the colour texture (RGBA8, the
+    /// RENDER_TARGET flag), the depth/stencil texture (D24S8, the
+    /// DEPTH_STENCIL flag), the RTV and DSV descriptor heaps and the
+    /// staging buffer (the three-plane readback layout).
+    /// The contract's PixelFormat to the DXGI format the device's
+    /// resource carries (the same mapping the Metal backend's
+    /// to_mtl_format records).
+    fn to_d3d_format(&self, format: PixelFormat) -> u32 {
+        match format {
+            PixelFormat::Rgba8 => DXGI_FORMAT_R8G8B8A8_UNORM,
+            PixelFormat::Rgba16F => DXGI_FORMAT_R16G16B16A16_FLOAT,
+            PixelFormat::R8 => DXGI_FORMAT_R8_UNORM,
+            PixelFormat::Depth24Stencil8 => DXGI_FORMAT_D24_UNORM_S8_UINT,
+        }
+    }
+
+    fn initialise(&mut self) -> Result<(), RenderError> {
+        let colour_clear = D3d12ClearValue {
+            format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            color: [0.0, 0.0, 0.0, 1.0],
+        };
+        self.color_texture = unsafe {
+            self_create_texture(
+                self.device,
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                self.config.width,
+                self.config.height,
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                Some(&colour_clear),
+            )?
+        };
+        let depth_clear = D3d12ClearValue {
+            format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+            color: [self.clear_depth, 0.0, 0.0, 0.0],
+        };
+        self.depth_texture = unsafe {
+            self_create_texture(
+                self.device,
+                DXGI_FORMAT_D24_UNORM_S8_UINT,
+                self.config.width,
+                self.config.height,
+                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                Some(&depth_clear),
+            )?
+        };
+        self.staging_buffer = unsafe {
+            self_create_buffer(
+                self.device,
+                STAGING_SIZE as u64,
+                D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )?
+        };
+        self.rtv_heap = unsafe {
+            self_create_descriptor_heap(
+                self.device,
+                D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+            )?
+        };
+        self.dsv_heap = unsafe {
+            self_create_descriptor_heap(
+                self.device,
+                D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+            )?
+        };
+        self.rtv_handle = unsafe { self_heap_cpu_handle(self.rtv_heap) };
+        self.dsv_handle = unsafe { self_heap_cpu_handle(self.dsv_heap) };
+        unsafe {
+            self_create_rtv_dsv(
+                self.device,
+                self.color_texture,
+                self.depth_texture,
+                self.rtv_handle,
+                self.dsv_handle,
+            );
+        }
+        Ok(())
+    }
+
+    /// Compiles the two HLSL sources into the diagnostic triangle's
+    /// pipeline (D3DCompile at runtime, the same rule the OpenGL backend's
+    /// GLSL runtime compilation records), serialises the root signature
+    /// and creates the vertex buffer.
+    fn ensure_triangle_resources(&mut self) -> bool {
+        if self.tri_ready {
+            return true;
+        }
+        let mut vs_blob: D3dBlobHandle = std::ptr::null_mut();
+        let mut ps_blob: D3dBlobHandle = std::ptr::null_mut();
+        let mut rs_blob: D3dBlobHandle = std::ptr::null_mut();
+        let mut error_blob: D3dBlobHandle = std::ptr::null_mut();
+        let vs_source = super::shader_library::TRIANGLE_VERTEX_SHADER;
+        let ps_source = super::shader_library::TRIANGLE_PIXEL_SHADER;
+        unsafe {
+            let compile = self
+                .loader
+                .d3d_compile
+                .expect("the loader resolved D3DCompile");
+            let hr = compile(
+                vs_source.as_ptr() as *const c_void,
+                vs_source.len() as u64,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                b"vsMain\0".as_ptr() as *const c_char,
+                b"vs_5_0\0".as_ptr() as *const c_char,
+                0,
+                0,
+                &mut vs_blob,
+                &mut error_blob,
+            );
+            if hr != S_OK || vs_blob.is_null() {
+                return false;
+            }
+            let hr = compile(
+                ps_source.as_ptr() as *const c_void,
+                ps_source.len() as u64,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                b"psMain\0".as_ptr() as *const c_char,
+                b"ps_5_0\0".as_ptr() as *const c_char,
+                0,
+                0,
+                &mut ps_blob,
+                &mut error_blob,
+            );
+            if hr != S_OK || ps_blob.is_null() {
+                return false;
+            }
+        }
+        // The blob sizes: the shader bytecodes' lengths (the PSO desc's
+        // bytecode carries).
+        let vs_blob_size = unsafe {
+            call_slot_u64_0(vs_blob as ComObject, BLOB_GET_BUFFER_SIZE)
+        };
+        let ps_blob_size = unsafe {
+            call_slot_u64_0(ps_blob as ComObject, BLOB_GET_BUFFER_SIZE)
+        };
+        // The root signature: one 32-bit constants root parameter (the
+        // 20-word block the draw writes), SHADER_VISIBILITY_ALL.
+        let constants = D3d12RootConstants {
+            shader_register: 0,
+            register_space: 0,
+            num_32bit_values: 20,
+        };
+        let parameter = D3d12RootParameter {
+            parameter_type: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            union_head_padding: [0],
+            constants,
+            union_tail_padding: [0],
+            visibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let root_signature_desc = D3d12RootSignatureDesc {
+            num_parameters: 1,
+            parameters: &parameter,
+            num_static_samplers: 0,
+            static_samplers: std::ptr::null(),
+            flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+        };
+        unsafe {
+            let serialize = self
+                .loader
+                .d3d12_serialize_root_signature
+                .expect("the loader resolved D3D12SerializeRootSignature");
+            let hr = serialize(
+                &root_signature_desc,
+                d3d::D3D_ROOT_SIGNATURE_VERSION_1_0,
+                &mut rs_blob,
+                &mut error_blob,
+            );
+            if hr != S_OK || rs_blob.is_null() {
+                return false;
+            }
+            let rs_bytes = std::slice::from_raw_parts(
+                call_slot_ptr_0(
+                    rs_blob as ComObject,
+                    BLOB_GET_BUFFER_POINTER,
+                ) as *const u8,
+                call_slot_u64_0(
+                    rs_blob as ComObject,
+                    BLOB_GET_BUFFER_SIZE,
+                ) as usize,
+            );
+            let mut root_signature: *mut c_void = std::ptr::null_mut();
+            let hr = call_slot_i32_5(
+                self.device as ComObject,
+                DEVICE_CREATE_ROOT_SIGNATURE,
+                0 as *mut c_void,
+                rs_bytes.as_ptr() as *const c_void as *mut c_void,
+                rs_bytes.len() as *mut c_void,
+                IID_ID3D12_ROOT_SIGNATURE_WORDS.as_ptr() as *mut c_void,
+                &mut root_signature as *mut _ as *mut c_void,
+            );
+            if hr != S_OK || root_signature.is_null() {
+                return false;
+            }
+            self.tri_root_signature = root_signature;
+        }
+        // The PSO: the blend state writes all channels, the rasterizer
+        // clips, the depth/stencil state is disabled (the triangle never
+        // writes depth), the input layout carries one R32G32B32 position.
+        let position = b"POSITION\0";
+        let input_element = D3d12InputElementDesc {
+            semantic_name: position.as_ptr() as *const c_char,
+            semantic_index: 0,
+            format: DXGI_FORMAT_R32G32B32_FLOAT,
+            input_slot: 0,
+            aligned_byte_offset: 0,
+            input_slot_class: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            instance_data_step_rate: 0,
+        };
+        let blend_target = D3d12RenderTargetBlendDesc {
+            blend_enable: 0,
+            logic_op_enable: 0,
+            src_blend: D3D12_BLEND_ONE,
+            dest_blend: D3D12_BLEND_ZERO,
+            blend_op: D3D12_BLEND_OP_ADD,
+            src_blend_alpha: D3D12_BLEND_ONE,
+            dest_blend_alpha: D3D12_BLEND_ZERO,
+            blend_op_alpha: D3D12_BLEND_OP_ADD,
+            logic_op: 0,
+            render_target_write_mask: D3D12_COLOR_WRITE_ENABLE_ALL,
+        };
+        let blend_state = D3d12BlendDesc {
+            alpha_to_coverage_enable: 0,
+            independent_blend_enable: 0,
+            render_target: [blend_target; 8],
+        };
+        let rasterizer = D3d12RasterizerDesc {
+            fill_mode: D3D12_FILL_MODE_SOLID,
+            cull_mode: D3D12_CULL_MODE_NONE,
+            front_counter_clockwise: 0,
+            depth_bias: 0,
+            depth_bias_clamp: 0.0,
+            slope_scaled_depth_bias: 0.0,
+            depth_clip_enable: 1,
+            multisample_enable: 0,
+            antialiased_line_enable: 0,
+            forced_sample_count: 0,
+            conservative_raster: 0,
+        };
+        let depth_stencil = D3d12DepthStencilDesc {
+            depth_enable: 0,
+            depth_write_mask: D3D12_DEPTH_WRITE_MASK_ZERO,
+            depth_func: 0,
+            stencil_enable: 0,
+            stencil_read_mask: 0,
+            stencil_write_mask: 0,
+            front_face: D3d12DepthStencilopDesc {
+                stencil_fail_op: 0,
+                stencil_depth_fail_op: 0,
+                stencil_pass_op: 0,
+                stencil_func: 0,
+            },
+            back_face: D3d12DepthStencilopDesc {
+                stencil_fail_op: 0,
+                stencil_depth_fail_op: 0,
+                stencil_pass_op: 0,
+                stencil_func: 0,
+            },
+        };
+        let input_layout = D3d12InputLayoutDesc {
+            num_elements: 1,
+            elements: &input_element,
+        };
+        // The PSO desc's bytecode carries the blob's buffer (the
+        // GetBufferPointer's pointer), not the blob interface.
+        let (vs_bytecode, ps_bytecode) = unsafe {
+            (
+                call_slot_ptr_0(vs_blob as ComObject, BLOB_GET_BUFFER_POINTER),
+                call_slot_ptr_0(ps_blob as ComObject, BLOB_GET_BUFFER_POINTER),
+            )
+        };
+        let pso_desc = D3d12GraphicsPipelineStateDesc {
+            root_signature: self.tri_root_signature,
+            vs: D3d12ShaderBytecode {
+                bytecode: vs_bytecode,
+                length: vs_blob_size,
+            },
+            ps: D3d12ShaderBytecode {
+                bytecode: ps_bytecode,
+                length: ps_blob_size,
+            },
+            ds: D3d12ShaderBytecode {
+                bytecode: std::ptr::null(),
+                length: 0,
+            },
+            hs: D3d12ShaderBytecode {
+                bytecode: std::ptr::null(),
+                length: 0,
+            },
+            gs: D3d12ShaderBytecode {
+                bytecode: std::ptr::null(),
+                length: 0,
+            },
+            stream_output: D3d12StreamOutputDesc {
+                so_declaration: std::ptr::null(),
+                num_entries: 0,
+                head_padding: [0],
+                buffer_strides: std::ptr::null(),
+                num_strides: 0,
+                rasterized_stream: 0,
+            },
+            blend_state,
+            sample_mask: 0xffffffff,
+            rasterizer_state: rasterizer,
+            depth_stencil_state: depth_stencil,
+            input_layout,
+            ib_strip_cut_value: 0,
+            primitive_topology_type: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            num_render_targets: 1,
+            rtv_formats: [
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                0, 0, 0, 0, 0, 0, 0,
+            ],
+            dsv_format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+            sample_desc: D3d12SampleDesc { count: 1, quality: 0 },
+            node_mask: 0,
+            cached_pso: D3d12CachedPipelineState {
+                cached_blob: std::ptr::null_mut(),
+                cached_blob_size: 0,
+            },
+            flags: 0,
+        };
+        let mut pipeline: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            let hr = call_slot_i32_4(
+                self.device as ComObject,
+                DEVICE_CREATE_GRAPHICS_PIPELINE_STATE,
+                &pso_desc as *const D3d12GraphicsPipelineStateDesc
+                    as *mut c_void,
+                IID_ID3D12_PIPELINE_STATE_WORDS.as_ptr() as *mut c_void,
+                &mut pipeline as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if hr != S_OK || pipeline.is_null() {
+                return false;
+            }
+        }
+        // The vertex buffer: the UPLOAD heap's mapped resource carrying
+        // the three vertices.
+        let vertices: [f32; 9] = [
+            0.0, 0.8, 0.0, //
+            -0.8, -0.8, 0.0, //
+            0.8, -0.8, 0.0,
+        ];
+        let vertex_buffer = unsafe {
+            self_create_buffer(
+                self.device,
+                (vertices.len() * 4) as u64,
+                D3D12_HEAP_TYPE_UPLOAD,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            )
+        };
+        let vertex_buffer = match vertex_buffer {
+            Ok(buffer) => buffer,
+            Err(_) => return false,
+        };
+        let mut map: *mut c_void = std::ptr::null_mut();
+        let mapped = unsafe {
+            call_slot_i32_4(
+                vertex_buffer as ComObject,
+                RESOURCE_MAP,
+                0 as *mut c_void,
+                &D3d12Range { begin: 0, end: 0 } as *const D3d12Range
+                    as *mut c_void,
+                &mut map as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            )
+        };
+        if mapped != S_OK || map.is_null() {
+            return false;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                vertices.as_ptr() as *const u8,
+                map as *mut u8,
+                vertices.len() * 4,
+            );
+            call_slot_i32_2(
+                vertex_buffer as ComObject,
+                RESOURCE_UNMAP,
+                0 as *mut c_void,
+                std::ptr::null_mut(),
+            );
+        }
+        self.tri_pipeline = pipeline;
+        self.tri_vertex_buffer = vertex_buffer;
+        self.tri_ready = true;
+        true
+    }
+
+    /// Builds the triangle's uniform block bytes (the MVP column-major
+    /// followed by the colour).
+    fn build_tri_uniform(&self) -> TriUniform {
+        let aspect = self.config.width as f32 / self.config.height as f32;
+        let projection = Mat4::perspective(
+            std::f32::consts::FRAC_PI_2,
+            aspect,
+            0.1,
+            100.0,
+        );
+        let view = Mat4::look_at(
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        );
+        let mvp = projection.multiply(view);
+        let colour = self.config.triangle_color;
+        TriUniform {
+            mvp: mvp.m,
+            color: [
+                colour.r as f32 / 255.0,
+                colour.g as f32 / 255.0,
+                colour.b as f32 / 255.0,
+                colour.a as f32 / 255.0,
+            ],
+        }
+    }
+
+    /// The diagnostic triangle's draw: the frame's command list carries
+    /// the pipeline, the root signature, the 20-word constants block and
+    /// the three positions.
+    fn draw_triangle(&mut self) {
+        if self.shutdown || !self.tri_ready {
+            return;
+        }
+        let uniform = self.build_tri_uniform();
+        let uniform_words = unsafe {
+            std::slice::from_raw_parts(
+                &uniform as *const TriUniform as *const u32,
+                20,
+            )
+        };
+        let viewport = D3d12Viewport {
+            top_left_x: 0.0,
+            top_left_y: 0.0,
+            width: self.config.width as f32,
+            height: self.config.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = D3d12Rect {
+            left: 0,
+            top: 0,
+            right: self.config.width as i32,
+            bottom: self.config.height as i32,
+        };
+        let vertex_buffer_view = D3d12VertexBufferView {
+            buffer_location: unsafe {
+                call_slot_u64_0(
+                    self.tri_vertex_buffer as ComObject,
+                    RESOURCE_GET_GPU_VIRTUAL_ADDRESS,
+                )
+            },
+            size_in_bytes: 36,
+            stride_in_bytes: 12,
+        };
+        unsafe {
+            call_slot_i32_2(
+                self.command_list as ComObject,
+                COMMAND_LIST_SET_PIPELINE_STATE,
+                self.tri_pipeline,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_RSSET_VIEWPORTS,
+                1 as *mut c_void,
+                &viewport as *const D3d12Viewport as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_RSSET_SCISSOR_RECTS,
+                1 as *mut c_void,
+                &scissor as *const D3d12Rect as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_5(
+                self.command_list as ComObject,
+                COMMAND_LIST_OMSET_RENDER_TARGETS,
+                1 as *mut c_void,
+                &self.rtv_handle as *const D3d12CpuDescriptorHandle
+                    as *mut c_void,
+                0 as *mut c_void,
+                &self.dsv_handle as *const D3d12CpuDescriptorHandle
+                    as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_2(
+                self.command_list as ComObject,
+                COMMAND_LIST_SET_GRAPHICS_ROOT_SIGNATURE,
+                self.tri_root_signature,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_5(
+                self.command_list as ComObject,
+                COMMAND_LIST_SET_GRAPHICS_ROOT_32BIT_CONSTANTS,
+                0 as *mut c_void,
+                20 as *mut c_void,
+                uniform_words.as_ptr() as *const c_void as *mut c_void,
+                0 as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_5(
+                self.command_list as ComObject,
+                COMMAND_LIST_IASET_VERTEX_BUFFERS,
+                0 as *mut c_void,
+                1 as *mut c_void,
+                &vertex_buffer_view as *const D3d12VertexBufferView
+                    as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_2(
+                self.command_list as ComObject,
+                COMMAND_LIST_IASET_PRIMITIVE_TOPOLOGY,
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_DRAW_INSTANCED,
+                3 as *mut c_void,
+                1 as *mut c_void,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
+    /// The frame's clear: the colour and the depth/stencil clears are
+    /// recorded into the command list (the load actions the other
+    /// backends' clear carries).
+    fn clear_frame(&mut self) {
+        // The readback's copies left the resources in the COPY_SOURCE
+        // state; the second frame's barriers bring them back into the
+        // render states before the clears (the two-frame probe's rule,
+        // with the all-subresources transition).
+        let colour_return = D3d12ResourceBarrier {
+            type_: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            transition: D3d12ResourceTransitionBarrier {
+                resource: self.color_texture,
+                subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                state_before: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                state_after: D3D12_RESOURCE_STATE_RENDER_TARGET,
+            },
+        };
+        let depth_return = D3d12ResourceBarrier {
+            type_: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            transition: D3d12ResourceTransitionBarrier {
+                resource: self.depth_texture,
+                subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                state_before: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                state_after: D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            },
+        };
+        if self.resources_in_copy_source {
+            unsafe {
+                // The probe C's frame-2 rule: one barrier per call, the
+                // two back-transitions recorded separately (only after a
+                // readback actually moved the resources).
+                call_slot_i32_3(
+                    self.command_list as ComObject,
+                    COMMAND_LIST_RESOURCE_BARRIER,
+                    1 as *mut c_void,
+                    &colour_return as *const D3d12ResourceBarrier as *mut c_void,
+                    std::ptr::null_mut(),
+                );
+                call_slot_i32_3(
+                    self.command_list as ComObject,
+                    COMMAND_LIST_RESOURCE_BARRIER,
+                    1 as *mut c_void,
+                    &depth_return as *const D3d12ResourceBarrier as *mut c_void,
+                    std::ptr::null_mut(),
+                );
+            }
+            self.resources_in_copy_source = false;
+        }
+        let clear_colour = [
+            self.clear_color.r as f32 / 255.0,
+            self.clear_color.g as f32 / 255.0,
+            self.clear_color.b as f32 / 255.0,
+            self.clear_color.a as f32 / 255.0,
+        ];
+        let no_rect = D3d12Rect {
+            left: 0,
+            top: 0,
+            right: self.config.width as i32,
+            bottom: self.config.height as i32,
+        };
+        unsafe {
+            call_slot_i32_4(
+                self.command_list as ComObject,
+                COMMAND_LIST_CLEAR_RENDER_TARGET_VIEW,
+                // The clear's descriptor handle travels by value: the
+                // probe C's ClearRenderTargetView record carries the
+                // handle itself, and the Wine run's vkd3d read the
+                // stack garbage the pointer form left in the slot.
+                self.rtv_handle.ptr as *mut c_void,
+                clear_colour.as_ptr() as *const c_void as *mut c_void,
+                1 as *mut c_void,
+                &no_rect as *const D3d12Rect as *mut c_void,
+            );
+            call_slot_i32_f32(
+                self.command_list as ComObject,
+                COMMAND_LIST_CLEAR_DEPTH_STENCIL_VIEW,
+                self.dsv_handle.ptr as *mut c_void,
+                (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL)
+                    as u32,
+                self.clear_depth as f32,
+                self.clear_stencil as u32,
+                1,
+                &no_rect as *const D3d12Rect as *mut c_void,
+            );
+        }
+    }
+
+    /// The readback's one pixel: the three plane copies (the colour plane,
+    /// the depth plane's words, the stencil plane's bytes) are recorded
+    /// into the command list before the Close, the frame executes, and the
+    /// mapped staging buffer carries the pixel.
+    fn readback_pixel(&mut self, x: u32, y: u32) {
+        if self.color_texture.is_null() || self.depth_texture.is_null() {
+            return;
+        }
+        let colour_pitch = d3d::colour_row_pitch(self.config.width);
+        let stencil_pitch = d3d::stencil_row_pitch(self.config.width);
+        let colour_footprint = D3d12PlacedFootprint {
+            offset: 0,
+            footprint: D3d12SubresourceFootprint {
+                format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                width: self.config.width,
+                height: self.config.height,
+                depth: 1,
+                row_pitch: colour_pitch,
+            },
+        };
+        let depth_footprint = D3d12PlacedFootprint {
+            offset: STAGING_COLOUR_BYTES as u64,
+            footprint: D3d12SubresourceFootprint {
+                format: DXGI_FORMAT_R32_FLOAT,
+                width: self.config.width,
+                height: self.config.height,
+                depth: 1,
+                row_pitch: colour_pitch,
+            },
+        };
+        let stencil_footprint = D3d12PlacedFootprint {
+            offset: STAGING_STENCIL_OFFSET as u64,
+            footprint: D3d12SubresourceFootprint {
+                format: DXGI_FORMAT_R8_UINT,
+                width: self.config.width,
+                height: self.config.height,
+                depth: 1,
+                row_pitch: stencil_pitch,
+            },
+        };
+        let colour_dst = D3d12TextureCopyLocation {
+            resource: self.staging_buffer,
+            type_: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            placed_footprint: colour_footprint,
+        };
+        let depth_dst = D3d12TextureCopyLocation {
+            resource: self.staging_buffer,
+            type_: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            placed_footprint: depth_footprint,
+        };
+        let stencil_dst = D3d12TextureCopyLocation {
+            resource: self.staging_buffer,
+            type_: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            placed_footprint: stencil_footprint,
+        };
+        let colour_src = D3d12TextureCopyLocation {
+            resource: self.color_texture,
+            type_: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            placed_footprint: D3d12PlacedFootprint {
+                offset: 0,
+                footprint: D3d12SubresourceFootprint {
+                    format: 0,
+                    width: 0,
+                    height: 0,
+                    depth: 0,
+                    row_pitch: 0,
+                },
+            },
+        };
+        let depth_src = D3d12TextureCopyLocation {
+            resource: self.depth_texture,
+            type_: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            placed_footprint: D3d12PlacedFootprint {
+                offset: 0,
+                footprint: D3d12SubresourceFootprint {
+                    format: 0,
+                    width: 0,
+                    height: 0,
+                    depth: 0,
+                    row_pitch: 0,
+                },
+            },
+        };
+        let stencil_src = D3d12TextureCopyLocation {
+            resource: self.depth_texture,
+            type_: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            placed_footprint: D3d12PlacedFootprint {
+                // The union's first word is the subresource index: the
+                // stencil plane reads as subresource 1 (the probe C's
+                // rule), and the offset's low word carries it.
+                offset: 1,
+                footprint: D3d12SubresourceFootprint {
+                    format: 0,
+                    width: 0,
+                    height: 0,
+                    depth: 0,
+                    row_pitch: 0,
+                },
+            },
+        };
+        let colour_barrier = D3d12ResourceBarrier {
+            type_: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            transition: D3d12ResourceTransitionBarrier {
+                resource: self.color_texture,
+                subresource: 0,
+                state_before: D3D12_RESOURCE_STATE_RENDER_TARGET,
+                state_after: D3D12_RESOURCE_STATE_COPY_SOURCE,
+            },
+        };
+        let depth_barrier = D3d12ResourceBarrier {
+            type_: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            transition: D3d12ResourceTransitionBarrier {
+                resource: self.depth_texture,
+                subresource: 0,
+                state_before: D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                state_after: D3D12_RESOURCE_STATE_COPY_SOURCE,
+            },
+        };
+        unsafe {
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_RESOURCE_BARRIER,
+                1 as *mut c_void,
+                &colour_barrier as *const D3d12ResourceBarrier as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_6(
+                self.command_list as ComObject,
+                COMMAND_LIST_COPY_TEXTURE_REGION,
+                &colour_dst as *const D3d12TextureCopyLocation as *mut c_void,
+                0 as *mut c_void,
+                0 as *mut c_void,
+                0 as *mut c_void,
+                &colour_src as *const D3d12TextureCopyLocation as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_RESOURCE_BARRIER,
+                1 as *mut c_void,
+                &depth_barrier as *const D3d12ResourceBarrier as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_6(
+                self.command_list as ComObject,
+                COMMAND_LIST_COPY_TEXTURE_REGION,
+                &depth_dst as *const D3d12TextureCopyLocation as *mut c_void,
+                0 as *mut c_void,
+                0 as *mut c_void,
+                0 as *mut c_void,
+                &depth_src as *const D3d12TextureCopyLocation as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_6(
+                self.command_list as ComObject,
+                COMMAND_LIST_COPY_TEXTURE_REGION,
+                &stencil_dst as *const D3d12TextureCopyLocation as *mut c_void,
+                0 as *mut c_void,
+                0 as *mut c_void,
+                0 as *mut c_void,
+                &stencil_src as *const D3d12TextureCopyLocation as *mut c_void,
+                std::ptr::null_mut(),
+            );
+        }
+        // The copies left both resources in COPY_SOURCE: the next
+        // clear_frame's return barriers bring them back (the probe C's
+        // frame-2 rule).
+        self.resources_in_copy_source = true;
+        // The frame executes: the Close, the ExecuteCommandLists, the
+        // queue's Signal and the wait (the GPU-side completion is what
+        // the wait sees).
+        let hr = unsafe {
+            call_slot_i32_0(self.command_list as ComObject, COMMAND_LIST_CLOSE)
+        };
+        if hr != S_OK {
+            return;
+        }
+        let lists = [self.command_list];
+        unsafe {
+            call_slot_i32_3(
+                self.queue as ComObject,
+                QUEUE_EXECUTE_COMMAND_LISTS,
+                1 as *mut c_void,
+                lists.as_ptr() as *const c_void as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            self.fence_value += 1;
+            call_slot_i32_4(
+                self.queue as ComObject,
+                QUEUE_SIGNAL,
+                self.fence,
+                self.fence_value as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_3(
+                self.fence as ComObject,
+                FENCE_SET_EVENT_ON_COMPLETION,
+                self.fence_value as *mut c_void,
+                self.fence_event,
+                std::ptr::null_mut(),
+            );
+            self.loader
+                .wait_for_single_object
+                .expect("the loader resolved WaitForSingleObject")(
+                self.fence_event, 5000,
+            );
+        }
+        // The mapped staging buffer carries the three planes.
+        let mut map: *mut c_void = std::ptr::null_mut();
+        let mapped = unsafe {
+            call_slot_i32_4(
+                self.staging_buffer as ComObject,
+                RESOURCE_MAP,
+                0 as *mut c_void,
+                &D3d12Range {
+                    begin: 0,
+                    end: STAGING_SIZE as u64,
+                } as *const D3d12Range as *mut c_void,
+                &mut map as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            )
+        };
+        if mapped != S_OK || map.is_null() {
+            return;
+        }
+        let map = map as *mut u8;
+        let cx = x as usize;
+        let cy = y as usize;
+        let colour = unsafe {
+            let row = map.add(cy * colour_pitch as usize);
+            let p = row.add(cx * 4);
+            ClearColor {
+                r: *p,
+                g: *p.add(1),
+                b: *p.add(2),
+                a: *p.add(3),
+            }
+        };
+        let depth_word = unsafe {
+            let words = map.add(STAGING_DEPTH_OFFSET) as *const u32;
+            let row_words = colour_pitch as usize / 4;
+            *words.add(cy * row_words + cx)
+        };
+        let depth = (depth_word & 0x00ff_ffff) as f32 / 16_777_215.0;
+        let stencil = unsafe {
+            let bytes = map.add(STAGING_STENCIL_OFFSET);
+            let row = bytes.add(cy * stencil_pitch as usize);
+            *row.add(cx) as i32
+        };
+        unsafe {
+            call_slot_i32_3(
+                self.staging_buffer as ComObject,
+                RESOURCE_UNMAP,
+                0 as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+        }
+        self.has_center = true;
+        self.center = colour;
+        self.center_depth = depth;
+        self.center_stencil = stencil;
+        self.last_readback.push(ReadbackSample {
+            x,
+            y,
+            color: colour,
+            depth,
+            stencil,
+        });
+    }
+}
+
+impl RenderBackend for D3d12Backend {
+    fn describe(&self) -> String {
+        format!(
+            "d3d12 feature_level=0x{:x} vendor=0x{:04x} renderer={}",
+            self.feature_level, self.adapter_vendor, self.adapter_desc
+        )
+    }
+
+    fn set_clear_color(&mut self, color: ClearColor) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        self.clear_color = color;
+    }
+
+    fn clear_color(&self) -> ClearColor {
+        self.clear_color
+    }
+
+    fn set_depth_test_enabled(&mut self, enabled: bool) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        self.depth_test_enabled = enabled;
+    }
+
+    fn clear(&mut self) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        // The frame's command list opens: the allocator and the list
+        // reset, the clears and the diagnostic draw are recorded.
+        let hr = unsafe {
+            call_slot_i32_0(self.allocator as ComObject, ALLOCATOR_RESET)
+        };
+        if hr != S_OK {
+            self.violations += 1;
+            return;
+        }
+        let hr = unsafe {
+            call_slot_i32_2(
+                self.command_list as ComObject,
+                COMMAND_LIST_RESET,
+                self.allocator,
+                self.tri_pipeline,
+            )
+        };
+        if hr != S_OK {
+            self.violations += 1;
+            return;
+        }
+        self.clear_frame();
+        if self.config.draw_triangle {
+            self.ensure_triangle_resources();
+            self.draw_triangle();
+        }
+        self.frame_open = true;
+    }
+
+    fn width(&self) -> u32 {
+        self.config.width
+    }
+
+    fn height(&self) -> u32 {
+        self.config.height
+    }
+
+    fn shutdown(&mut self) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        self.shutdown = true;
+    }
+
+    fn violation_count(&self) -> u64 {
+        self.violations
+    }
+
+    fn create_shader_program(
+        &mut self,
+        id: u32,
+    ) -> Result<ShaderProgram, RenderError> {
+        if self.shutdown {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "create_shader_program: the backend is shut down",
+            ));
+        }
+        Ok(ShaderProgram {
+            inner: Arc::new(Mutex::new(ShaderProgramInner {
+                id,
+                compiled: true,
+            })),
+        })
+    }
+
+    fn create_gpu_mesh(&mut self) -> Result<GpuMesh, RenderError> {
+        if self.shutdown {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "create_gpu_mesh: the backend is shut down",
+            ));
+        }
+        Ok(GpuMesh {
+            inner: Arc::new(Mutex::new(GpuMeshInner {
+                vertex_count: 0,
+                index_count: 0,
+                uploaded: false,
+            })),
+        })
+    }
+
+    fn upload_mesh(
+        &mut self,
+        mesh: &GpuMesh,
+        layout: &VertexLayout,
+        vertices: &[u8],
+        indices: &[u32],
+    ) -> Result<(), RenderError> {
+        if self.shutdown {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "upload_mesh: the backend is shut down",
+            ));
+        }
+        if layout.stride == 0 {
+            return Err(RenderError::from(
+                "upload_mesh: the layout's stride must be positive",
+            ));
+        }
+        let mut inner = mesh.inner.lock().unwrap();
+        inner.vertex_count = (vertices.len() as u32) / layout.stride;
+        inner.index_count = indices.len() as u32;
+        inner.uploaded = true;
+        Ok(())
+    }
+
+    fn draw(&mut self, mesh: &GpuMesh, _program: &ShaderProgram) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        let inner = mesh.inner.lock().unwrap();
+        if !inner.uploaded {
+            self.violations += 1;
+        }
+    }
+
+    fn submit(&mut self, submission: &DrawSubmission) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        let inner = submission.mesh.inner.lock().unwrap();
+        if !inner.uploaded {
+            self.violations += 1;
+        }
+    }
+
+    fn create_render_target(
+        &mut self,
+        desc: &RenderTargetDesc,
+    ) -> Result<RenderTarget, RenderError> {
+        if self.shutdown {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "create_render_target: the backend is shut down",
+            ));
+        }
+        desc.validate()?;
+        let mut views = Vec::new();
+        for i in 0..desc.color_attachment_count as usize {
+            let format = desc.color_formats[i];
+            let resource = unsafe {
+                self_create_texture(
+                    self.device,
+                    self.to_d3d_format(format),
+                    desc.width,
+                    desc.height,
+                    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                )?
+            };
+            views.push(D3d12Texture2D {
+                inner: Arc::new(Mutex::new(TextureViewInner {
+                    width: desc.width,
+                    height: desc.height,
+                    depth: 1,
+                    format,
+                    is_depth: false,
+                    released: false,
+                })),
+                resource,
+                released: false,
+            });
+        }
+        let depth_view = if desc.depth_attachment {
+            let format = desc.depth_format;
+            let resource = unsafe {
+                self_create_texture(
+                    self.device,
+                    DXGI_FORMAT_D24_UNORM_S8_UINT,
+                    desc.width,
+                    desc.height,
+                    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    None,
+                )?
+            };
+            Some(D3d12Texture2D {
+                inner: Arc::new(Mutex::new(TextureViewInner {
+                    width: desc.width,
+                    height: desc.height,
+                    depth: 1,
+                    format,
+                    is_depth: true,
+                    released: false,
+                })),
+                resource,
+                released: false,
+            })
+        } else {
+            None
+        };
+        let target = D3d12RenderTarget {
+            inner: Arc::new(Mutex::new(RenderTargetInner {
+                width: desc.width,
+                height: desc.height,
+                color_attachment_count: desc.color_attachment_count,
+                depth_attachment: desc.depth_attachment,
+                released: false,
+            })),
+            views,
+            depth_view,
+            released: false,
+        };
+        let handle = RenderTarget {
+            inner: Arc::clone(&target.inner),
+        };
+        self.targets.push(target);
+        Ok(handle)
+    }
+
+    fn begin_render_pass(&mut self, target: Option<&RenderTarget>) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        self.bound_target = target.map(|t| Arc::clone(&t.inner));
+        self.pass_open = true;
+    }
+
+    fn end_render_pass(&mut self) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        self.bound_target = None;
+        self.pass_open = false;
+    }
+
+    fn release_render_target(&mut self, target: &RenderTarget) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        match self
+            .targets
+            .iter_mut()
+            .find(|t| Arc::ptr_eq(&t.inner, &target.inner))
+        {
+            Some(t) => {
+                if t.released {
+                    self.violations += 1;
+                } else {
+                    t.released = true;
+                    target.inner.lock().unwrap().released = true;
+                }
+            }
+            None => {
+                self.violations += 1;
+            }
+        }
+    }
+
+    fn render_target_texture(&self, target: &RenderTarget) -> Option<TextureView> {
+        self.render_target_texture_at(target, 0)
+    }
+
+    fn render_target_texture_at(
+        &self,
+        target: &RenderTarget,
+        attachment: u32,
+    ) -> Option<TextureView> {
+        let index = self
+            .targets
+            .iter()
+            .position(|t| Arc::ptr_eq(&t.inner, &target.inner))?;
+        let t = &self.targets[index];
+        if t.released {
+            return None;
+        }
+        if attachment == DEPTH_ATTACHMENT {
+            let depth_view = t.depth_view.as_ref()?;
+            return Some(TextureView {
+                inner: Arc::clone(&depth_view.inner),
+            });
+        }
+        let view = t.views.get(attachment as usize)?;
+        Some(TextureView {
+            inner: Arc::clone(&view.inner),
+        })
+    }
+
+    fn bind_texture(&mut self, _view: Option<&TextureView>, _unit: u32) {
+        if self.shutdown {
+            self.violations += 1;
+        }
+    }
+
+    fn create_texture_2d(
+        &mut self,
+        desc: &Texture2DDesc,
+    ) -> Result<TextureView, RenderError> {
+        if self.shutdown {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "create_texture_2d: the backend is shut down",
+            ));
+        }
+        desc.validate()?;
+        let resource = unsafe {
+            self_create_texture(
+                self.device,
+                self.to_d3d_format(desc.format),
+                desc.width,
+                desc.height,
+                0,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+            )?
+        };
+        let view = D3d12Texture2D {
+            inner: Arc::new(Mutex::new(TextureViewInner {
+                width: desc.width,
+                height: desc.height,
+                depth: 1,
+                format: desc.format,
+                is_depth: false,
+                released: false,
+            })),
+            resource,
+            released: false,
+        };
+        let handle = TextureView {
+            inner: Arc::clone(&view.inner),
+        };
+        self.textures_2d.push(view);
+        Ok(handle)
+    }
+
+    fn release_texture_2d(&mut self, view: &TextureView) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        match self
+            .textures_2d
+            .iter_mut()
+            .find(|t| Arc::ptr_eq(&t.inner, &view.inner))
+        {
+            Some(t) => {
+                if t.released {
+                    self.violations += 1;
+                } else {
+                    t.released = true;
+                    view.inner.lock().unwrap().released = true;
+                }
+            }
+            None => {
+                self.violations += 1;
+            }
+        }
+    }
+
+    fn fill_texture_2d(
+        &mut self,
+        view: &TextureView,
+        data: &[u8],
+    ) -> Result<(), RenderError> {
+        if self.shutdown {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "fill_texture_2d: the backend is shut down",
+            ));
+        }
+        let index = self
+            .textures_2d
+            .iter()
+            .position(|t| Arc::ptr_eq(&t.inner, &view.inner))
+            .ok_or_else(|| {
+                RenderError::from(
+                    "fill_texture_2d: the texture is not owned by this \
+                     backend",
+                )
+            })?;
+        if self.textures_2d[index].released {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "fill_texture_2d: the texture is released",
+            ));
+        }
+        let inner = view.inner.lock().unwrap();
+        let expected = (inner.width as usize)
+            * (inner.height as usize)
+            * bytes_per_pixel(inner.format) as usize;
+        drop(inner);
+        if data.len() != expected {
+            return Err(RenderError::from(format!(
+                "fill_texture_2d: expected {} bytes, got {}",
+                expected,
+                data.len()
+            )));
+        }
+        // The upload path lands in the next milestones (the same rule the
+        // other backends record); the size validation is the contract's
+        // rule here.
+        Ok(())
+    }
+
+    fn read_texture_2d(
+        &self,
+        view: &TextureView,
+        data: &mut [u8],
+    ) -> Result<bool, RenderError> {
+        let index = self
+            .textures_2d
+            .iter()
+            .position(|t| Arc::ptr_eq(&t.inner, &view.inner));
+        let index = match index {
+            Some(index) => index,
+            None => {
+                return Err(RenderError::from(
+                    "read_texture_2d: the texture is not owned by this \
+                     backend",
+                ));
+            }
+        };
+        if self.textures_2d[index].released {
+            return Ok(false);
+        }
+        let inner = view.inner.lock().unwrap();
+        let expected = (inner.width as usize)
+            * (inner.height as usize)
+            * bytes_per_pixel(inner.format) as usize;
+        drop(inner);
+        if data.len() != expected {
+            return Err(RenderError::from(format!(
+                "read_texture_2d: expected {} bytes, got {}",
+                expected,
+                data.len()
+            )));
+        }
+        // The readback is validation-only for now (the same rule the
+        // other backends record).
+        Ok(false)
+    }
+
+    fn set_camera(&mut self, camera: CameraParams) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        self.camera = camera;
+    }
+
+    fn camera(&self) -> CameraParams {
+        self.camera
+    }
+
+    fn swap_buffers(&mut self) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        // The readback happens before the frame ends (the same
+        // pre-present rule the other backends record).
+        self.readback();
+        self.frame_open = false;
+    }
+
+    fn queue_readback(&mut self, x: u32, y: u32) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        self.readback_queue.push((x, y));
+    }
+
+    fn readback(&mut self) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        self.last_readback.clear();
+        let queue = std::mem::take(&mut self.readback_queue);
+        if self.config.readback_center || !queue.is_empty() {
+            self.readback_pixel(self.config.width / 2, self.config.height / 2);
+        }
+        for (x, y) in queue {
+            self.readback_pixel(x, y);
+        }
+    }
+
+    fn last_readback(&self) -> &[ReadbackSample] {
+        &self.last_readback
+    }
+
+    fn has_center_pixel(&self) -> bool {
+        self.has_center
+    }
+
+    fn center_pixel(&self) -> ClearColor {
+        self.center
+    }
+
+    fn center_depth(&self) -> f32 {
+        self.center_depth
+    }
+
+    fn center_stencil(&self) -> i32 {
+        self.center_stencil
+    }
+}

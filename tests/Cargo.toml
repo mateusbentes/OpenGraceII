@@ -11,6 +11,7 @@ og2-core = { path = "../core" }
 vulkan = ["og2-core/vulkan"]
 opengl = ["og2-core/opengl"]
 metal = ["og2-core/metal"]
+d3d12 = ["og2-core/d3d12"]
 
 [[test]]
 name = "docs"

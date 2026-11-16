@@ -17,6 +17,8 @@ pub mod vulkan;
 pub mod opengl;
 #[cfg(feature = "metal")]
 pub mod metal;
+#[cfg(feature = "d3d12")]
+pub mod d3d12;
 pub use null::{NullEvent, NullRenderBackend};
 #[cfg(feature = "vulkan")]
 pub use vulkan::{VulkanBackend, VulkanBackendConfig};
@@ -24,6 +26,8 @@ pub use vulkan::{VulkanBackend, VulkanBackendConfig};
 pub use opengl::{OpenGlBackend, OpenGlBackendConfig};
 #[cfg(feature = "metal")]
 pub use metal::{MetalBackend, MetalBackendConfig};
+#[cfg(feature = "d3d12")]
+pub use d3d12::{D3d12Backend, D3d12BackendConfig};
 
 use std::sync::{Arc, Mutex};
 // Re-exported so the backend modules (and the engine's other modules) reach

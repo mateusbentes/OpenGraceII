@@ -22,8 +22,12 @@ Milestone 3 is in progress: the OpenGL backend is done (the engine's own
 EGL + GL 3.3 core loader, validated on Linux with llvmpipe through an EGL
 surfaceless context), and the Metal backend is implemented (the engine's
 own Objective-C runtime loader, no Apple SDK headers; the module compiles
-on any platform and the hardware run needs a Mac). Direct3D 12 (Windows)
-follows.
+on any platform and the hardware run needs a Mac). The Direct3D 12
+backend is implemented and validated under Wine with vkd3d over lavapipe:
+the smoke run creates the device, clears, draws the diagnostic triangle,
+copies the three planes and reads the centre pixel back (the colour and
+the depth planes match; the stencil plane's copy is undefined under
+vkd3d and its value is reported, not asserted).
 
 ## The lessons from OpenGrace
 

@@ -15,7 +15,7 @@ The `.docx` files in this directory are generated from the `.md` sources with
 | --- | --- | --- |
 | 1 | Rust skeleton: Cargo workspace, module layout, the validation matrix (build, test, docs checks), the pinned toolchain | Done |
 | 2 | Render contract and the first backend: Vulkan on Linux (lavapipe); the Android hardware run follows | Done |
-| 3 | The remaining backends: OpenGL (Windows/Linux), Metal (macOS/iOS), Direct3D 12 (Windows) | In progress (OpenGL done, Metal implemented; the D3D 12 and the Metal hardware runs follow) |
+| 3 | The remaining backends: OpenGL (Windows/Linux), Metal (macOS/iOS), Direct3D 12 (Windows) | In progress (OpenGL done, Metal implemented, Direct3D 12 validated under Wine with vkd3d; the Metal hardware run follows) |
 | 4 | Render foundation: math, mesh, shader, material | Planned |
 | 5 | Forward lighting: light types, shadow mapping | Planned |
 | 6 | Deferred lighting: MRT G-buffer, the lighting pass | Planned |
@@ -65,6 +65,8 @@ cargo build --features og2-core/vulkan,og2-core/opengl
 cargo test -p og2-tests --features og2-core/vulkan,og2-core/opengl
 cargo build --features og2-core/metal
 cargo test -p og2-tests --features og2-tests/vulkan,og2-tests/opengl,og2-tests/metal
+cargo build --features og2-core/d3d12
+cargo test -p og2-tests --features og2-tests/vulkan,og2-tests/opengl,og2-tests/metal,og2-tests/d3d12
 ```
 
 The render suite's source imports the backends' types, so the render
@@ -120,6 +122,33 @@ for the Apple targets):
   (objc_getClass, sel_registerName, objc_msgSend resolved through
   dlopen of the platform's libobjc; no Apple SDK headers, no third-party
   binding), the same rule the Vulkan and the OpenGL loaders record.
+---
+Milestone 3 (the Direct3D 12 backend), Linux x86_64, Rust 1.100.0
+(cross-build with the MinGW x86_64-w64-mingw32 toolchain; the runtime
+validation ran under Wine 9.0 with vkd3d 1.3 over lavapipe):
+
+- The D3D12 backend is the engine's own loader over d3d12.dll and
+  dxgi.dll (CreateDXGIFactory1, D3D12CreateDevice, D3DCompile from
+  d3dcompiler_47.dll), resolved through the kernel32 load surface and
+  hand-written COM vtable calls — no third-party wrapper, the same rule
+  the Vulkan, the OpenGL and the Metal loaders record.
+- The cross-build compiles with zero errors and zero warnings for
+  x86_64-pc-windows-gnu, and the Linux build links with the loader's
+  kernel32 imports gated behind `#[cfg(windows)]` so the platform
+  without d3d12.dll skips cleanly.
+- The smoke run under Wine creates the device (the GPU vkd3d reports),
+  clears, draws the diagnostic triangle, copies the three planes and
+  reads the centre pixel back: the colour plane matches the clear
+  colour exactly and the depth plane reads 1.0 at the centre.
+- The stencil plane's copy (subresource 1 of the D24S8 depth-stencil
+  resource) is undefined under vkd3d/lavapipe: the value read back
+  changes between runs of the same binary. The backend's D3D12 usage
+  is the standard idiom, so the smoke run reports the stencil value
+  without asserting it; a hardware D3D12 run would settle it.
+- `cargo test --features vulkan,opengl,metal,d3d12`: 12 tests passed —
+  3 docs-rule suites and 9 render tests (the null backend, the Vulkan
+  smoke, the Metal smoke and the D3D12 smoke, which skips cleanly where
+  the platform has no d3d12.dll).
 
 ---
 

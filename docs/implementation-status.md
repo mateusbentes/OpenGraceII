@@ -15,7 +15,7 @@ The `.docx` files in this directory are generated from the `.md` sources with
 | --- | --- | --- |
 | 1 | Rust skeleton: Cargo workspace, module layout, the validation matrix (build, test, docs checks), the pinned toolchain | Done |
 | 2 | Render contract and the first backend: Vulkan on Linux (lavapipe); the Android hardware run follows | Done |
-| 3 | The remaining backends: OpenGL (Windows/Linux), Metal (macOS/iOS), Direct3D 12 (Windows) | Planned |
+| 3 | The remaining backends: OpenGL (Windows/Linux), Metal (macOS/iOS), Direct3D 12 (Windows) | In progress (OpenGL done) |
 | 4 | Render foundation: math, mesh, shader, material | Planned |
 | 5 | Forward lighting: light types, shadow mapping | Planned |
 | 6 | Deferred lighting: MRT G-buffer, the lighting pass | Planned |
@@ -61,8 +61,13 @@ The `.docx` files in this directory are generated from the `.md` sources with
 
 ```sh
 cargo build
-cargo test
+cargo build --features og2-core/vulkan,og2-core/opengl
+cargo test -p og2-tests --features og2-core/vulkan,og2-core/opengl
 ```
+
+The render suite's source imports the backends' types, so the render
+target compiles only when the corresponding features are enabled; the
+featureless `cargo test` runs the docs-rules suite alone.
 
 ---
 
@@ -88,6 +93,15 @@ Milestone 2 (render contract + the Vulkan backend), Linux x86_64, Rust
   layer reports zero violations on the smoke run.
 - The Android hardware run stays open (the same milestone's validation on
   a device follows).
+
+Milestone 3 (the OpenGL backend), Linux x86_64, Rust 1.100.0, EGL
+surfaceless + llvmpipe:
+- `cargo build --features opengl`: the workspace builds, no warnings.
+- `cargo test`: 10 tests passed — 3 docs-rule suites and 7 render tests.
+- The OpenGL smoke test renders the diagnostic triangle through the
+  engine's own EGL + GL 3.3 core loader (no third-party binding), reads
+  the centre pixel back and validates the clear colour, the clear depth
+  and the clear stencil values, matching the Vulkan backend's smoke run.
 
 ---
 

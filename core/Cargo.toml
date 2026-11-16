@@ -10,6 +10,7 @@ path = "src/lib.rs"
 [features]
 default = []
 vulkan = ["dep:libc"]
+opengl = ["dep:libc"]
 
 [dependencies]
 # The Vulkan backend dlopen()s the platform's libvulkan.so.1 and resolves
@@ -20,3 +21,7 @@ libc = { version = "0.2", optional = true }
 [[example]]
 name = "vk_smoke"
 required-features = ["vulkan"]
+
+[[example]]
+name = "gl_smoke"
+required-features = ["opengl"]

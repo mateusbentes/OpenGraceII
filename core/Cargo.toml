@@ -16,10 +16,14 @@ metal = ["dep:libc"]
 # (kernel32 extern "system"), so it does not need the libc dlopen surface.
 d3d12 = []
 
-[dependencies]
-# The Vulkan backend dlopen()s the platform's libvulkan.so.1 and resolves
-# vkGetInstanceProcAddr itself; libc is only the dlopen/dlsym surface, and
-# the engine never calls into a third-party Vulkan binding (lesson 3).
+[target.'cfg(not(windows))'.dependencies]
+# The Vulkan and the OpenGL backends dlopen() the platform's libraries and
+# resolve the entry points themselves; libc is only the dlopen/dlsym
+# surface, and the engine never calls into a third-party binding (lesson
+# 3). Windows is not the dlopen family (the loaders use the platform's own
+# LoadLibrary surface there, see each backend's cfg gates), so the
+# dependency is target gated and the manifest stays warning-free on the
+# windows-gnu cross-check.
 libc = { version = "0.2", optional = true }
 
 [[example]]

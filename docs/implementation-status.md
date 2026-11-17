@@ -152,6 +152,48 @@ validation ran under Wine 9.0 with vkd3d 1.3 over lavapipe):
 
 ---
 
+The macOS build's first run (the Metal hardware validation's build
+step) found two portability defects the Linux-only validation could not
+see, both fixed in the same milestone:
+
+- The Vulkan build script required glslangValidator on every machine
+  with the feature enabled, even where the Vulkan backend only compiles
+  and never runs (macOS, iOS). The build script now falls back to the
+  committed SPIR-V arrays (vulkan_spirv_committed.rs, generated on the
+  Linux validation machine by the same validator) when the validator is
+  absent, and recompiles the shader library when it is present; the
+  fallback's smoke run reproduces the generated path's result exactly.
+- The Vulkan, the OpenGL and the Metal loaders referenced the libc
+  dlopen surface unconditionally, so the windows-gnu cross-build of the
+  full feature matrix failed. The Vulkan loader now carries the
+  platform's own LoadLibraryW surface on Windows (vulkan-1.dll, the ICD
+  loader's canonical name), and the OpenGL and the Metal loaders fail
+  cleanly at load time with the platform's own message (the EGL
+  surfaceless path and the Metal framework do not exist on Windows; the
+  WGL path is its own future milestone). The libc dependency is target
+  gated, and the full matrix (Linux all-features, windows-gnu
+  all-features, and the four-feature test suite) builds warning-free.
+
+The macOS hardware run's first frame exposed two further defects, both
+fixed in the same milestone:
+
+- The render pipeline descriptor's colour attachment was set with a
+  single-argument selector that does not exist on the Metal API; the
+  runtime raised an Objective-C exception the Rust process cannot
+  catch. The call now uses the two-argument
+  setColorAttachmentPixelFormat:forIndex: form the API declares.
+- The frame's command buffer was never encoded: the clear and the
+  triangle's draw were stubs. The clear pass now records the render
+  pass descriptor (the frame target's colour and depth/stencil
+  attachments with the clear load actions), the triangle's draw encodes
+  inside the pass, and the swap's commit closes the frame the way the
+  Vulkan submit path does.
+- The four-feature test suite's Vulkan smoke used process::exit on its
+  skip path, which aborts the whole test binary on machines without a
+  Vulkan loader; the skip now returns like the other smokes.
+
+---
+
 ## Lessons carried from OpenGrace
 
 The five lessons recorded at the close of OpenGrace's first full campaign

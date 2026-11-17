@@ -448,6 +448,14 @@ impl Default for GlLoader {
 
 /// dlopen()s the platform's EGL library (libEGL.so.1) and resolves the
 /// EGL surface through eglGetProcAddress; then resolves the GL core.
+///
+/// The EGL surfaceless path is a POSIX shape (libEGL.so.1 is a
+/// dlopen()ed library): on Windows the load fails cleanly with the
+/// platform's own message and the backend reports it (the build-only
+/// status the validation matrix records; a WGL path would be its own
+/// milestone). The loader's other functions stay platform-neutral, so
+/// the Windows build links the module unchanged.
+#[cfg(not(windows))]
 pub fn load_library() -> Result<*mut c_void, String> {
     unsafe {
         let handle = libc::dlopen(
@@ -464,6 +472,17 @@ pub fn load_library() -> Result<*mut c_void, String> {
     }
 }
 
+#[cfg(windows)]
+pub fn load_library() -> Result<*mut c_void, String> {
+    Err(
+        "OpenGlBackend: the EGL surfaceless path does not exist on \
+         Windows (the build-only status; the WGL path is its own \
+         milestone)"
+            .to_string(),
+    )
+}
+
+#[cfg(not(windows))]
 pub unsafe fn get_library_proc(
     library: *mut c_void,
     name: &str,
@@ -472,6 +491,15 @@ pub unsafe fn get_library_proc(
     libc::dlsym(library, name_c.as_ptr())
 }
 
+#[cfg(windows)]
+pub unsafe fn get_library_proc(
+    _library: *mut c_void,
+    _name: &str,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+#[cfg(not(windows))]
 unsafe fn dl_error_string() -> String {
     let err = libc::dlerror();
     if err.is_null() {
@@ -480,6 +508,7 @@ unsafe fn dl_error_string() -> String {
         std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned()
     }
 }
+
 
 impl GlLoader {
     /// Resolves the EGL surface through the library handle, then the GL
@@ -491,14 +520,18 @@ impl GlLoader {
         library: *mut c_void,
         missing: &mut String,
     ) -> bool {
-        // The EGL surface resolves through dlsym on the library handle.
+        // The EGL surface resolves through dlsym on the library handle
+        // (the get_library_proc call carries the platform's gate: on
+        // Windows the load failed before this runs and the function is
+        // the null stub).
         macro_rules! load_egl {
             ($field:ident, $name:literal) => {
                 if self.$field.is_none() {
                     unsafe {
-                        let symbol =
-                            libc::dlsym(library, concat!($name, "\0").as_ptr()
-                                as *const c_char);
+                        let symbol = get_library_proc(
+                            library,
+                            $name,
+                        );
                         if symbol.is_null() {
                             *missing = $name.to_string();
                             return false;

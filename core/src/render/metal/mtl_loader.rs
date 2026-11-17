@@ -94,6 +94,13 @@ pub const MTLLV_2_0: NsUInteger = 2 << 8;
 // from a storage mode plus the default cache mode.
 pub const MTLRO_SHARED: NsUInteger = MTLSM_SHARED << 4;
 pub const MTLRO_PRIVATE: NsUInteger = MTLSM_PRIVATE << 4;
+// The published blit options: the combined depth/stencil formats'
+// buffer copies name the plane the copy carries through the
+// copy(...options:) variant (the plain copy form is the API's
+// forbidden form for these formats — the hardware run's zero
+// depth/stencil readback caught it).
+pub const MTLBLOPT_DEPTH_FROM_DEPTH_STENCIL: NsUInteger = 1;
+pub const MTLBLOPT_STENCIL_FROM_DEPTH_STENCIL: NsUInteger = 2;
 
 // ---------------------------------------------------------------------------
 // Fixed-size structures (the published C layouts)
@@ -203,6 +210,10 @@ impl MtlLoader {
 
     /// The dlopen path attempt. On Apple platforms the framework loads;
     /// elsewhere it reports false with a clear missing-symbol message.
+    /// The Windows build links the module but the load fails cleanly
+    /// before any dlopen (no libobjc, no Metal.framework there; the
+    /// build-only status the validation matrix records).
+    #[cfg(not(windows))]
     pub fn load(&mut self, missing: &mut String) -> bool {
         if self.loaded {
             return true;
@@ -296,6 +307,12 @@ impl MtlLoader {
         true
     }
 
+    #[cfg(windows)]
+    pub fn load(&mut self, missing: &mut String) -> bool {
+        *missing = "the Objective-C runtime (no Metal on Windows)".to_string();
+        false
+    }
+
     /// Registers a selector by name (the backend's sel_registerName
     /// wrapper; the selector string is interned once).
     pub fn sel(&self, name: &str) -> *mut c_void {
@@ -359,6 +376,51 @@ impl MtlLoader {
         f(self_, sel, arg)
     }
 
+    /// The message-send form `id objc_msgSend(id self, SEL op, id arg1,
+    /// id arg2, id arg3)`: three object arguments, one object return
+    /// (the device's newLibraryWithSource:options:error:, whose third
+    /// argument is the NSError** out-slot the caller passes by pointer).
+    pub unsafe fn send_ptr_arg3(
+        &self,
+        self_: *mut c_void,
+        sel: *mut c_void,
+        arg1: *mut c_void,
+        arg2: *mut c_void,
+        arg3: *mut c_void,
+    ) -> *mut c_void {
+        let f: unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+        ) -> *mut c_void = std::mem::transmute(self.objc_msg_send.unwrap());
+        f(self_, sel, arg1, arg2, arg3)
+    }
+
+    /// The message-send form `id objc_msgSend(id self, SEL op, id arg1,
+    /// void* arg2)`: one object argument and one pointer (the device's
+    /// newRenderPipelineStateWithDescriptor:error:, whose second
+    /// argument is the NSError** out-slot the caller passes by
+    /// pointer — the API's only documented synchronous pipeline
+    /// creation; the plain descriptor-only form does not exist in the
+    /// protocol's headers).
+    pub unsafe fn send_ptr_arg2(
+        &self,
+        self_: *mut c_void,
+        sel: *mut c_void,
+        arg1: *mut c_void,
+        arg2: *mut c_void,
+    ) -> *mut c_void {
+        let f: unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+        ) -> *mut c_void = std::mem::transmute(self.objc_msg_send.unwrap());
+        f(self_, sel, arg1, arg2)
+    }
+
     pub unsafe fn send_void(&self, self_: *mut c_void, sel: *mut c_void) {
         let f: unsafe extern "C" fn(*mut c_void, *mut c_void) =
             std::mem::transmute(self.objc_msg_send.unwrap());
@@ -387,7 +449,61 @@ impl MtlLoader {
             *mut c_void,
             NsUInteger,
         ) = std::mem::transmute(self.objc_msg_send.unwrap());
-        f(self_, sel, arg)
+        f(self_, sel, arg);
+    }
+
+    /// The message-send form `void objc_msgSend(id self, SEL op, double
+    /// arg)`: one double argument (the depth attachment's clear depth).
+    pub unsafe fn send_void_double(
+        &self,
+        self_: *mut c_void,
+        sel: *mut c_void,
+        arg: f64,
+    ) {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void, f64) =
+            std::mem::transmute(self.objc_msg_send.unwrap());
+        f(self_, sel, arg);
+    }
+
+    /// The message-send form `void objc_msgSend(id self, SEL op,
+    /// MTLClearColor arg)`: the clear colour's four-double struct. The
+    /// struct is a homogeneous floating-point aggregate, so the arm64
+    /// ABI passes it in the vector registers (v0..v3) the C ABI's own
+    /// rule gives it.
+    pub unsafe fn send_void_clear_color(
+        &self,
+        self_: *mut c_void,
+        sel: *mut c_void,
+        arg: MtlClearColor,
+    ) {
+        let f: unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            MtlClearColor,
+        ) = std::mem::transmute(self.objc_msg_send.unwrap());
+        f(self_, sel, arg);
+    }
+
+    /// The message-send form `void objc_msgSend(id self, SEL op, id arg,
+    /// NSUInteger arg2, NSUInteger arg3)`: one object and two integers
+    /// (the buffer bindings' setVertexBuffer:offset:atIndex: and
+    /// setFragmentBuffer:offset:atIndex:).
+    pub unsafe fn send_void_ptr_ul2(
+        &self,
+        self_: *mut c_void,
+        sel: *mut c_void,
+        arg1: *mut c_void,
+        arg2: NsUInteger,
+        arg3: NsUInteger,
+    ) {
+        let f: unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            NsUInteger,
+            NsUInteger,
+        ) = std::mem::transmute(self.objc_msg_send.unwrap());
+        f(self_, sel, arg1, arg2, arg3);
     }
 
     pub unsafe fn send_void_ul2(
@@ -403,7 +519,28 @@ impl MtlLoader {
             NsUInteger,
             NsUInteger,
         ) = std::mem::transmute(self.objc_msg_send.unwrap());
-        f(self_, sel, arg1, arg2)
+        f(self_, sel, arg1, arg2);
+    }
+
+    /// The message-send form `void objc_msgSend(id self, SEL op,
+    /// NSUInteger arg1, NSUInteger arg2, NSUInteger arg3)`: three
+    /// integers (the draw's drawPrimitives:vertexStart:vertexCount:).
+    pub unsafe fn send_void_ul3(
+        &self,
+        self_: *mut c_void,
+        sel: *mut c_void,
+        arg1: NsUInteger,
+        arg2: NsUInteger,
+        arg3: NsUInteger,
+    ) {
+        let f: unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            NsUInteger,
+            NsUInteger,
+            NsUInteger,
+        ) = std::mem::transmute(self.objc_msg_send.unwrap());
+        f(self_, sel, arg1, arg2, arg3);
     }
 
     pub unsafe fn send_ul_ret_ptr(

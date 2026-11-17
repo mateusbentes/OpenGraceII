@@ -28,6 +28,7 @@ fn main() {
     println!("center_depth: {}", backend.center_depth());
     println!("center_stencil: {}", backend.center_stencil());
     println!("violations: {}", backend.violation_count());
+    println!("tri_error: {}", backend.triangle_error());
     backend.shutdown();
     let ok = backend.has_center_pixel()
         && backend.center_pixel() == ClearColor { r: 200, g: 40, b: 40, a: 255 }

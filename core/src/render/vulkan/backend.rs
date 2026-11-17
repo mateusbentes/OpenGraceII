@@ -2703,24 +2703,65 @@ impl RenderBackend for VulkanBackend {
 /// backend resolves the entry points through the library's
 /// vkGetInstanceProcAddr, so the runtime link-time dependency is only the
 /// platform's libvulkan.so.1 (the same rule the OpenGL backend follows).
+///
+/// On Windows the same surface is LoadLibraryW over vulkan-1.dll (the
+/// platform's own loading primitives, the same rule): the functions are
+/// the kernel32 imports the platform itself provides, gated behind
+/// cfg(windows) with the non-Windows stubs keeping the module linkable.
 unsafe fn load_library() -> Result<*mut std::os::raw::c_void, RenderError> {
-    let names = [
-        b"libvulkan.so.1\0".as_ref(),
-        b"libvulkan.so\0".as_ref(),
-    ];
-    for name in &names {
-        let handle = libc::dlopen(name.as_ptr() as *const _,
-                                  libc::RTLD_NOW | libc::RTLD_LOCAL);
-        if !handle.is_null() {
-            return Ok(handle);
+    #[cfg(windows)]
+    {
+        // The UTF-16 "vulkan-1.dll" literal (the loader's canonical
+        // Windows name, the ICD loader's own export).
+        let name: [u16; 13] = [
+            0x0076, 0x0075, 0x006c, 0x006b, 0x0061, 0x006e, 0x002d,
+            0x0031, 0x002e, 0x0064, 0x006c, 0x006c, 0x0000,
+        ];
+        let handle = LoadLibraryW(name.as_ptr());
+        if handle.is_null() {
+            return Err(RenderError::from(
+                "VulkanBackend: the platform's vulkan-1.dll could not be \
+                 loaded",
+            ));
         }
+        return Ok(handle);
     }
-    Err(RenderError::from(
-        "VulkanBackend: the platform's libvulkan.so.1 could not be loaded",
-    ))
+    #[cfg(not(windows))]
+    {
+        let names = [
+            b"libvulkan.so.1\0".as_ref(),
+            b"libvulkan.so\0".as_ref(),
+        ];
+        for name in &names {
+            let handle = libc::dlopen(name.as_ptr() as *const _,
+                                      libc::RTLD_NOW | libc::RTLD_LOCAL);
+            if !handle.is_null() {
+                return Ok(handle);
+            }
+        }
+        Err(RenderError::from(
+            "VulkanBackend: the platform's libvulkan.so.1 could not be \
+             loaded",
+        ))
+    }
 }
 
-/// One library symbol by name.
+// The kernel32 imports the Windows path needs (the platform's own
+// loading primitives). The dlsym shape carries over: on Windows the
+// GetProcAddress replaces dlsym.
+#[cfg(windows)]
+extern "system" {
+    fn LoadLibraryW(
+        name: *const u16,
+    ) -> *mut std::os::raw::c_void;
+    fn GetProcAddress_vk(
+        module: *mut std::os::raw::c_void,
+        name: *const u8,
+    ) -> *mut std::os::raw::c_void;
+}
+
+/// One library symbol by name. On Windows the GetProcAddress is the
+/// dlsym's counterpart; on the other platforms the dlsym stays.
 unsafe fn get_library_proc(
     library: *mut std::os::raw::c_void,
     name: &str,
@@ -2728,5 +2769,34 @@ unsafe fn get_library_proc(
     let mut bytes = Vec::with_capacity(name.len() + 1);
     bytes.extend_from_slice(name.as_bytes());
     bytes.push(0);
-    libc::dlsym(library, bytes.as_ptr() as *const _)
+    #[cfg(windows)]
+    {
+        GetProcAddress_vk(library, bytes.as_ptr() as *const u8)
+    }
+    #[cfg(not(windows))]
+    {
+        libc::dlsym(library, bytes.as_ptr() as *const _)
+    }
+}
+
+// The non-Windows stubs for the kernel32 imports keep the module
+// linkable where the backend never reaches the Windows path (the
+// backend reports its load error before any call).
+// The reserved names are the platform's own entry-point spellings; the
+// allow keeps the never-called stubs quiet (the cfg pair makes each
+// half compile on exactly one platform).
+#[cfg(not(windows))]
+#[allow(non_snake_case, dead_code)]
+unsafe extern "system" fn LoadLibraryW(
+    _name: *const u16,
+) -> *mut std::os::raw::c_void {
+    std::ptr::null_mut()
+}
+#[cfg(not(windows))]
+#[allow(non_snake_case, dead_code)]
+unsafe extern "system" fn GetProcAddress(
+    _module: *mut std::os::raw::c_void,
+    _name: *const u8,
+) -> *mut std::os::raw::c_void {
+    std::ptr::null_mut()
 }

@@ -43,5 +43,16 @@ void main()
 /// build script. The generated file is the build's output; the engine
 /// never links a third-party Vulkan binding (lesson 3).
 pub mod spirv {
+    // The generated path is the build's normal output; the committed
+    // path is the fallback for the machines without glslangValidator
+    // (the macOS and the iOS builds where the Vulkan backend only
+    // compiles and never runs). The build script picks the path with
+    // the spirv_generated and the spirv_fallback cfgs.
+    #[cfg(feature = "vulkan")]
+    #[cfg(not(spirv_fallback))]
     include!(concat!(env!("OUT_DIR"), "/vulkan_spirv.rs"));
+
+    #[cfg(feature = "vulkan")]
+    #[cfg(spirv_fallback)]
+    include!("vulkan_spirv_committed.rs");
 }

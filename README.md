@@ -28,6 +28,13 @@ the smoke run creates the device, clears, draws the diagnostic triangle,
 copies the three planes and reads the centre pixel back (the colour and
 the depth planes match; the stencil plane's copy is undefined under
 vkd3d and its value is reported, not asserted).
+The Metal backend's first hardware run on macOS found two real defects
+the Linux-only validation could not see: a render pipeline descriptor
+selector that does not exist on the Metal API (the runtime raised an
+Objective-C exception the Rust process cannot catch) and a frame path
+whose clear and draw were stubs. Both are fixed: the pass now records
+the clear load actions, the triangle encodes inside the pass, and the
+swap's commit closes the frame the way the Vulkan submit path does.
 
 ## The lessons from OpenGrace
 

@@ -14,20 +14,24 @@
 pub const TRIANGLE_VERTEX_SHADER: &str = r"
 #include <metal_stdlib>
 using namespace metal;
-struct VertexUniforms
+struct Uniforms
 {
     float4x4 mvp;
+    float4 color;
 };
 struct VertexOut
 {
     float4 position [[position]];
 };
-vertex VertexOut vertexMain(uint vid [[vertex_id]],
-                            float3 position [[attribute(0)]],
-                            constant VertexUniforms& u [[buffer(0)]])
+struct VertexIn
+{
+    float3 position [[attribute(0)]];
+};
+vertex VertexOut vertexMain(VertexIn in [[stage_in]],
+                            constant Uniforms& u [[buffer(0)]])
 {
     VertexOut out;
-    out.position = u.mvp * float4(position, 1.0);
+    out.position = u.mvp * float4(in.position, 1.0);
     return out;
 }
 ";
@@ -36,11 +40,12 @@ vertex VertexOut vertexMain(uint vid [[vertex_id]],
 pub const TRIANGLE_FRAGMENT_SHADER: &str = r"
 #include <metal_stdlib>
 using namespace metal;
-struct FragmentUniforms
+struct Uniforms
 {
+    float4x4 mvp;
     float4 color;
 };
-fragment float4 fragmentMain(constant FragmentUniforms& u [[buffer(0)]])
+fragment float4 fragmentMain(constant Uniforms& u [[buffer(0)]])
 {
     return u.color;
 }

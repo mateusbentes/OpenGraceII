@@ -143,8 +143,12 @@ fn vulkan_backend_smoke() {
     let mut backend = match VulkanBackend::new(config) {
         Ok(b) => b,
         Err(e) => {
+            // The platform has no Vulkan loader (the Mac and the iOS
+            // builds compile the backend but never run it): the skip is
+            // a return, never a process exit (an exit would kill the
+            // whole test binary, the defect the macOS suite run caught).
             eprintln!("skip: {}", e);
-            std::process::exit(77);
+            return;
         }
     };
     backend.set_clear_color(CLEAR_COLOR);

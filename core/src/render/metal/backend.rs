@@ -27,10 +27,13 @@
 //! the `RenderError` message.
 
 use super::mtl_loader::{
-    MtlLoader, MtlOrigin, MtlSize,
+    MtlClearColor, MtlLoader, MtlOrigin, MtlSize,
     MTLPX_RGBA8_UNORM, MTLPX_RGBA16_FLOAT, MTLPX_R8_UNORM,
     MTLPX_DEPTH24_UNORM_STENCIL8, MTLPX_DEPTH32_FLOAT_STENCIL8,
+    MTLLA_CLEAR, MTLSA_STORE,
+    MTLPT_TRIANGLE,
     MTLVF_FLOAT3, MTLSF_PER_VERTEX, MTLSM_SHARED, MTLSM_PRIVATE,
+    MTLBLOPT_DEPTH_FROM_DEPTH_STENCIL, MTLBLOPT_STENCIL_FROM_DEPTH_STENCIL,
     MTLCU_RENDER_TARGET, MTLCU_SHADER_READ,
 };
 use super::super::{
@@ -133,6 +136,15 @@ pub struct MetalBackend {
     tri_pipeline: super::mtl_loader::MtlRenderPipelineStateHandle,
     tri_uniform_buffer: super::mtl_loader::MtlBufferHandle,
     tri_ready: bool,
+    /// The first failure's stage in the triangle resources' setup, with
+    /// the API's own error text where one exists (the hardware run's
+    /// diagnostic: the contract's render-path failures are silent
+    /// unless they surface here).
+    tri_error: String,
+    // The frame's open command buffer (the clear pass's record; the
+    // swap's commit closes the frame the way the Vulkan submit_frame
+    // carries).
+    frame_command_buffer: super::mtl_loader::MtlCommandBufferHandle,
     // The clear colour and the clear state.
     clear_color: ClearColor,
     clear_depth: f32,
@@ -206,6 +218,8 @@ impl MetalBackend {
             tri_pipeline: std::ptr::null_mut(),
             tri_uniform_buffer: std::ptr::null_mut(),
             tri_ready: false,
+            tri_error: String::new(),
+            frame_command_buffer: std::ptr::null_mut(),
             clear_color: ClearColor {
                 r: 0,
                 g: 0,
@@ -237,6 +251,13 @@ impl MetalBackend {
         };
         backend.initialise()?;
         Ok(backend)
+    }
+
+    /// The first failure's stage in the triangle resources' setup (an
+    /// empty string means the setup succeeded; the diagnostic the
+    /// smoke examples surface before the frame's checks).
+    pub fn triangle_error(&self) -> &str {
+        &self.tri_error
     }
 
     /// The off-screen frame target's textures: the colour attachment (RGBA8
@@ -343,36 +364,69 @@ impl MetalBackend {
 
     /// Compiles the two MSL sources into one MTLLibrary (the device's own
     /// compiler; a nil return is the compile failure's signal).
-    fn compile_library(
+    fn compile_stage(
         &mut self,
-        vertex_source: &str,
-        fragment_source: &str,
+        source: &str,
+        stage: &'static str,
     ) -> Option<super::mtl_loader::MTLLibraryHandle> {
-        let mut source = String::with_capacity(
-            vertex_source.len() + fragment_source.len() + 1,
-        );
-        source.push_str(vertex_source);
-        source.push_str(fragment_source);
-        let source_string = self.make_ns_string(&source);
+        let source_string = self.make_ns_string(source);
         if source_string.is_null() {
+            self.tri_error = format!("{}: the source's NSString failed", stage);
             return None;
         }
         let options = unsafe {
             self.loader
                 .alloc_init(self.loader.cls_mtl_compile_options)
         };
+        // The device's real library-creation method is
+        // newLibraryWithSource:options:error: (the compile-error out-slot
+        // is the NSError** the caller passes by pointer; a nil return is
+        // the compile failure's signal). The earlier compileSource:
+        // options: selector does not exist in the API, so the runtime
+        // raised the NSInvalidArgumentException the Rust runtime cannot
+        // catch — the hardware run's crash right after the describe:.
+        let mut compile_error: *mut c_void = std::ptr::null_mut();
         let library = unsafe {
-            self.loader.send_ptr_arg(
+            self.loader.send_ptr_arg3(
                 self.device,
-                self.loader.sel("compileSource:options:"),
+                self.loader.sel("newLibraryWithSource:options:error:"),
                 source_string,
+                options,
+                &mut compile_error as *mut *mut c_void as *mut c_void,
             )
         };
-        let _ = options;
         if library.is_null() {
+            self.tri_error = if compile_error.is_null() {
+                format!("{}: the library creation returned nil", stage)
+            } else {
+                format!("{}: {}", stage, self.ns_error_text(compile_error))
+            };
             None
         } else {
             Some(library)
+        }
+    }
+
+    /// Reads an NSError's message (the localizedDescription property's
+    /// NSString through UTF8String, the same read the device name uses).
+    fn ns_error_text(&self, error: *mut c_void) -> String {
+        let description = unsafe {
+            self.loader.send0(error, self.loader.sel("localizedDescription"))
+        };
+        if description.is_null() {
+            return "an unnamed error".to_string();
+        }
+        let text = unsafe {
+            self.loader
+                .send_ret_ptr(description, self.loader.sel("UTF8String"))
+        };
+        if text.is_null() {
+            return "an unnamed error".to_string();
+        }
+        unsafe {
+            std::ffi::CStr::from_ptr(text as *const std::os::raw::c_char)
+                .to_string_lossy()
+                .into_owned()
         }
     }
 
@@ -494,27 +548,48 @@ impl MetalBackend {
         if self.tri_ready {
             return true;
         }
-        let library = match self.compile_library(
+        // One library per stage (the same compile shape the C++ Metal
+        // backend records): the combined-source library had no failure
+        // signal this path could read, so the stage that failed stayed
+        // unnamed in the smoke's diagnostic.
+        let vertex_library = match self.compile_stage(
             super::shader_library::TRIANGLE_VERTEX_SHADER,
-            super::shader_library::TRIANGLE_FRAGMENT_SHADER,
+            "the vertex stage's library",
         ) {
             Some(library) => library,
             None => return false,
         };
-        let vertex_function = match self.new_function(library, "vertexMain") {
-            Some(function) => function,
+        let vertex_function =
+            match self.new_function(vertex_library, "vertexMain") {
+                Some(function) => function,
+                None => {
+                    self.tri_error = "vertexMain lookup failed".to_string();
+                    return false;
+                }
+            };
+        let fragment_library = match self.compile_stage(
+            super::shader_library::TRIANGLE_FRAGMENT_SHADER,
+            "the fragment stage's library",
+        ) {
+            Some(library) => library,
             None => return false,
         };
         let fragment_function =
-            match self.new_function(library, "fragmentMain") {
+            match self.new_function(fragment_library, "fragmentMain") {
                 Some(function) => function,
-                None => return false,
+                None => {
+                    self.tri_error =
+                        "fragmentMain lookup failed".to_string();
+                    return false;
+                }
             };
         let descriptor = unsafe {
             self.loader
                 .alloc_init(self.loader.cls_mtl_render_pipeline_descriptor)
         };
         if descriptor.is_null() {
+            self.tri_error =
+                "pipeline descriptor alloc failed".to_string();
             return false;
         }
         unsafe {
@@ -530,11 +605,24 @@ impl MetalBackend {
             );
         }
         // The vertex descriptor: one Float3 attribute (position) at
-        // buffer index 0, per-vertex.
+        // buffer index 1 (the vertices' buffer; the uniform sits at
+        // buffer index 0), per-vertex. The layout array is indexed by
+        // buffer index, so the stride lands on layout 1. The
+        // constructor is the class method vertexDescriptor (the API's
+        // documented form: it returns "a default object with allocated
+        // arrays in the attributes and layouts properties") — the
+        // alloc/init pair leaves the arrays unallocated, the pipeline's
+        // validation nils the state and the triangle draw is silently
+        // dropped (the hardware run's missing draw caught it).
         let vertex_descriptor = unsafe {
-            self.loader.alloc_init(self.loader.cls_mtl_vertex_descriptor)
+            self.loader.send0(
+                self.loader.cls_mtl_vertex_descriptor,
+                self.loader.sel("vertexDescriptor"),
+            )
         };
         if vertex_descriptor.is_null() {
+            self.tri_error = "the vertex descriptor's constructor failed"
+                .to_string();
             return false;
         }
         let attributes = unsafe {
@@ -557,7 +645,7 @@ impl MetalBackend {
             self.loader.send_ul_ret_ptr(
                 layouts,
                 self.loader.sel("objectAtIndexedSubscript:"),
-                0,
+                1,
             )
         };
         unsafe {
@@ -569,7 +657,7 @@ impl MetalBackend {
             self.loader.send_void_ul(
                 attribute_0,
                 self.loader.sel("setBufferIndex:"),
-                0,
+                1,
             );
             self.loader.send_void_ul(
                 attribute_0,
@@ -592,10 +680,24 @@ impl MetalBackend {
                 vertex_descriptor,
             );
             // The colour attachment's pixel format follows the frame
-            // target's (the off-screen target's RGBA8 unorm).
+            // target's (the off-screen target's RGBA8 unorm). The pipeline
+            // descriptor carries the per-attachment formats through its
+            // colourAttachments array (the same indexed-subscript pattern
+            // the render pass descriptor uses; the hardware run caught the
+            // direct-selector forms as Objective-C exceptions the Rust
+            // runtime cannot catch).
+            let colour_attachments = self.loader.send0(
+                    descriptor,
+                    self.loader.sel("colorAttachments"),
+            );
+            let colour_attachment_0 = self.loader.send_ul_ret_ptr(
+                    colour_attachments,
+                    self.loader.sel("objectAtIndexedSubscript:"),
+                    0,
+            );
             self.loader.send_void_ul(
-                descriptor,
-                self.loader.sel("setColorAttachmentPixelFormat:"),
+                colour_attachment_0,
+                self.loader.sel("setPixelFormat:"),
                 MTLPX_RGBA8_UNORM,
             );
             // The depth attachment's pixel format (the depth/stencil
@@ -605,22 +707,44 @@ impl MetalBackend {
                 self.loader.sel("setDepthAttachmentPixelFormat:"),
                 self.depth_format,
             );
+            // The stencil attachment's pixel format: the combined
+            // depth/stencil format carries the pass's stencilAttachment
+            // texture too, so the pipeline's descriptor must name the
+            // same format (its default MTLPixelFormatInvalid fails the
+            // pipeline's match validation, which nils the pipeline state
+            // and silently drops the triangle draw).
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setStencilAttachmentPixelFormat:"),
+                self.depth_format,
+            );
         }
         let pipeline = unsafe {
-            self.loader.send_ptr_arg(
+            let mut pipeline_error: *mut c_void = std::ptr::null_mut();
+            let pipeline = self.loader.send_ptr_arg2(
                 self.device,
-                self.loader.sel("newRenderPipelineStateWithDescriptor:"),
+                self.loader
+                    .sel("newRenderPipelineStateWithDescriptor:error:"),
                 descriptor,
-            )
+                &mut pipeline_error as *mut *mut c_void as *mut c_void,
+            );
+            if pipeline.is_null() {
+                self.tri_error = if pipeline_error.is_null() {
+                    "the pipeline state creation returned nil".to_string()
+                } else {
+                    self.ns_error_text(pipeline_error)
+                };
+                return false;
+            }
+            pipeline
         };
-        if pipeline.is_null() {
-            return false;
-        }
         // The triangle's uniform buffer: the shared-storage buffer the
         // draw binds (the same staging rule the other backends follow).
         let uniform = self.build_tri_uniform();
         let buffer = self.create_shared_buffer(&uniform);
         if buffer.is_null() {
+            self.tri_error =
+                "uniform buffer allocation failed".to_string();
             return false;
         }
         self.tri_pipeline = pipeline;
@@ -633,22 +757,227 @@ impl MetalBackend {
     /// the pipeline, the uniform buffer and the triangle's three
     /// positions. The triangle never writes depth (the same scoped toggle
     /// the other backends apply).
-    fn draw_triangle(&mut self) {
-        if self.shutdown || !self.tri_ready {
+    fn draw_triangle(&mut self, encoder: *mut c_void) {
+        if self.shutdown || !self.tri_ready || encoder.is_null() {
             return;
         }
-        // The frame's command buffer and encoder exist only inside the
-        // frame's clear pass (the next milestones' release path wires the
-        // full pass); the resources are ensured once here.
-        let _ = self.tri_pipeline;
-        let _ = self.tri_uniform_buffer;
+        unsafe {
+            // The pipeline state and the uniform buffer bind at the
+            // vertex stage's buffer index 0 (the shader's `buffer(0)`
+            // qualifier) and the fragment stage's buffer index 0 (the
+            // fragment shader's own `buffer(0)` qualifier).
+            self.loader.send_void_ptr(
+                encoder,
+                self.loader.sel("setRenderPipelineState:"),
+                self.tri_pipeline,
+            );
+            self.loader.send_void_ptr_ul2(
+                encoder,
+                self.loader.sel("setVertexBuffer:offset:atIndex:"),
+                self.tri_uniform_buffer,
+                0,
+                0,
+            );
+            self.loader.send_void_ptr_ul2(
+                encoder,
+                self.loader.sel("setFragmentBuffer:offset:atIndex:"),
+                self.tri_uniform_buffer,
+                0,
+                0,
+            );
+            // The triangle's three vertices (the NDC positions the
+            // Vulkan backend's mesh carries), stride 12: the vertex
+            // buffer at index 1 (the vertex descriptor's attribute 0
+            // points there).
+            let vertices: [f32; 9] = [
+                -0.5, -0.5, 0.0, //
+                0.5, -0.5, 0.0, //
+                0.0, 0.5, 0.0,
+            ];
+            let vertex_bytes = std::slice::from_raw_parts(
+                vertices.as_ptr() as *const u8,
+                vertices.len() * 4,
+            );
+            let vertex_buffer = self.create_shared_buffer(vertex_bytes);
+            if vertex_buffer.is_null() {
+                self.violations += 1;
+                return;
+            }
+            self.loader.send_void_ptr_ul2(
+                encoder,
+                self.loader.sel("setVertexBuffer:offset:atIndex:"),
+                vertex_buffer,
+                0,
+                1,
+            );
+            self.loader.send_void_ul3(
+                encoder,
+                self.loader.sel("drawPrimitives:vertexStart:vertexCount:"),
+                MTLPT_TRIANGLE,
+                0,
+                3,
+            );
+        }
     }
 
     /// The frame's clear: the render pass's load actions carry the clear
-    /// values when the frame's command buffer runs.
-    fn clear_frame(&mut self) {
-        // The recorded state lives until the frame's encode; the pass's
-        // load actions read it then.
+    /// values when the frame's command buffer runs. The command buffer
+    /// stays open until the swap's commit (the Vulkan begin/submit
+    /// frame's same shape).
+    fn clear_frame(&mut self) -> *mut c_void {
+        let command_buffer = unsafe {
+            self.loader.send0(self.queue, self.loader.sel("commandBuffer"))
+        };
+        if command_buffer.is_null() {
+            self.violations += 1;
+            return std::ptr::null_mut();
+        }
+        // The render pass descriptor: the frame target's two attachments
+        // with the clear load actions (the same shape the Vulkan
+        // begin_frame's clear values carry).
+        let pass_descriptor = unsafe {
+            self.loader.alloc_init(
+                self.loader.cls_mtl_render_pass_descriptor,
+            )
+        };
+        if pass_descriptor.is_null() {
+            self.violations += 1;
+            return std::ptr::null_mut();
+        }
+        let colour_attachments = unsafe {
+            self.loader.send0(
+                pass_descriptor,
+                self.loader.sel("colorAttachments"),
+            )
+        };
+        let colour_attachment = unsafe {
+            self.loader.send_ul_ret_ptr(
+                colour_attachments,
+                self.loader.sel("objectAtIndexedSubscript:"),
+                0,
+            )
+        };
+        let depth_attachment = unsafe {
+            self.loader.send0(
+                pass_descriptor,
+                self.loader.sel("depthAttachment"),
+            )
+        };
+        if colour_attachment.is_null() || depth_attachment.is_null() {
+            self.violations += 1;
+            return std::ptr::null_mut();
+        }
+        let colour = self.clear_color;
+        let mtl_colour = MtlClearColor {
+            red: colour.r as f64 / 255.0,
+            green: colour.g as f64 / 255.0,
+            blue: colour.b as f64 / 255.0,
+            alpha: colour.a as f64 / 255.0,
+        };
+        unsafe {
+            self.loader.send_void_ptr(
+                colour_attachment,
+                self.loader.sel("setTexture:"),
+                self.color_texture,
+            );
+            self.loader.send_void_clear_color(
+                colour_attachment,
+                self.loader.sel("setClearColor:"),
+                mtl_colour,
+            );
+            self.loader.send_void_ul(
+                colour_attachment,
+                self.loader.sel("setLoadAction:"),
+                MTLLA_CLEAR,
+            );
+            self.loader.send_void_ul(
+                colour_attachment,
+                self.loader.sel("setStoreAction:"),
+                MTLSA_STORE,
+            );
+            self.loader.send_void_ptr(
+                depth_attachment,
+                self.loader.sel("setTexture:"),
+                self.depth_texture,
+            );
+            self.loader.send_void_double(
+                depth_attachment,
+                self.loader.sel("setClearDepth:"),
+                self.clear_depth as f64,
+            );
+            // The depth attachment's own load/store actions: the
+            // descriptor's default is DontCare, so the clear depth never
+            // lands without them (the hardware run's NaN readback caught
+            // the fix that moved the stencil selectors to the
+            // stencilAttachment and left the depth attachment's own
+            // actions unset).
+            self.loader.send_void_ul(
+                depth_attachment,
+                self.loader.sel("setLoadAction:"),
+                MTLLA_CLEAR,
+            );
+            self.loader.send_void_ul(
+                depth_attachment,
+                self.loader.sel("setStoreAction:"),
+                MTLSA_STORE,
+            );
+            // The stencil attachment is a separate descriptor: the
+            // depth attachment's descriptor carries no stencil selectors
+            // (setClearStencil:, setStencilLoadAction: and
+            // setStencilStoreAction: belong to the stencilAttachment,
+            // so sending them to the depth attachment raised the
+            // NSInvalidArgumentException the Rust runtime cannot catch
+            // — the hardware run's crash right after the describe:).
+            let stencil_attachment = self.loader.send0(
+                pass_descriptor,
+                self.loader.sel("stencilAttachment"),
+            );
+            if stencil_attachment.is_null() {
+                self.violations += 1;
+                return std::ptr::null_mut();
+            }
+            self.loader.send_void_ptr(
+                stencil_attachment,
+                self.loader.sel("setTexture:"),
+                self.depth_texture,
+            );
+            self.loader.send_void_ul(
+                stencil_attachment,
+                self.loader.sel("setClearStencil:"),
+                self.clear_stencil as super::mtl_loader::NsUInteger,
+            );
+            self.loader.send_void_ul(
+                stencil_attachment,
+                self.loader.sel("setLoadAction:"),
+                MTLLA_CLEAR,
+            );
+            self.loader.send_void_ul(
+                stencil_attachment,
+                self.loader.sel("setStoreAction:"),
+                MTLSA_STORE,
+            );
+        }
+        let encoder = unsafe {
+            self.loader.send_ptr_arg(
+                command_buffer,
+                self.loader.sel("renderCommandEncoderWithDescriptor:"),
+                pass_descriptor,
+            )
+        };
+        if encoder.is_null() {
+            self.violations += 1;
+            return std::ptr::null_mut();
+        }
+        // The triangle's draw happens inside the pass (the encoder stays
+        // open until the frame's end; the caller closes it).
+        if self.config.draw_triangle {
+            self.ensure_triangle_resources();
+            self.draw_triangle(encoder);
+        }
+        unsafe {
+            self.loader.send_void(encoder, self.loader.sel("endEncoding"));
+        }
+        command_buffer
     }
 
     /// The readback's one pixel: the blit command encoder copies the
@@ -678,10 +1007,20 @@ impl MetalBackend {
         if blit.is_null() {
             return;
         }
+        // The depth/stencil copy: the combined formats' copies carry
+        // the plane the copy names through the options variant (the
+        // plain copy form is the API's forbidden form for these
+        // formats — the hardware run's zero depth/stencil readback
+        // caught it). The depth plane's copy carries the depth value
+        // packed in the low word of each 4-byte destination pixel (the
+        // 24/8 format's depth in the bottom three bytes; the 32F/8
+        // format's depth float in the whole word), and the stencil
+        // plane's copy carries the stencil byte in each 4-byte pixel's
+        // bottom byte (the API's packed-copies' convention).
         let copy = self.loader.sel(
             "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:\
              sourceSize:toBuffer:destinationOffset:\
-             destinationBytesPerRow:destinationBytesPerImage:",
+             destinationBytesPerRow:destinationBytesPerImage:options:",
         );
         unsafe {
             // The colour copy: one pixel at (x, y), one row of 4 bytes.
@@ -694,6 +1033,7 @@ impl MetalBackend {
                 MtlOrigin,
                 MtlSize,
                 super::mtl_loader::MtlBufferHandle,
+                super::mtl_loader::NsUInteger,
                 super::mtl_loader::NsUInteger,
                 super::mtl_loader::NsUInteger,
                 super::mtl_loader::NsUInteger,
@@ -718,9 +1058,8 @@ impl MetalBackend {
                 0,
                 4,
                 4,
+                0,
             );
-            // The depth copy: the same one pixel, the depth/stencil
-            // plane's packed word landing at offset 16.
             if !self.depth_texture.is_null() {
                 f(
                     blit,
@@ -742,6 +1081,34 @@ impl MetalBackend {
                     16,
                     4,
                     4,
+                    MTLBLOPT_DEPTH_FROM_DEPTH_STENCIL,
+                );
+                // The stencil plane's copy: the API's rule is one plane
+                // per copy (the options variant takes either the depth
+                // or the stencil option, "but not both"), so the stencil
+                // lands in its own copy at offset 20, one 4-byte pixel
+                // carrying the stencil byte in its bottom byte.
+                f(
+                    blit,
+                    copy,
+                    self.depth_texture,
+                    0,
+                    0,
+                    MtlOrigin {
+                        x: x as u64,
+                        y: y as u64,
+                        z: 0,
+                    },
+                    MtlSize {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                    staging,
+                    20,
+                    4,
+                    4,
+                    MTLBLOPT_STENCIL_FROM_DEPTH_STENCIL,
                 );
             }
             self.loader.send_void(blit, self.loader.sel("endEncoding"));
@@ -767,26 +1134,31 @@ impl MetalBackend {
             b: bytes[2],
             a: bytes[3],
         };
-        // The depth/stencil word: the packed 4-byte texel. The 24/8
-        // format's depth lives in the top three bytes, the stencil in the
-        // low byte; the 32F/8 format's depth is a float and the stencil
-        // stays 0 (the same rule the Vulkan readback records).
+        // The depth/stencil word: the packed 4-byte texel the options
+        // variant's copies land (the depth plane's copy puts the depth
+        // in the low word — the 24/8 format's depth in the bottom three
+        // bytes, the 32F/8 format's depth float in the whole word; the
+        // stencil plane's copy puts the stencil byte in each pixel's
+        // bottom byte).
         let depth_stencil = u32::from_le_bytes([
             bytes[16],
             bytes[17],
             bytes[18],
             bytes[19],
         ]);
-        let (depth, stencil) = if self.depth_format
+        let stencil = (u32::from_le_bytes([
+            bytes[20],
+            bytes[21],
+            bytes[22],
+            bytes[23],
+        ]) & 0xFF) as i32;
+        let depth = if self.depth_format
             == MTLPX_DEPTH24_UNORM_STENCIL8
         {
             let depth24 = depth_stencil >> 8;
-            let depth = depth24 as f32 / 16_777_215.0;
-            let stencil = (depth_stencil & 0xFF) as i32;
-            (depth, stencil)
+            depth24 as f32 / 16_777_215.0
         } else {
-            let depth = f32::from_bits(depth_stencil);
-            (depth, 0)
+            f32::from_bits(depth_stencil)
         };
         self.has_center = true;
         self.center = colour;
@@ -832,11 +1204,7 @@ impl RenderBackend for MetalBackend {
             self.violations += 1;
             return;
         }
-        self.clear_frame();
-        if self.config.draw_triangle {
-            self.ensure_triangle_resources();
-            self.draw_triangle();
-        }
+        self.frame_command_buffer = self.clear_frame();
         self.frame_open = true;
     }
 
@@ -1250,6 +1618,21 @@ impl RenderBackend for MetalBackend {
         if self.shutdown {
             self.violations += 1;
             return;
+        }
+        // The frame's command buffer commits (the pass's load actions and
+        // the triangle's draw run now; the same rule the Vulkan
+        // submit_frame's queue submit carries).
+        let command_buffer = self.frame_command_buffer;
+        self.frame_command_buffer = std::ptr::null_mut();
+        if !command_buffer.is_null() {
+            unsafe {
+                self.loader
+                    .send_void(command_buffer, self.loader.sel("commit"));
+                self.loader.send_void(
+                    command_buffer,
+                    self.loader.sel("waitUntilCompleted"),
+                );
+            }
         }
         // The readback happens before the frame ends (the same
         // pre-present rule the other backends follow).

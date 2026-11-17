@@ -194,6 +194,62 @@ fixed in the same milestone:
 
 ---
 
+The Metal hardware run (Apple A18 Pro, macOS) — the frame after the
+first encode — found five further defects, each fixed and re-validated
+in the same milestone until the diagnostic triangle drew and read back
+correctly:
+
+- The pipeline state creation used the plain single-argument
+  newRenderPipelineStateWithDescriptor: form, which the Metal API's
+  headers do not declare; the documented synchronous form is
+  newRenderPipelineStateWithDescriptor:error:. The call now uses the
+  error variant and records the NSError's message when the state fails
+  to build.
+- The render pass descriptor's depth and stencil attachments: the
+  combined depth/stencil format's stencil plane is its own
+  MTLRenderPassStencilAttachmentDescriptor (the depth attachment
+  descriptor carries no stencil selectors), and the load/store actions
+  the depth attachment needs (Clear/Store) sit on the depth descriptor
+  itself. The pass now sets both descriptors with their own actions.
+- The render pipeline descriptor left the stencilAttachmentPixelFormat
+  at its default MTLPixelFormatInvalid while the pass names the
+  combined depth/stencil format for both planes; the pipeline's match
+  validation nils the state and the draw is silently dropped. The
+  descriptor now names the same combined format for both planes.
+- The depth/stencil readback: the device's combined
+  Depth32Float_Stencil8 format allocates 64 bits per pixel (the
+  24-bit packed format does not exist on this GPU class). The blit
+  copy now uses the options variant with the depth and stencil plane
+  selections, the staging buffer sizes the 8-byte texel, and the
+  decode reads the depth word's float and the stencil byte per the
+  format's layout.
+- The MSL shader sources: the vertex function declared the position
+  input as a direct float3 [[attribute(0)]] parameter, which the Metal
+  shading language rejects for vertex functions (the compiler's
+  message: invalid type 'float3' for input declaration). The sources
+  now use the [[stage_in]] struct form with one compiled library per
+  stage (the vertex and the fragment sources each declare their own
+  uniform struct; the earlier single-library concatenation made the
+  fragment's uniform struct invisible to the compiler). The shader
+  functions' lookups compile per stage too.
+
+The pass's diagnostic: the triangle resources' setup records the first
+failure's stage and the API's own error text (the NSError's
+localizedDescription), and the smoke example prints it — the run's
+final defects surfaced stage by stage (library compile, then the
+fragment's missing struct) exactly as the compiler's messages named
+them.
+
+The validated hardware run: the smoke renders the diagnostic triangle
+on the Apple A18 Pro's default device, clears (0,0,0,255) black with
+depth 1.0 and stencil 0, reads the centre pixel back as the triangle's
+colour (200,40,40,255) with depth 1.0 and stencil 0, and reports zero
+violations. The four-feature test suite passes on the Mac (9 render
+tests including the Metal smoke with its clear depth 0.25 and stencil
+7 checks).
+
+---
+
 ## Lessons carried from OpenGrace
 
 The five lessons recorded at the close of OpenGrace's first full campaign

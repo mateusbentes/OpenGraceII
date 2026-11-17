@@ -28,13 +28,21 @@ the smoke run creates the device, clears, draws the diagnostic triangle,
 copies the three planes and reads the centre pixel back (the colour and
 the depth planes match; the stencil plane's copy is undefined under
 vkd3d and its value is reported, not asserted).
-The Metal backend's first hardware run on macOS found two real defects
-the Linux-only validation could not see: a render pipeline descriptor
-selector that does not exist on the Metal API (the runtime raised an
-Objective-C exception the Rust process cannot catch) and a frame path
-whose clear and draw were stubs. Both are fixed: the pass now records
-the clear load actions, the triangle encodes inside the pass, and the
-swap's commit closes the frame the way the Vulkan submit path does.
+The Metal backend's hardware run on macOS (Apple A18 Pro) completed: the
+smoke renders the diagnostic triangle, clears and reads the centre pixel
+back as the triangle's colour with the clear depth and stencil values.
+The run found and fixed seven real defects the Linux-only validation
+could not see: two pipeline descriptor selectors that do not exist on
+the Metal API (the runtime raises Objective-C exceptions the Rust
+process cannot catch), a frame path whose clear and draw were stubs,
+the combined depth/stencil pass descriptors' own stencil attachment and
+load/store actions, the pipeline descriptor's stencil pixel format
+match (a mismatch nils the pipeline state and silently drops the draw),
+the 64-bit-per-pixel Depth32Float_Stencil8 readback layout, and the
+Metal shading language's vertex input rule (the position input uses the
+[[stage_in]] struct form, one compiled library per stage). The shader
+stages' setup records the first failure's stage and the API's own error
+text, which the smoke example prints.
 
 ## The lessons from OpenGrace
 

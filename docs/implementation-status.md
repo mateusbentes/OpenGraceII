@@ -15,7 +15,7 @@ The `.docx` files in this directory are generated from the `.md` sources with
 | --- | --- | --- |
 | 1 | Rust skeleton: Cargo workspace, module layout, the validation matrix (build, test, docs checks), the pinned toolchain | Done |
 | 2 | Render contract and the first backend: Vulkan on Linux (lavapipe); the Android hardware run follows | Done |
-| 3 | The remaining backends: OpenGL (Windows/Linux), Metal (macOS/iOS), Direct3D 12 (Windows) | In progress (OpenGL done, Metal implemented, Direct3D 12 validated under Wine with vkd3d; the Metal hardware run follows) |
+| 3 | The remaining backends: OpenGL (Windows/Linux), Metal (macOS/iOS), Direct3D 12 (Windows) | Done (OpenGL and Vulkan validated on Linux hardware, Metal on the macOS hardware run, Direct3D 12 under Wine with vkd3d; the Android Vulkan run stays open) |
 | 4 | Render foundation: math, mesh, shader, material | Planned |
 | 5 | Forward lighting: light types, shadow mapping | Planned |
 | 6 | Deferred lighting: MRT G-buffer, the lighting pass | Planned |
@@ -247,6 +247,37 @@ colour (200,40,40,255) with depth 1.0 and stencil 0, and reports zero
 violations. The four-feature test suite passes on the Mac (9 render
 tests including the Metal smoke with its clear depth 0.25 and stencil
 7 checks).
+
+---
+
+Milestone 3's second validation machine (the LucDev notebook, Linux
+x86_64, Rust 1.100.0, Intel Iris Xe Graphics (ADL GT2) hardware):
+
+- `git pull` fast-forwards to the Metal hardware run's commits; the
+  workspace builds all-features with zero warnings.
+- `cargo test -p og2-tests --features vulkan,opengl,metal,d3d12`: 9
+  tests passed — 3 docs-rule suites and 6 render tests (the null
+  backend's suite and the three backends' smokes; the Metal smoke skips
+  cleanly where the platform has no Metal framework).
+- The Vulkan smoke ran on the notebook's own GPU (Intel Iris Xe,
+  Vulkan 1.4): the diagnostic triangle draws and reads back the same
+  centre colour, depth and stencil the lavapipe runs recorded — a real
+  hardware run, not the software rasterizer.
+- The OpenGL smoke ran on the same GPU through Mesa 26.0.8's GL 4.6
+  core profile: the same triangle, the same readback values, zero
+  violations.
+- The windows-gnu cross-build compiles all-features with zero warnings.
+- The D3D12 smoke under Wine (vkd3d over the notebook's lavapipe ICD)
+  creates the device, clears, draws the triangle and reads the centre
+  back: the colour matches, the depth reads 1.0, the stencil value is
+  reported as undefined under vkd3d as before.
+
+With the Mac's Metal hardware run and the LucDev's Linux/Wine runs, the
+same render contract is validated on all three of the engine's
+development platforms: Linux x86_64 (Vulkan and OpenGL on hardware),
+Windows x86_64 (the D3D12 path under Wine with vkd3d plus the
+windows-gnu cross-build) and macOS arm64 (Metal on the A18 Pro's
+hardware).
 
 ---
 

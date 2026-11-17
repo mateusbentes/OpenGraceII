@@ -347,6 +347,15 @@ pub struct TextureViewInner {
 
 /// A shared handle to a GPU mesh. Upload is explicit via `upload()`; nothing
 /// reaches the GPU until upload().
+///
+/// The generic mesh path's uniform contract (M4c, the same rule the four
+/// live backends record): the vertex stage carries the camera block — the
+/// view-projection matrix the set_camera state builds and the model matrix
+/// the submission writes — as one API-neutral layout each backend maps onto
+/// its own language (Vulkan's std140 block, OpenGL's two uniforms, D3D12's
+/// cbuffer, Metal's constant struct). The two matrices are column-major
+/// (the engine's Mat4 convention) and the block's byte layout is identical
+/// across the backends, so one upload path serves all four.
 #[derive(Clone)]
 pub struct GpuMesh {
     pub(crate) inner: Arc<Mutex<GpuMeshInner>>,
@@ -363,6 +372,8 @@ impl GpuMesh {
 
 /// The backend-owned state of a GPU mesh handle.
 pub struct GpuMeshInner {
+    /// The backend's slot for the mesh's buffers (the create order).
+    pub id: usize,
     pub vertex_count: u32,
     pub index_count: u32,
     pub uploaded: bool,

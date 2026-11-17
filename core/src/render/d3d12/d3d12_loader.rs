@@ -60,6 +60,7 @@ pub type ComVtable = *mut c_void;
 
 pub const DXGI_FORMAT_UNKNOWN: u32 = 0;
 pub const DXGI_FORMAT_R32G32B32_FLOAT: u32 = 6;
+pub const DXGI_FORMAT_R32G32_FLOAT: u32 = 16;
 pub const DXGI_FORMAT_R16G16B16A16_FLOAT: u32 = 10;
 pub const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
 pub const DXGI_FORMAT_R8_UNORM: u32 = 61;
@@ -89,6 +90,7 @@ pub const D3D12_RESOURCE_STATE_DEPTH_WRITE: u32 = 0x10;
 pub const D3D12_RESOURCE_STATE_COPY_DEST: u32 = 0x400;
 pub const D3D12_RESOURCE_STATE_COPY_SOURCE: u32 = 0x800;
 pub const D3D12_RESOURCE_STATE_GENERIC_READ: u32 = 0xac3;
+pub const D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE: u32 = 0x80;
 
 pub const D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET: u32 = 0x1;
 pub const D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL: u32 = 0x2;
@@ -100,7 +102,26 @@ pub const D3D12_HEAP_FLAG_NONE: u32 = 0;
 
 pub const D3D12_DESCRIPTOR_HEAP_TYPE_RTV: u32 = 2;
 pub const D3D12_DESCRIPTOR_HEAP_TYPE_DSV: u32 = 3;
+pub const D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV: u32 = 0;
+pub const D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER: u32 = 1;
 pub const D3D12_DESCRIPTOR_HEAP_FLAG_NONE: u32 = 0;
+pub const D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE: u32 = 1;
+
+pub const D3D12_DESCRIPTOR_RANGE_TYPE_SRV: u32 = 0;
+pub const D3D12_DESCRIPTOR_RANGE_TYPE_CBV: u32 = 2;
+pub const D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER: u32 = 3;
+
+pub const D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE: u32 = 0;
+
+pub const D3D12_SRV_DIMENSION_TEXTURE2D: u32 = 4;
+pub const D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING: u32 = 0x1688;
+
+pub const D3D12_FILTER_MIN_MAG_MIP_POINT: u32 = 0x0;
+pub const D3D12_TEXTURE_ADDRESS_MODE_WRAP: u32 = 1;
+pub const D3D12_COMPARISON_FUNC_ALWAYS: u32 = 8;
+pub const D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE: u32 = 2;
+
+pub const DXGI_FORMAT_R32_UINT: u32 = 42;
 
 pub const D3D12_CLEAR_FLAG_DEPTH: u32 = 0x1;
 pub const D3D12_CLEAR_FLAG_STENCIL: u32 = 0x2;
@@ -120,6 +141,7 @@ pub const D3D12_CULL_MODE_NONE: u32 = 1;
 
 pub const D3D12_DEPTH_WRITE_MASK_ZERO: u32 = 0;
 pub const D3D12_DEPTH_WRITE_MASK_ALL: u32 = 1;
+pub const D3D12_COMPARISON_FUNC_LESS: u32 = 2;
 
 pub const D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE: u32 = 3;
 pub const D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST: u32 = 4;
@@ -129,9 +151,9 @@ pub const D3D12_SHADER_VISIBILITY_ALL: u32 = 0;
 pub const D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT: u32 =
     0x1;
 pub const D3D_ROOT_SIGNATURE_VERSION_1_0: u32 = 1;
+pub const D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED: u32 = 0;
 
 pub const D3D12_PIPELINE_STATE_FLAG_NONE: u32 = 0;
-pub const D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED: u32 = 0;
 pub const D3D12_RESOURCE_BARRIER_TYPE_TRANSITION: u32 = 0;
 pub const D3D12_RESOURCE_BARRIER_FLAG_NONE: u32 = 0;
 pub const D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES: u32 = 0xffff_ffff;
@@ -433,11 +455,20 @@ pub struct D3d12RootParameter {
     // The union's alignment is 8 (the descriptor members carry a
     // pointer), so one padding word follows the type.
     pub union_head_padding: [u32; 1],
-    pub constants: D3d12RootConstants,
+    pub constants_or_table: D3d12RootParameterUnion,
     // The union's storage is 16 bytes: 4 padding bytes follow the
     // 12-byte constants before the visibility word at offset 24.
     pub union_tail_padding: [u32; 1],
     pub visibility: u32,
+}
+
+/// The root parameter's union member: the 32-bit constants or the
+/// descriptor table (the same 16 bytes either member reads; the
+/// parameter_type selects the interpretation).
+#[derive(Clone, Copy)]
+pub union D3d12RootParameterUnion {
+    pub constants: D3d12RootConstants,
+    pub table: D3d12RootDescriptorTable,
 }
 
 /// The published struct: the root signature's description.
@@ -555,6 +586,97 @@ pub struct D3d12Box {
     pub right: u32,
     pub bottom: u32,
     pub back: u32,
+}
+
+/// The published struct: the descriptor range (one root descriptor
+/// table's entry). The MinGW-w64 header's field order.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3d12DescriptorRange {
+    pub range_type: u32,
+    pub num_descriptors: u32,
+    pub base_shader_register: u32,
+    pub register_space: u32,
+    pub offset_in_descriptors_from_table_start: u32,
+}
+
+/// The published struct: the root descriptor table's parameter (the
+/// union's descriptor-table member; the 8-byte pointer keeps the union's
+/// alignment, so the same head/tail padding the constants member
+/// carries).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3d12RootDescriptorTable {
+    pub num_descriptor_ranges: u32,
+    pub descriptor_ranges: *const D3d12DescriptorRange,
+}
+
+/// The published struct: the static sampler (the root signature's
+/// sampler array member; the MinGW-w64 header's field order).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3d12StaticSamplerDesc {
+    pub filter: u32,
+    pub address_u: u32,
+    pub address_v: u32,
+    pub address_w: u32,
+    pub mip_lod_bias: f32,
+    pub max_anisotropy: u32,
+    pub comparison_func: u32,
+    pub border_color: u32,
+    pub min_lod: f32,
+    pub max_lod: f32,
+    pub shader_register: u32,
+    pub register_space: u32,
+    pub shader_visibility: u32,
+}
+
+/// The published struct: the shader resource view's description (the
+/// texture2D member only; the union's other members stay behind the
+/// three-word texture2D member, the union's storage is 16 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3d12ShaderResourceViewDesc {
+    pub format: u32,
+    pub view_dimension: u32,
+    pub shader_4_component_mapping: u32,
+    pub texture_2d: D3d12Tex2DSrv,
+    // The union's storage is 24 bytes (the largest member, the
+    // TEX2D_ARRAY_SRV's, is 20 bytes): 2 words follow the 16-byte
+    // tex2d member.
+    pub union_tail_padding: [u32; 2],
+}
+
+/// The published struct: the tex2D SRV member (the header's four
+/// fields: the mip slice, the mip levels, the plane slice and the
+/// minimum LOD clamp).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3d12Tex2DSrv {
+    pub most_detailed_mip: u32,
+    pub mip_levels: u32,
+    pub plane_slice: u32,
+    pub resource_min_lod_clamp: f32,
+}
+
+/// The published struct: the constant buffer view's description (the
+/// texture2D member's SRV sibling; the union's storage is 16 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3d12ConstantBufferViewDesc {
+    pub buffer_location: u64,
+    pub size_in_bytes: u32,
+    pub union_tail_padding: [u32; 1],
+}
+
+/// The published struct: the index buffer view (the IASetIndexBuffer
+/// call's one argument).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3d12IndexBufferView {
+    pub buffer_location: u64,
+    pub size_in_bytes: u32,
+    pub format: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -747,6 +869,20 @@ pub unsafe fn call_slot_i32_2(
         *mut c_void,
         *mut c_void,
     ) -> i32 = std::mem::transmute(*slot);
+    f(obj, arg1, arg2)
+}
+/// Calls the vtable slot at `index` with one pointer and one u64
+/// argument and a void return (the SetGraphicsRootDescriptorTable's
+/// handle-by-value ABI).
+pub unsafe fn call_slot_void_ptr_u64(
+    obj: ComObject,
+    index: usize,
+    arg1: *mut c_void,
+    arg2: u64,
+) {
+    let slot = vtable_of(obj).add(index);
+    let f: unsafe extern "system" fn(ComObject, *mut c_void, u64) =
+        std::mem::transmute(*slot);
     f(obj, arg1, arg2)
 }
 
@@ -979,6 +1115,15 @@ pub unsafe fn call_slot_i32_f32(
 pub fn colour_row_pitch(width: u32) -> u32 {
     D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
         * ((width * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
+            / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT)
+}
+
+/// The texture upload's row pitch for any texel size (the same 256-byte
+/// alignment the colour plane's rule carries): 256 * ceil(width * bytes
+/// / 256).
+pub fn texture_row_pitch(width: u32, bytes: u32) -> u32 {
+    D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
+        * ((width * bytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
             / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT)
 }
 

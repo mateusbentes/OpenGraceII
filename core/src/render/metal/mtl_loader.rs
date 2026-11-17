@@ -34,6 +34,7 @@ pub type MTLLibraryHandle = *mut c_void;
 pub type MtlFunctionHandle = *mut c_void;
 pub type MtlRenderPipelineStateHandle = *mut c_void;
 pub type MtlDepthStencilStateHandle = *mut c_void;
+pub type MtlSamplerStateHandle = *mut c_void;
 pub type MtlBufferHandle = *mut c_void;
 pub type MtlTextureHandle = *mut c_void;
 pub type MtlClassHandle = *mut c_void;
@@ -76,6 +77,7 @@ pub const MTLPT_TRIANGLE: NsUInteger = 3;
 pub const MTLIT_UINT32: NsUInteger = 1;
 
 pub const MTLVF_FLOAT3: NsUInteger = 30;
+pub const MTLVF_FLOAT2: NsUInteger = 29;
 pub const MTLSF_CONSTANT: NsUInteger = 0;
 pub const MTLSF_PER_VERTEX: NsUInteger = 1;
 
@@ -101,6 +103,19 @@ pub const MTLRO_PRIVATE: NsUInteger = MTLSM_PRIVATE << 4;
 // depth/stencil readback caught it).
 pub const MTLBLOPT_DEPTH_FROM_DEPTH_STENCIL: NsUInteger = 1;
 pub const MTLBLOPT_STENCIL_FROM_DEPTH_STENCIL: NsUInteger = 2;
+// The published sampler filter states (MTLSamplerMinMagFilter's own
+// values: nearest 0, linear 1) and the sampler address modes
+// (MTLSamplerAddressMode: clamp to edge 0). The mesh path's sampler is
+// NEAREST with the clamp-to-edge address mode.
+pub const MTLSMF_NEAREST: NsUInteger = 0;
+pub const MTLSMF_LINEAR: NsUInteger = 1;
+pub const MTLSAM_CLAMP_TO_EDGE: NsUInteger = 0;
+// The published winding rule (MTLWinding: counter-clockwise 0) and the
+// cull mode (MTLCullMode: none 0). The mesh path's first step draws
+// both faces (no culling, the same forgiving rule the Vulkan path's
+// first step records).
+pub const MTLWINDING_COUNTER_CLOCKWISE: NsUInteger = 0;
+pub const MTLCULL_NONE: NsUInteger = 0;
 
 // ---------------------------------------------------------------------------
 // Fixed-size structures (the published C layouts)
@@ -188,6 +203,7 @@ pub struct MtlLoader {
     pub cls_mtl_vertex_descriptor: MtlClassHandle,
     pub cls_mtl_compile_options: MtlClassHandle,
     pub cls_mtl_render_pass_descriptor: MtlClassHandle,
+    pub cls_mtl_sampler_descriptor: MtlClassHandle,
     pub loaded: bool,
 }
 
@@ -204,6 +220,7 @@ impl MtlLoader {
             cls_mtl_vertex_descriptor: std::ptr::null_mut(),
             cls_mtl_compile_options: std::ptr::null_mut(),
             cls_mtl_render_pass_descriptor: std::ptr::null_mut(),
+            cls_mtl_sampler_descriptor: std::ptr::null_mut(),
             loaded: false,
         }
     }
@@ -302,6 +319,7 @@ impl MtlLoader {
             class!(cls_mtl_vertex_descriptor, "MTLVertexDescriptor");
             class!(cls_mtl_compile_options, "MTLCompileOptions");
             class!(cls_mtl_render_pass_descriptor, "MTLRenderPassDescriptor");
+            class!(cls_mtl_sampler_descriptor, "MTLSamplerDescriptor");
         }
         self.loaded = true;
         true
@@ -452,6 +470,20 @@ impl MtlLoader {
         f(self_, sel, arg);
     }
 
+    /// The message-send form `void objc_msgSend(id self, SEL op, BOOL
+    /// arg)`: one BOOL (the depth/stencil descriptor's
+    /// setDepthWriteEnabled:, the Objective-C BOOL is one byte).
+    pub unsafe fn send_void_bool(
+        &self,
+        self_: *mut c_void,
+        sel: *mut c_void,
+        arg: bool,
+    ) {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void, u8) =
+            std::mem::transmute(self.objc_msg_send.unwrap());
+        f(self_, sel, if arg { 1 } else { 0 });
+    }
+
     /// The message-send form `void objc_msgSend(id self, SEL op, double
     /// arg)`: one double argument (the depth attachment's clear depth).
     pub unsafe fn send_void_double(
@@ -555,6 +587,53 @@ impl MtlLoader {
             NsUInteger,
         ) -> *mut c_void = std::mem::transmute(self.objc_msg_send.unwrap());
         f(self_, sel, arg)
+    }
+
+    /// The message-send form `void objc_msgSend(id self, SEL op, id arg1,
+    /// NSUInteger arg2)`: one object and one integer (the fragment
+    /// stage's texture and sampler bindings'
+    /// setFragmentTexture:atIndex: and setFragmentSamplerState:atIndex:).
+    pub unsafe fn send_void_ptr_ul(
+        &self,
+        self_: *mut c_void,
+        sel: *mut c_void,
+        arg1: *mut c_void,
+        arg2: NsUInteger,
+    ) {
+        let f: unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            NsUInteger,
+        ) = std::mem::transmute(self.objc_msg_send.unwrap());
+        f(self_, sel, arg1, arg2);
+    }
+
+    /// The message-send form `void objc_msgSend(id self, SEL op,
+    /// NSUInteger a1, NSUInteger a2, NSUInteger a3, id a4, NSUInteger
+    /// a5)`: the indexed draw's drawIndexedPrimitives:indexCount:
+    /// indexType:indexBuffer:indexBufferOffset: (primitive type, index
+    /// count, index type, index buffer, byte offset).
+    pub unsafe fn send_void_ul3_ptr_ul(
+        &self,
+        self_: *mut c_void,
+        sel: *mut c_void,
+        arg1: NsUInteger,
+        arg2: NsUInteger,
+        arg3: NsUInteger,
+        arg4: *mut c_void,
+        arg5: NsUInteger,
+    ) {
+        let f: unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            NsUInteger,
+            NsUInteger,
+            NsUInteger,
+            *mut c_void,
+            NsUInteger,
+        ) = std::mem::transmute(self.objc_msg_send.unwrap());
+        f(self_, sel, arg1, arg2, arg3, arg4, arg5);
     }
 
     pub unsafe fn send_ul2_ret_ptr(

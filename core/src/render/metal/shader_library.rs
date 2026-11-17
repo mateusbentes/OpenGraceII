@@ -50,3 +50,70 @@ fragment float4 fragmentMain(constant Uniforms& u [[buffer(0)]])
     return u.color;
 }
 ";
+
+/// The generic mesh's vertex shader: the PNU vertex (the attribute table
+/// the pipeline's MTLVertexDescriptor carries), the camera block (the
+/// view-projection matrix the backend's set_camera builds) and the model
+/// matrix the submission carries. RULE (M4c): the same Camera struct
+/// declaration both stages carry — the uniform block is one byte layout
+/// the two libraries share, so the fragment stage's struct stays
+/// bit-identical to the vertex stage's.
+pub const MESH_VERTEX_SHADER: &str = r"
+#include <metal_stdlib>
+using namespace metal;
+struct Camera
+{
+    float4x4 view_projection;
+    float4x4 model;
+};
+struct MeshVertexIn
+{
+    float3 position [[attribute(0)]];
+    float3 normal [[attribute(1)]];
+    float2 uv [[attribute(2)]];
+};
+struct MeshVertexOut
+{
+    float4 position [[position]];
+    float3 normal;
+    float2 uv;
+};
+vertex MeshVertexOut meshVertexMain(MeshVertexIn in [[stage_in]],
+                                    constant Camera& camera [[buffer(0)]])
+{
+    MeshVertexOut out;
+    float4 world = camera.model * float4(in.position, 1.0);
+    out.position = camera.view_projection * world;
+    out.normal = in.normal;
+    out.uv = in.uv;
+    return out;
+}
+";
+
+/// The generic mesh's fragment shader: the bound texture's sample times
+/// the surface tint (the material path's minimum). The Camera struct is
+/// the same declaration the vertex stage carries (the M4c rule) even
+/// though this stage only reads the texture — the sampler is
+/// [[sampler(0)]] and the texture [[texture(0)]].
+pub const MESH_FRAGMENT_SHADER: &str = r"
+#include <metal_stdlib>
+using namespace metal;
+struct Camera
+{
+    float4x4 view_projection;
+    float4x4 model;
+};
+struct MeshVertexOut
+{
+    float4 position [[position]];
+    float3 normal;
+    float2 uv;
+};
+fragment float4 meshFragmentMain(MeshVertexOut in [[stage_in]],
+                                 constant Camera& camera [[buffer(0)]],
+                                 texture2d<float> surface_texture [[texture(0)]],
+                                 sampler surface_sampler [[sampler(0)]])
+{
+    return surface_texture.sample(surface_sampler, in.uv);
+}
+";

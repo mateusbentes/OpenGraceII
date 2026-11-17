@@ -28,11 +28,15 @@
 
 use super::mtl_loader::{
     MtlClearColor, MtlLoader, MtlOrigin, MtlSize,
+    MtlRegion,
     MTLPX_RGBA8_UNORM, MTLPX_RGBA16_FLOAT, MTLPX_R8_UNORM,
     MTLPX_DEPTH24_UNORM_STENCIL8, MTLPX_DEPTH32_FLOAT_STENCIL8,
     MTLLA_CLEAR, MTLSA_STORE,
     MTLPT_TRIANGLE,
-    MTLVF_FLOAT3, MTLSF_PER_VERTEX, MTLSM_SHARED, MTLSM_PRIVATE,
+    MTLVF_FLOAT2, MTLVF_FLOAT3, MTLSF_PER_VERTEX, MTLSM_SHARED, MTLSM_PRIVATE,
+    MTLSMF_NEAREST, MTLWINDING_COUNTER_CLOCKWISE, MTLCULL_NONE,
+    MTLSAM_CLAMP_TO_EDGE, MTLLA_LOAD,
+    MTLIT_UINT32, MTLCF_LESS,
     MTLBLOPT_DEPTH_FROM_DEPTH_STENCIL, MTLBLOPT_STENCIL_FROM_DEPTH_STENCIL,
     MTLCU_RENDER_TARGET, MTLCU_SHADER_READ,
 };
@@ -54,6 +58,38 @@ use std::sync::{Arc, Mutex};
 struct TriUniform {
     mvp: [[f32; 4]; 4],
     color: [f32; 4],
+}
+
+/// The generic mesh's uniform block (the same two column-major matrices
+/// the Vulkan and the D3D12 blocks carry: the view-projection the
+/// set_camera state builds and the model matrix the submission writes).
+#[repr(C)]
+struct MeshUniform {
+    view_projection: [[f32; 4]; 4],
+    model: [[f32; 4]; 4],
+}
+
+/// The backend-owned state of one uploaded generic mesh: the vertex and
+/// index buffers (shared storage, the CPU writes them directly), the
+/// per-mesh uniform buffer and the counts.
+#[allow(dead_code)]
+struct MetalMeshState {
+    stride: u32,
+    vertex_buffer: super::mtl_loader::MtlBufferHandle,
+    index_buffer: super::mtl_loader::MtlBufferHandle,
+    uniform_buffer: super::mtl_loader::MtlBufferHandle,
+    vertex_count: u32,
+    index_count: u32,
+}
+
+/// The mesh path's pipeline resources (the MSL library pair the mesh
+/// shaders compile to, the depth/stencil state and the sampler). The
+/// `ensure_mesh_resources` creates them lazily on the first upload.
+#[allow(dead_code)]
+struct MetalMeshResources {
+    pipeline: super::mtl_loader::MtlRenderPipelineStateHandle,
+    depth_state: super::mtl_loader::MtlDepthStencilStateHandle,
+    sampler: super::mtl_loader::MtlSamplerStateHandle,
 }
 
 /// The Metal backend's configuration. The same fields the other backends'
@@ -158,6 +194,21 @@ pub struct MetalBackend {
     violations: u64,
     targets: Vec<MetalRenderTarget>,
     textures_2d: Vec<MetalTexture2D>,
+    next_mesh_id: usize,
+    /// The generic mesh path's state: one slot per create_gpu_mesh, the
+    /// mesh pipeline's resources and the default texture the draws fall
+    /// back to (the same structure the Vulkan and the OpenGL paths
+    /// carry).
+    meshes: Vec<Option<MetalMeshState>>,
+    mesh_resources: Option<MetalMeshResources>,
+    mesh_ready: bool,
+    mesh_error: String,
+    /// The default texture's index into `textures_2d` (the 1x1 white
+    /// texture the setup created; the draws fall back to it when no
+    /// texture is bound) and the bound texture's index (the
+    /// bind_texture state).
+    default_texture: Option<usize>,
+    bound_texture: Option<usize>,
     readback_queue: Vec<(u32, u32)>,
     last_readback: Vec<ReadbackSample>,
     has_center: bool,
@@ -237,6 +288,13 @@ impl MetalBackend {
             violations: 0,
             targets: Vec::new(),
             textures_2d: Vec::new(),
+            next_mesh_id: 0,
+            meshes: Vec::new(),
+            mesh_resources: None,
+            mesh_ready: false,
+            mesh_error: String::new(),
+            default_texture: None,
+            bound_texture: None,
             readback_queue: Vec::new(),
             last_readback: Vec::new(),
             has_center: false,
@@ -289,6 +347,21 @@ impl MetalBackend {
             self.config.height,
             self.depth_format,
         )?;
+        // The default texture: one 1x1 opaque white texel the mesh path's
+        // draws fall back to when no texture is bound (the same default
+        // the Vulkan and the OpenGL paths record).
+        let view = self.create_texture_2d(&Texture2DDesc {
+            width: 1,
+            height: 1,
+            format: PixelFormat::Rgba8,
+        })?;
+        self.fill_texture_2d(&view, &[255, 255, 255, 255])?;
+        let index = self
+            .textures_2d
+            .iter()
+            .position(|t| Arc::ptr_eq(&t.inner, &view.inner))
+            .expect("the default texture's slot");
+        self.default_texture = Some(index);
         Ok(())
     }
 
@@ -511,6 +584,34 @@ impl MetalBackend {
         }
     }
 
+    /// Builds the mesh's uniform block bytes (the view-projection matrix
+    /// the set_camera state builds and the model matrix the submission
+    /// writes — the same two matrices the Vulkan and the D3D12 blocks
+    /// carry).
+    fn build_mesh_uniform(&self, model: Mat4) -> Vec<u8> {
+        let aspect = self.config.width as f32 / self.config.height as f32;
+        let camera = self.camera;
+        let view = Mat4::look_at(camera.eye, camera.target, camera.up);
+        let projection = Mat4::perspective(
+            camera.fov_y_rad,
+            aspect,
+            camera.near,
+            camera.far,
+        );
+        let view_projection = projection.multiply(view);
+        let uniform = MeshUniform {
+            view_projection: view_projection.m,
+            model: model.m,
+        };
+        unsafe {
+            std::slice::from_raw_parts(
+                &uniform as *const MeshUniform as *const u8,
+                std::mem::size_of::<MeshUniform>(),
+            )
+            .to_vec()
+        }
+    }
+
     /// Allocates a shared-storage buffer with the given bytes (the CPU
     /// writes, the GPU reads: Metal's shared storage is GPU-visible, no
     /// staging copy the Vulkan path needs exists here).
@@ -539,6 +640,308 @@ impl MetalBackend {
             }
         }
         buffer
+    }
+
+    /// The mesh path's sampler state: one NEAREST sampler, clamp-to-edge
+    /// on both axes (the same filter the Vulkan and the D3D12 paths
+    /// record).
+    fn create_mesh_sampler(&self) -> super::mtl_loader::MtlSamplerStateHandle {
+        let descriptor = unsafe {
+            self.loader.alloc_init(self.loader.cls_mtl_sampler_descriptor)
+        };
+        if descriptor.is_null() {
+            return std::ptr::null_mut();
+        }
+        let sampler = unsafe {
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setMinFilter:"),
+                MTLSMF_NEAREST,
+            );
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setMagFilter:"),
+                MTLSMF_NEAREST,
+            );
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setSAddressMode:"),
+                MTLSAM_CLAMP_TO_EDGE,
+            );
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setTAddressMode:"),
+                MTLSAM_CLAMP_TO_EDGE,
+            );
+            self.loader.send_ptr_arg(
+                self.device,
+                self.loader.sel("newSamplerStateWithDescriptor:"),
+                descriptor,
+            )
+        };
+        if sampler.is_null() {
+            return std::ptr::null_mut();
+        }
+        sampler
+    }
+
+    /// The mesh path's depth/stencil state: the depth test on (LESS, the
+    /// same rule the Vulkan and the D3D12 paths record), the depth write
+    /// on, the stencil test off.
+    fn create_mesh_depth_state(&self) -> super::mtl_loader::MtlDepthStencilStateHandle {
+        let descriptor = unsafe {
+            self.loader.alloc_init(
+                self.loader.cls_mtl_depth_stencil_descriptor,
+            )
+        };
+        if descriptor.is_null() {
+            return std::ptr::null_mut();
+        }
+        let state = unsafe {
+            self.loader.send_void_bool(
+                descriptor,
+                self.loader.sel("setDepthWriteEnabled:"),
+                true,
+            );
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setDepthCompareFunction:"),
+                MTLCF_LESS,
+            );
+            self.loader.send_ptr_arg(
+                self.device,
+                self.loader.sel("newDepthStencilStateWithDescriptor:"),
+                descriptor,
+            )
+        };
+        if state.is_null() {
+            return std::ptr::null_mut();
+        }
+        state
+    }
+
+    /// The mesh path's pipeline: the two MSL libraries compile (the
+    /// Camera struct both stages declare), the vertex descriptor carries
+    /// the PNU layout's three attributes (position 0, normal 12, uv 24)
+    /// at buffer index 1 (the uniform sits at buffer index 0), the
+    /// colour attachment's pixel format follows the frame target's.
+    fn ensure_mesh_resources(&mut self) -> bool {
+        if self.mesh_ready {
+            return true;
+        }
+        let vertex_library = match self.compile_stage(
+            super::shader_library::MESH_VERTEX_SHADER,
+            "the mesh vertex stage's library",
+        ) {
+            Some(library) => library,
+            None => return false,
+        };
+        let vertex_function =
+            match self.new_function(vertex_library, "meshVertexMain") {
+                Some(function) => function,
+                None => {
+                    self.mesh_error =
+                        "meshVertexMain lookup failed".to_string();
+                    return false;
+                }
+            };
+        let fragment_library = match self.compile_stage(
+            super::shader_library::MESH_FRAGMENT_SHADER,
+            "the mesh fragment stage's library",
+        ) {
+            Some(library) => library,
+            None => return false,
+        };
+        let fragment_function =
+            match self.new_function(fragment_library, "meshFragmentMain") {
+                Some(function) => function,
+                None => {
+                    self.mesh_error =
+                        "meshFragmentMain lookup failed".to_string();
+                    return false;
+                }
+            };
+        let descriptor = unsafe {
+            self.loader
+                .alloc_init(self.loader.cls_mtl_render_pipeline_descriptor)
+        };
+        if descriptor.is_null() {
+            self.mesh_error =
+                "the mesh pipeline descriptor alloc failed".to_string();
+            return false;
+        }
+        unsafe {
+            self.loader.send_void_ptr(
+                descriptor,
+                self.loader.sel("setVertexFunction:"),
+                vertex_function,
+            );
+            self.loader.send_void_ptr(
+                descriptor,
+                self.loader.sel("setFragmentFunction:"),
+                fragment_function,
+            );
+        }
+        // The vertex descriptor: the class method vertexDescriptor (the
+        // same rule the triangle path records: the alloc/init pair
+        // leaves the arrays unallocated).
+        let vertex_descriptor = unsafe {
+            self.loader.send0(
+                self.loader.cls_mtl_vertex_descriptor,
+                self.loader.sel("vertexDescriptor"),
+            )
+        };
+        if vertex_descriptor.is_null() {
+            self.mesh_error =
+                "the mesh vertex descriptor's constructor failed"
+                    .to_string();
+            return false;
+        }
+        let attributes = unsafe {
+            self.loader.send0(
+                vertex_descriptor,
+                self.loader.sel("attributes"),
+            )
+        };
+        let layouts = unsafe {
+            self.loader.send0(vertex_descriptor, self.loader.sel("layouts"))
+        };
+        unsafe {
+            // The three attributes: position (Float3, offset 0), normal
+            // (Float3, offset 12), uv (Float2, offset 24), all at buffer
+            // index 1 (the vertices' buffer; the uniform sits at buffer
+            // index 0).
+            for (index, (format, offset)) in [
+                (MTLVF_FLOAT3, 0usize),
+                (MTLVF_FLOAT3, 12usize),
+                (MTLVF_FLOAT2, 24usize),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let attribute = self.loader.send_ul_ret_ptr(
+                    attributes,
+                    self.loader.sel("objectAtIndexedSubscript:"),
+                    index as super::mtl_loader::NsUInteger,
+                );
+                self.loader.send_void_ul(
+                    attribute,
+                    self.loader.sel("setFormat:"),
+                    *format,
+                );
+                self.loader.send_void_ul(
+                    attribute,
+                    self.loader.sel("setBufferIndex:"),
+                    1,
+                );
+                self.loader.send_void_ul(
+                    attribute,
+                    self.loader.sel("setOffset:"),
+                    *offset as super::mtl_loader::NsUInteger,
+                );
+            }
+            // The layout at buffer index 1: the PNU stride (32), per
+            // vertex.
+            let layout_1 = self.loader.send_ul_ret_ptr(
+                layouts,
+                self.loader.sel("objectAtIndexedSubscript:"),
+                1,
+            );
+            self.loader.send_void_ul(
+                layout_1,
+                self.loader.sel("setStride:"),
+                32,
+            );
+            self.loader.send_void_ul(
+                layout_1,
+                self.loader.sel("setStepFunction:"),
+                MTLSF_PER_VERTEX,
+            );
+            self.loader.send_void_ptr(
+                descriptor,
+                self.loader.sel("setVertexDescriptor:"),
+                vertex_descriptor,
+            );
+            // The colour attachment's pixel format follows the frame
+            // target's RGBA8 unorm, the depth and the stencil attachment
+            // formats follow the device's pick (the same rule the
+            // triangle pipeline records).
+            let colour_attachments = self.loader.send0(
+                descriptor,
+                self.loader.sel("colorAttachments"),
+            );
+            let colour_attachment_0 = self.loader.send_ul_ret_ptr(
+                colour_attachments,
+                self.loader.sel("objectAtIndexedSubscript:"),
+                0,
+            );
+            self.loader.send_void_ul(
+                colour_attachment_0,
+                self.loader.sel("setPixelFormat:"),
+                MTLPX_RGBA8_UNORM,
+            );
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setDepthAttachmentPixelFormat:"),
+                self.depth_format,
+            );
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setStencilAttachmentPixelFormat:"),
+                self.depth_format,
+            );
+            // The winding rule and the cull mode: no culling (the same
+            // forgiving rule the Vulkan path's first step records).
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setWinding:"),
+                MTLWINDING_COUNTER_CLOCKWISE,
+            );
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setCullMode:"),
+                MTLCULL_NONE,
+            );
+        }
+        let pipeline = unsafe {
+            let mut pipeline_error: *mut c_void = std::ptr::null_mut();
+            let pipeline = self.loader.send_ptr_arg2(
+                self.device,
+                self.loader
+                    .sel("newRenderPipelineStateWithDescriptor:error:"),
+                descriptor,
+                &mut pipeline_error as *mut *mut c_void as *mut c_void,
+            );
+            if pipeline.is_null() {
+                self.mesh_error = if pipeline_error.is_null() {
+                    "the mesh pipeline state creation returned nil"
+                        .to_string()
+                } else {
+                    self.ns_error_text(pipeline_error)
+                };
+                return false;
+            }
+            pipeline
+        };
+        let depth_state = self.create_mesh_depth_state();
+        if depth_state.is_null() {
+            self.mesh_error =
+                "the mesh depth/stencil state creation failed".to_string();
+            return false;
+        }
+        let sampler = self.create_mesh_sampler();
+        if sampler.is_null() {
+            self.mesh_error =
+                "the mesh sampler state creation failed".to_string();
+            return false;
+        }
+        self.mesh_resources = Some(MetalMeshResources {
+            pipeline,
+            depth_state,
+            sampler,
+        });
+        self.mesh_ready = true;
+        true
     }
 
     /// The diagnostic triangle's pipeline: the MSL library compiles, the
@@ -980,6 +1383,264 @@ impl MetalBackend {
         command_buffer
     }
 
+    /// The mesh draw's render pass descriptor: the frame target's two
+    /// attachments with the LOAD load action (the clear pass's pixels
+    /// stay; the same rule the Vulkan path's open render pass records —
+    /// the Metal frame carries multiple render passes on one command
+    /// buffer, each pass's load action keeps the previous pass's output).
+    fn mesh_pass_descriptor(&mut self) -> *mut c_void {
+        let pass_descriptor = unsafe {
+            self.loader.alloc_init(
+                self.loader.cls_mtl_render_pass_descriptor,
+            )
+        };
+        if pass_descriptor.is_null() {
+            self.violations += 1;
+            return std::ptr::null_mut();
+        }
+        let colour_attachments = unsafe {
+            self.loader.send0(
+                pass_descriptor,
+                self.loader.sel("colorAttachments"),
+            )
+        };
+        let colour_attachment = unsafe {
+            self.loader.send_ul_ret_ptr(
+                colour_attachments,
+                self.loader.sel("objectAtIndexedSubscript:"),
+                0,
+            )
+        };
+        let depth_attachment = unsafe {
+            self.loader.send0(
+                pass_descriptor,
+                self.loader.sel("depthAttachment"),
+            )
+        };
+        let stencil_attachment = unsafe {
+            self.loader.send0(
+                pass_descriptor,
+                self.loader.sel("stencilAttachment"),
+            )
+        };
+        if colour_attachment.is_null()
+            || depth_attachment.is_null()
+            || stencil_attachment.is_null()
+        {
+            self.violations += 1;
+            return std::ptr::null_mut();
+        }
+        unsafe {
+            self.loader.send_void_ptr(
+                colour_attachment,
+                self.loader.sel("setTexture:"),
+                self.color_texture,
+            );
+            self.loader.send_void_ul(
+                colour_attachment,
+                self.loader.sel("setLoadAction:"),
+                MTLLA_LOAD,
+            );
+            self.loader.send_void_ul(
+                colour_attachment,
+                self.loader.sel("setStoreAction:"),
+                MTLSA_STORE,
+            );
+            self.loader.send_void_ptr(
+                depth_attachment,
+                self.loader.sel("setTexture:"),
+                self.depth_texture,
+            );
+            self.loader.send_void_ul(
+                depth_attachment,
+                self.loader.sel("setLoadAction:"),
+                MTLLA_LOAD,
+            );
+            self.loader.send_void_ul(
+                depth_attachment,
+                self.loader.sel("setStoreAction:"),
+                MTLSA_STORE,
+            );
+            self.loader.send_void_ptr(
+                stencil_attachment,
+                self.loader.sel("setTexture:"),
+                self.depth_texture,
+            );
+            self.loader.send_void_ul(
+                stencil_attachment,
+                self.loader.sel("setLoadAction:"),
+                MTLLA_LOAD,
+            );
+            self.loader.send_void_ul(
+                stencil_attachment,
+                self.loader.sel("setStoreAction:"),
+                MTLSA_STORE,
+            );
+        }
+        pass_descriptor
+    }
+
+    /// The mesh's draw: the render command encoder the frame's command
+    /// buffer carries (the pass's load action LOAD keeps the clear's
+    /// pixels), the pipeline state, the depth/stencil state, the uniform
+    /// buffer at buffer index 0 (both stages), the vertex buffer at
+    /// index 1, the index buffer, the bound texture and the sampler at
+    /// the fragment stage's slots 0. The draw is the indexed form
+    /// (drawIndexedPrimitives) the uint32 index buffer carries.
+    fn draw_mesh_by_id(
+        &mut self,
+        mesh_id: usize,
+        model: Mat4,
+    ) {
+        let command_buffer = self.frame_command_buffer;
+        if self.shutdown || command_buffer.is_null() {
+            self.violations += 1;
+            return;
+        }
+        let state = match self.meshes.get(mesh_id) {
+            Some(Some(state)) => state,
+            _ => {
+                self.violations += 1;
+                return;
+            }
+        };
+        if !self.mesh_ready {
+            return;
+        }
+        // The uniform block: the view-projection matrix from the
+        // set_camera state and the model matrix the submission carries.
+        let uniform = self.build_mesh_uniform(model);
+        let uniform_bytes = state.uniform_buffer;
+        let contents = unsafe {
+            self.loader.send0(uniform_bytes, self.loader.sel("contents"))
+        };
+        if contents.is_null() {
+            self.violations += 1;
+            return;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                uniform.as_ptr(),
+                contents as *mut u8,
+                uniform.len(),
+            );
+        }
+        // The pipeline's handles copy out of the option (the pass
+        // descriptor's creation needs the &mut self borrow; the handles
+        // are plain pointers, the copy is the borrow's clean split).
+        let (pipeline, depth_state, sampler) = {
+            let resources = self.mesh_resources.as_ref().unwrap();
+            (resources.pipeline, resources.depth_state, resources.sampler)
+        };
+        let texture = self
+            .bound_texture
+            .and_then(|i| self.textures_2d.get(i))
+            .filter(|t| !t.released)
+            .map(|t| t.texture)
+            .or_else(|| {
+                self.default_texture
+                    .and_then(|i| self.textures_2d.get(i))
+                    .filter(|t| !t.released)
+                    .map(|t| t.texture)
+            });
+        let texture = match texture {
+            Some(texture) => texture,
+            None => {
+                self.violations += 1;
+                return;
+            }
+        };
+        let (vertex_buffer, index_buffer, index_count) = (
+            state.vertex_buffer,
+            state.index_buffer,
+            state.index_count,
+        );
+        let pass_descriptor = self.mesh_pass_descriptor();
+        if pass_descriptor.is_null() {
+            return;
+        }
+        let encoder = unsafe {
+            self.loader.send_ptr_arg(
+                command_buffer,
+                self.loader.sel("renderCommandEncoderWithDescriptor:"),
+                pass_descriptor,
+            )
+        };
+        if encoder.is_null() {
+            self.violations += 1;
+            return;
+        }
+        unsafe {
+            // The pipeline state and the depth/stencil state.
+            self.loader.send_void_ptr(
+                encoder,
+                self.loader.sel("setRenderPipelineState:"),
+                pipeline,
+            );
+            self.loader.send_void_ptr(
+                encoder,
+                self.loader.sel("setDepthStencilState:"),
+                depth_state,
+            );
+            // The uniform buffer at the vertex stage's buffer index 0
+            // (the shader's `buffer(0)` qualifier) and the fragment
+            // stage's own buffer index 0 (the same Camera struct both
+            // stages declare).
+            self.loader.send_void_ptr_ul2(
+                encoder,
+                self.loader.sel("setVertexBuffer:offset:atIndex:"),
+                uniform_bytes,
+                0,
+                0,
+            );
+            self.loader.send_void_ptr_ul2(
+                encoder,
+                self.loader.sel("setFragmentBuffer:offset:atIndex:"),
+                uniform_bytes,
+                0,
+                0,
+            );
+            // The vertex buffer at index 1 (the vertex descriptor's
+            // attributes point there).
+            self.loader.send_void_ptr_ul2(
+                encoder,
+                self.loader.sel("setVertexBuffer:offset:atIndex:"),
+                vertex_buffer,
+                0,
+                1,
+            );
+            // The fragment stage's texture and sampler at slot 0 (the
+            // shader's `texture(0)` and `sampler(0)` qualifiers).
+            self.loader.send_void_ptr_ul(
+                encoder,
+                self.loader.sel("setFragmentTexture:atIndex:"),
+                texture,
+                0,
+            );
+            self.loader.send_void_ptr_ul(
+                encoder,
+                self.loader.sel("setFragmentSamplerState:atIndex:"),
+                sampler,
+                0,
+            );
+            // The indexed draw: the drawIndexedPrimitives call the
+            // uint32 index buffer carries.
+            self.loader.send_void_ul3_ptr_ul(
+                encoder,
+                self.loader.sel(
+                    "drawIndexedPrimitives:indexCount:indexType:\
+                     indexBuffer:indexBufferOffset:",
+                ),
+                MTLPT_TRIANGLE,
+                index_count as super::mtl_loader::NsUInteger,
+                MTLIT_UINT32,
+                index_buffer,
+                0,
+            );
+            self.loader.send_void(encoder, self.loader.sel("endEncoding"));
+        }
+    }
+
     /// The readback's one pixel: the blit command encoder copies the
     /// colour word (offset 0) and the depth/stencil word (offset 16) into
     /// a staging buffer the CPU reads. The depth and the stencil land in
@@ -1253,8 +1914,11 @@ impl RenderBackend for MetalBackend {
                 "create_gpu_mesh: the backend is shut down",
             ));
         }
+        let id = self.next_mesh_id;
+        self.next_mesh_id += 1;
         Ok(GpuMesh {
             inner: Arc::new(Mutex::new(GpuMeshInner {
+                id,
                 vertex_count: 0,
                 index_count: 0,
                 uploaded: false,
@@ -1286,6 +1950,63 @@ impl RenderBackend for MetalBackend {
                  stride",
             ));
         }
+        if indices.is_empty() {
+            return Err(RenderError::from(
+                "upload_mesh: the index data is empty",
+            ));
+        }
+        // The mesh pipeline's resources: the same lazy ensure the
+        // triangle path follows (one pipeline serves every mesh).
+        if !self.ensure_mesh_resources() {
+            return Err(RenderError::from(format!(
+                "upload_mesh: the mesh pipeline could not be created \
+                 ({})",
+                self.mesh_error
+            )));
+        }
+        let mesh_id = mesh.inner.lock().unwrap().id;
+        while self.meshes.len() <= mesh_id {
+            self.meshes.push(None);
+        }
+        if self.meshes[mesh_id].is_some() {
+            return Err(RenderError::from(
+                "upload_mesh: the mesh was already uploaded",
+            ));
+        }
+        // The three shared-storage buffers: the PNU bytes, the u32
+        // indices and the uniform block (the CPU writes, the GPU reads:
+        // Metal's shared storage is GPU-visible, no staging copy the
+        // Vulkan path needs exists here).
+        let vertex_buffer = self.create_shared_buffer(vertices);
+        if vertex_buffer.is_null() {
+            return Err(RenderError::from(
+                "upload_mesh: the vertex buffer could not be allocated",
+            ));
+        }
+        let mut index_bytes = Vec::with_capacity(indices.len() * 4);
+        for index in indices {
+            index_bytes.extend_from_slice(&index.to_le_bytes());
+        }
+        let index_buffer = self.create_shared_buffer(&index_bytes);
+        if index_buffer.is_null() {
+            return Err(RenderError::from(
+                "upload_mesh: the index buffer could not be allocated",
+            ));
+        }
+        let uniform_buffer = self.create_shared_buffer(&[0u8; 128]);
+        if uniform_buffer.is_null() {
+            return Err(RenderError::from(
+                "upload_mesh: the uniform buffer could not be allocated",
+            ));
+        }
+        self.meshes[mesh_id] = Some(MetalMeshState {
+            stride: layout.stride,
+            vertex_buffer,
+            index_buffer,
+            uniform_buffer,
+            vertex_count: (vertices.len() as u32) / layout.stride,
+            index_count: indices.len() as u32,
+        });
         let mut inner = mesh.inner.lock().unwrap();
         inner.vertex_count = (vertices.len() as u32) / layout.stride;
         inner.index_count = indices.len() as u32;
@@ -1301,7 +2022,11 @@ impl RenderBackend for MetalBackend {
         let inner = mesh.inner.lock().unwrap();
         if !inner.uploaded {
             self.violations += 1;
+            return;
         }
+        let mesh_id = inner.id;
+        drop(inner);
+        self.draw_mesh_by_id(mesh_id, Mat4::IDENTITY);
     }
 
     fn submit(&mut self, submission: &DrawSubmission) {
@@ -1309,10 +2034,22 @@ impl RenderBackend for MetalBackend {
             self.violations += 1;
             return;
         }
+        for light in &submission.lights {
+            if light.validate().is_err() {
+                self.violations += 1;
+            }
+        }
+        // The generic path: the model matrix from the submission, the
+        // camera block from the set_camera state (the same uniform buffer
+        // the draw() path writes).
         let inner = submission.mesh.inner.lock().unwrap();
         if !inner.uploaded {
             self.violations += 1;
+            return;
         }
+        let mesh_id = inner.id;
+        drop(inner);
+        self.draw_mesh_by_id(mesh_id, submission.model);
     }
 
     fn create_render_target(
@@ -1457,9 +2194,28 @@ impl RenderBackend for MetalBackend {
             })
     }
 
-    fn bind_texture(&mut self, _view: Option<&TextureView>, _unit: u32) {
+    fn bind_texture(&mut self, view: Option<&TextureView>, _unit: u32) {
         if self.shutdown {
             self.violations += 1;
+            return;
+        }
+        // The first sampler unit: the mesh path's draw binds the texture
+        // the state carries (the same rule the Vulkan and the OpenGL
+        // paths record). A None clears the binding and the draw falls
+        // back to the default texture.
+        if _unit != 0 {
+            return;
+        }
+        match view {
+            None => {
+                self.bound_texture = None;
+            }
+            Some(view) => {
+                self.bound_texture = self
+                    .textures_2d
+                    .iter()
+                    .position(|t| Arc::ptr_eq(&t.inner, &view.inner));
+            }
         }
     }
 
@@ -1553,17 +2309,55 @@ impl RenderBackend for MetalBackend {
         let expected = (inner.width as usize)
             * (inner.height as usize)
             * bytes_per_pixel(inner.format) as usize;
+        let width = inner.width;
+        let height = inner.height;
+        let format = inner.format;
         drop(inner);
         if data.len() != expected {
             return Err(RenderError::from(format!(
                 "fill_texture_2d: expected {} bytes, got {}",
-                expected,
-                data.len()
+                expected, data.len()
             )));
         }
-        // The upload path lands in the next milestones (the release path
-        // wires the blit copy); the size validation is the contract's
-        // rule here.
+        // The upload: the texture's replaceRegion call (the private
+        // texture's CPU write path — the CPU writes the texels through
+        // the driver's own staging copy; the same rule the Vulkan path's
+        // staging upload records).
+        let texture = self.textures_2d[index].texture;
+        let region = MtlRegion {
+            origin: MtlOrigin {
+                x: 0,
+                y: 0,
+                z: 0,
+            },
+            size: MtlSize {
+                width: width as super::mtl_loader::NsUInteger,
+                height: height as super::mtl_loader::NsUInteger,
+                depth: 1,
+            },
+        };
+        let bytes_per_row =
+            width * bytes_per_pixel(format) as u32;
+        unsafe {
+            let f: unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *const c_void,
+                super::mtl_loader::NsUInteger,
+                super::mtl_loader::NsUInteger,
+                MtlRegion,
+            ) = std::mem::transmute(self.loader.objc_msg_send.unwrap());
+            f(
+                texture,
+                self.loader.sel(
+                    "replaceRegion:mipmapLevel:withBytes:bytesPerRow:",
+                ),
+                data.as_ptr() as *const c_void,
+                0,
+                bytes_per_row as super::mtl_loader::NsUInteger,
+                region,
+            );
+        }
         Ok(())
     }
 

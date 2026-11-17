@@ -30,3 +30,36 @@ void main()
     fragColor = color;
 }
 ";
+
+/// The generic mesh's vertex shader: the PNU vertex and the two camera
+/// uniforms (the same names the backend's uniform locations fetch).
+pub const MESH_VERTEX_SHADER: &str = r"
+#version 330 core
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec3 normal;
+layout(location = 2) in vec2 uv;
+uniform mat4 view_projection;
+uniform mat4 model;
+out vec3 v_normal;
+out vec2 v_uv;
+void main()
+{
+    gl_Position = view_projection * model * vec4(position, 1.0);
+    v_normal = normal;
+    v_uv = uv;
+}
+";
+
+/// The generic mesh's fragment shader: the bound texture's colour (the
+/// sampler at unit 0 the backend's bind_texture drives).
+pub const MESH_FRAGMENT_SHADER: &str = r"
+#version 330 core
+in vec3 v_normal;
+in vec2 v_uv;
+uniform sampler2D surface_texture;
+out vec4 fragColor;
+void main()
+{
+    fragColor = texture(surface_texture, v_uv);
+}
+";

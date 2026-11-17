@@ -62,6 +62,7 @@ pub struct NullRenderBackend {
     events: Vec<NullEvent>,
     targets: Vec<NullRenderTarget>,
     textures_2d: Vec<NullTexture2D>,
+    next_mesh_id: usize,
     readback_queue: Vec<(u32, u32)>,
     last_readback: Vec<ReadbackSample>,
     has_center: bool,
@@ -103,6 +104,7 @@ impl NullRenderBackend {
             events: Vec::new(),
             targets: Vec::new(),
             textures_2d: Vec::new(),
+            next_mesh_id: 0,
             readback_queue: Vec::new(),
             last_readback: Vec::new(),
             has_center: false,
@@ -247,8 +249,11 @@ impl RenderBackend for NullRenderBackend {
                 "create_gpu_mesh: the backend is shut down",
             ));
         }
+        let id = self.next_mesh_id;
+        self.next_mesh_id += 1;
         Ok(GpuMesh {
             inner: Arc::new(Mutex::new(GpuMeshInner {
+                id,
                 vertex_count: 0,
                 index_count: 0,
                 uploaded: false,

@@ -25,6 +25,7 @@ pub const GL_COLOR: u32 = 0x1800;
 pub const GL_DEPTH_COMPONENT: u32 = 0x1902;
 pub const GL_STENCIL_INDEX: u32 = 0x1901;
 pub const GL_UNSIGNED_BYTE: u32 = 0x1401;
+pub const GL_UNSIGNED_INT: u32 = 0x1405;
 pub const GL_FLOAT: u32 = 0x1406;
 pub const GL_DEPTH_TEST: u32 = 0x0B71;
 pub const GL_LESS: u32 = 0x0201;
@@ -57,6 +58,7 @@ pub const GL_TRIANGLES: u32 = 0x0004;
 pub const GL_FLOAT_VEC4: u32 = 0x8B52;
 pub const GL_ARRAY_BUFFER: u32 = 0x8892;
 pub const GL_ELEMENT_ARRAY_BUFFER: u32 = 0x8893;
+pub const GL_TEXTURE0: u32 = 0x84C0;
 pub const GL_STATIC_DRAW: u32 = 0x88E4;
 pub const GL_STREAM_DRAW: u32 = 0x88E0;
 pub const GL_VERTEX_SHADER: u32 = 0x8B31;
@@ -180,6 +182,7 @@ pub type PfnGlDeleteProgram = unsafe extern "C" fn(program: u32);
 pub type PfnGlGetUniformLocation =
     unsafe extern "C" fn(program: u32, name: *const c_char) -> i32;
 pub type PfnGlUniform1f = unsafe extern "C" fn(location: i32, v: f32);
+pub type PfnGlUniform1i = unsafe extern "C" fn(location: i32, v: i32);
 pub type PfnGlUniform4f =
     unsafe extern "C" fn(location: i32, a: f32, b: f32, c: f32, d: f32);
 pub type PfnGlUniformMatrix4fv = unsafe extern "C" fn(
@@ -341,6 +344,7 @@ pub struct GlLoader {
     pub gl_delete_program: Option<PfnGlDeleteProgram>,
     pub gl_get_uniform_location: Option<PfnGlGetUniformLocation>,
     pub gl_uniform_1f: Option<PfnGlUniform1f>,
+    pub gl_uniform_1i: Option<PfnGlUniform1i>,
     pub gl_uniform_4f: Option<PfnGlUniform4f>,
     pub gl_uniform_matrix_4fv: Option<PfnGlUniformMatrix4fv>,
     pub gl_vertex_attrib_pointer: Option<PfnGlVertexAttribPointer>,
@@ -415,6 +419,7 @@ impl GlLoader {
             gl_delete_program: None,
             gl_get_uniform_location: None,
             gl_uniform_1f: None,
+            gl_uniform_1i: None,
             gl_uniform_4f: None,
             gl_uniform_matrix_4fv: None,
             gl_vertex_attrib_pointer: None,
@@ -630,6 +635,7 @@ impl GlLoader {
         load_gl!(gl_delete_program, "glDeleteProgram");
         load_gl!(gl_get_uniform_location, "glGetUniformLocation");
         load_gl!(gl_uniform_1f, "glUniform1f");
+        load_gl!(gl_uniform_1i, "glUniform1i");
         load_gl!(gl_uniform_4f, "glUniform4f");
         load_gl!(gl_uniform_matrix_4fv, "glUniformMatrix4fv");
         load_gl!(gl_vertex_attrib_pointer, "glVertexAttribPointer");

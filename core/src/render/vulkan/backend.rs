@@ -28,6 +28,16 @@ struct TriUniform {
     color: [f32; 4],
 }
 
+/// The generic mesh's uniform block (std140: the view-projection matrix
+/// the set_camera path builds and the model matrix the submit() copies).
+/// Both shader stages that read the camera declare the same block (the
+/// shared-uniform rule the Metal bug taught).
+#[repr(C)]
+struct MeshUniform {
+    view_projection: [[f32; 4]; 4],
+    model: [[f32; 4]; 4],
+}
+
 /// The Vulkan backend's configuration.
 #[derive(Clone, Debug)]
 pub struct VulkanBackendConfig {
@@ -72,6 +82,25 @@ struct VulkanResource {
     handle: vk::VkBuffer,
     memory: vk::VkDeviceMemory,
     released: bool,
+}
+
+/// The backend-owned state of one uploaded generic mesh: the vertex and
+/// index buffers (host-visible, the CPU writes them directly), the per-mesh
+/// uniform buffer and the descriptor set (the camera block plus the
+/// combined image sampler the material binds).
+// The stride, the uniform buffer's handle and the vertex count record the
+// upload's shape; the draw path reads the buffers and the set (the dead
+// code rule keeps the record fields quiet).
+#[allow(dead_code)]
+struct VulkanMeshState {
+    stride: u32,
+    vertex_buffer: VulkanResource,
+    index_buffer: VulkanResource,
+    uniform_buffer: VulkanResource,
+    uniform_map: *mut std::os::raw::c_void,
+    descriptor_set: vk::VkDescriptorSet,
+    vertex_count: u32,
+    index_count: u32,
 }
 
 /// The Vulkan backend's own texture: a device image plus the memory
@@ -141,6 +170,18 @@ pub struct VulkanBackend {
     readback_map: *mut std::os::raw::c_void,
     // The default texture (1x1 opaque white).
     default_texture: Option<VulkanTexture2D>,
+    // The generic mesh path's state: one slot per create_gpu_mesh, the
+    // buffers and the descriptor set the draw path binds.
+    meshes: Vec<Option<VulkanMeshState>>,
+    /// The sampler unit 0's bound texture: the texture's index into the
+    /// textures_2d vector (None means the default texture's view).
+    bound_texture: Option<usize>,
+    mesh_pipeline: vk::VkPipeline,
+    mesh_pipeline_ready: bool,
+    mesh_pipeline_layout: vk::VkPipelineLayout,
+    mesh_set_layout: vk::VkDescriptorSetLayout,
+    mesh_pool: vk::VkDescriptorPool,
+    mesh_sampler: vk::VkSampler,
     // The diagnostic triangle resources.
     tri_mesh: Option<GpuMesh>,
     tri_shader: Option<ShaderProgram>,
@@ -260,6 +301,14 @@ impl VulkanBackend {
             },
             readback_map: std::ptr::null_mut(),
             default_texture: None,
+            meshes: Vec::new(),
+            bound_texture: None,
+            mesh_pipeline: std::ptr::null_mut(),
+            mesh_pipeline_ready: false,
+            mesh_pipeline_layout: std::ptr::null_mut(),
+            mesh_set_layout: std::ptr::null_mut(),
+            mesh_pool: std::ptr::null_mut(),
+            mesh_sampler: std::ptr::null_mut(),
             tri_mesh: None,
             tri_shader: None,
             tri_pipeline: std::ptr::null_mut(),
@@ -629,6 +678,29 @@ impl VulkanBackend {
             released: false,
         };
         self.readback_map = self.map_memory(self.readback_buffer.memory)?;
+        // The default texture: one 1x1 opaque white texel the mesh path's
+        // descriptor set samples when no texture is bound (the shader's
+        // sampler needs a live view from the first draw on).
+        let desc = Texture2DDesc {
+            width: 1,
+            height: 1,
+            format: PixelFormat::Rgba8,
+        };
+        let view = self.create_texture_2d(&desc)?;
+        let white = [255u8, 255, 255, 255];
+        self.fill_texture_2d(&view, &white)?;
+        let index = self
+            .textures_2d
+            .iter()
+            .position(|x| Arc::ptr_eq(&x.inner, &view.inner))
+            .expect("the default texture's slot");
+        self.default_texture = Some(VulkanTexture2D {
+            inner: self.textures_2d[index].inner.clone(),
+            image: self.textures_2d[index].image,
+            memory: self.textures_2d[index].memory,
+            view: self.textures_2d[index].view,
+            released: false,
+        });
         Ok(())
     }
     /// The image layout transition: the generic pipeline barrier the
@@ -2012,6 +2084,583 @@ impl VulkanBackend {
         Ok(module)
     }
 
+    /// The generic mesh pipeline's lazy creation: the two shader modules
+    /// (the cube shaders from the library), the descriptor set layout (the
+    /// camera block at binding 0, the combined image sampler at binding 1),
+    /// the pipeline layout, the sampler and the graphics pipeline (the PNU
+    /// vertex input, the depth test on, the triangle list).
+    fn ensure_mesh_pipeline(&mut self) {
+        if self.mesh_pipeline_ready {
+            return;
+        }
+        if self.create_mesh_pipeline().is_err() {
+            return;
+        }
+        self.mesh_pipeline_ready = true;
+    }
+
+    fn create_mesh_pipeline(&mut self) -> Result<(), RenderError> {
+        let vertex_module =
+            self.create_shader_module(&shader_library::spirv::CUBE_VERTEX_SHADER_SPIRV)?;
+        let fragment_module =
+            self.create_shader_module(&shader_library::spirv::CUBE_FRAGMENT_SHADER_SPIRV)?;
+        // The descriptor set layout: binding 0 is the std140 camera block
+        // (the vertex stage reads it), binding 1 is the combined image
+        // sampler (the fragment stage reads it).
+        let bindings = [
+            vk::VkDescriptorSetLayoutBinding {
+                binding: 0,
+                descriptor_type: vk::DescriptorType::UniformBuffer,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStage::Vertex as u32,
+                p_immutable_samplers: std::ptr::null(),
+            },
+            vk::VkDescriptorSetLayoutBinding {
+                binding: 1,
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStage::Fragment as u32,
+                p_immutable_samplers: std::ptr::null(),
+            },
+        ];
+        let layout_info = vk::VkDescriptorSetLayoutCreateInfo {
+            s_type: vk::StructureType::DescriptorSetLayoutCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            binding_count: 2,
+            p_bindings: bindings.as_ptr(),
+        };
+        let mut set_layout = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_descriptor_set_layout.unwrap())(
+                self.device,
+                &layout_info,
+                std::ptr::null(),
+                &mut set_layout,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: the mesh's descriptor set layout failed",
+            ));
+        }
+        self.mesh_set_layout = set_layout;
+        let set_layouts = [set_layout];
+        let pipeline_layout_info = vk::VkPipelineLayoutCreateInfo {
+            s_type: vk::StructureType::PipelineLayoutCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            set_layout_count: 1,
+            p_set_layouts: set_layouts.as_ptr(),
+            push_constant_range_count: 0,
+            p_push_constant_ranges: std::ptr::null(),
+        };
+        let mut pipeline_layout = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_pipeline_layout.unwrap())(
+                self.device,
+                &pipeline_layout_info,
+                std::ptr::null(),
+                &mut pipeline_layout,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: the mesh's pipeline layout failed",
+            ));
+        }
+        self.mesh_pipeline_layout = pipeline_layout;
+        // The sampler: linear filtering, clamp to edge (the mip-map
+        // machinery stays out of the first generic path).
+        let sampler_info = vk::VkSamplerCreateInfo {
+            s_type: vk::StructureType::SamplerCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            mag_filter: vk::Filter::Nearest,
+            min_filter: vk::Filter::Nearest,
+            mip_map_mode: 0,
+            address_mode_u: vk::SamplerAddressMode::ClampToEdge,
+            address_mode_v: vk::SamplerAddressMode::ClampToEdge,
+            address_mode_w: vk::SamplerAddressMode::ClampToEdge,
+            mip_lod_bias: 0.0,
+            anisotropy_enable: 0,
+            max_anisotropy: 1.0,
+            compare_enable: 0,
+            compare_op: vk::CompareOp::Always,
+            min_lod: 0.0,
+            max_lod: 0.0,
+            border_color: vk::BorderColor::FloatTransparentBlack,
+            unnormalized_coordinates: 0,
+        };
+        let mut sampler = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_sampler.unwrap())(
+                self.device,
+                &sampler_info,
+                std::ptr::null(),
+                &mut sampler,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: the mesh's sampler failed",
+            ));
+        }
+        self.mesh_sampler = sampler;
+        // The graphics pipeline: the PNU vertex (one binding at stride 32,
+        // three attributes: position at 0, normal at 12, uv at 24), the
+        // depth test on (LESS, the depth write on), no culling (the cube's
+        // faces are CCW but the path's first step stays forgiving).
+        let vertex_entry = b"main\0";
+        let stages = [
+            vk::VkPipelineShaderStageCreateInfo {
+                s_type: vk::StructureType::PipelineShaderStageCreateInfo,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: vk::ShaderStage::Vertex,
+                module: vertex_module,
+                p_name: vertex_entry.as_ptr() as *const _,
+                p_specialization_info: std::ptr::null(),
+            },
+            vk::VkPipelineShaderStageCreateInfo {
+                s_type: vk::StructureType::PipelineShaderStageCreateInfo,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: vk::ShaderStage::Fragment,
+                module: fragment_module,
+                p_name: vertex_entry.as_ptr() as *const _,
+                p_specialization_info: std::ptr::null(),
+            },
+        ];
+        let bindings = [vk::VkVertexInputBindingDescription {
+            binding: 0,
+            stride: 32,
+            input_rate: vk::VertexInputRate::Vertex,
+        }];
+        let attributes = [
+            vk::VkVertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32B32Sfloat as u32,
+                offset: 0,
+            },
+            vk::VkVertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32B32Sfloat as u32,
+                offset: 12,
+            },
+            vk::VkVertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::Format::Rg32Sfloat as u32,
+                offset: 24,
+            },
+        ];
+        let vertex_input = vk::VkPipelineVertexInputStateCreateInfo {
+            s_type: vk::StructureType::PipelineVertexInputStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            vertex_binding_description_count: 1,
+            p_vertex_binding_descriptions: bindings.as_ptr(),
+            vertex_attribute_description_count: 3,
+            p_vertex_attribute_descriptions: attributes.as_ptr(),
+        };
+        let input_assembly = vk::VkPipelineInputAssemblyStateCreateInfo {
+            s_type: vk::StructureType::PipelineInputAssemblyStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            topology: vk::PrimitiveTopology::TriangleList,
+            primitive_restart_enable: 0,
+        };
+        let viewport = vk::VkViewport {
+            x: 0.0,
+            y: 0.0,
+            width: self.config.width as f32,
+            height: self.config.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = vk::VkRect2D {
+            offset: vk::VkOffset2D { x: 0, y: 0 },
+            extent: vk::VkExtent2D {
+                width: self.config.width,
+                height: self.config.height,
+            },
+        };
+        let viewport_state = vk::VkPipelineViewportStateCreateInfo {
+            s_type: vk::StructureType::PipelineViewportStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            viewport_count: 1,
+            p_viewports: &viewport,
+            scissor_count: 1,
+            p_scissors: &scissor,
+        };
+        let rasterization = vk::VkPipelineRasterizationStateCreateInfo {
+            s_type: vk::StructureType::PipelineRasterizationStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            depth_clamp_enable: 0,
+            rasterizer_discard_enable: 0,
+            polygon_mode: vk::PolygonMode::Fill,
+            cull_mode: 0,
+            front_face: vk::FrontFace::CounterClockwise,
+            depth_bias_enable: 0,
+            depth_bias_constant_factor: 0.0,
+            depth_bias_clamp: 0.0,
+            depth_bias_slope_factor: 0.0,
+            line_width: 1.0,
+        };
+        let multisample = vk::VkPipelineMultisampleStateCreateInfo {
+            s_type: vk::StructureType::PipelineMultisampleStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            rasterization_samples: vk::SampleCount::One,
+            sample_shading_enable: 0,
+            min_sample_shading: 1.0,
+            p_sample_mask: std::ptr::null(),
+            alpha_to_coverage_enable: 0,
+            alpha_to_one_enable: 0,
+        };
+        let depth_stencil = vk::VkPipelineDepthStencilStateCreateInfo {
+            s_type: vk::StructureType::PipelineDepthStencilStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            depth_test_enable: 1,
+            depth_write_enable: 1,
+            depth_compare_op: vk::CompareOp::Less,
+            depth_bounds_test_enable: 0,
+            stencil_test_enable: 0,
+            front: vk::VkStencilOpState {
+                fail_op: vk::StencilOp::Keep,
+                pass_op: vk::StencilOp::Keep,
+                depth_fail_op: vk::StencilOp::Keep,
+                compare_op: vk::CompareOp::Always,
+                compare_mask: 0,
+                write_mask: 0,
+                reference: 0,
+            },
+            back: vk::VkStencilOpState {
+                fail_op: vk::StencilOp::Keep,
+                pass_op: vk::StencilOp::Keep,
+                depth_fail_op: vk::StencilOp::Keep,
+                compare_op: vk::CompareOp::Always,
+                compare_mask: 0,
+                write_mask: 0,
+                reference: 0,
+            },
+            min_depth_bounds: 0.0,
+            max_depth_bounds: 1.0,
+        };
+        let blend_attachment = vk::VkPipelineColorBlendAttachmentState {
+            blend_enable: 0,
+            src_color_blend_factor: vk::BlendFactor::Zero,
+            dst_color_blend_factor: vk::BlendFactor::Zero,
+            color_blend_op: vk::BlendOp::Add,
+            src_alpha_blend_factor: vk::BlendFactor::Zero,
+            dst_alpha_blend_factor: vk::BlendFactor::Zero,
+            alpha_blend_op: vk::BlendOp::Add,
+            color_write_mask: 0xF,
+        };
+        let color_blend = vk::VkPipelineColorBlendStateCreateInfo {
+            s_type: vk::StructureType::PipelineColorBlendStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            logic_op_enable: 0,
+            logic_op: 0,
+            attachment_count: 1,
+            p_attachments: &blend_attachment,
+            blend_constants: [0.0, 0.0, 0.0, 0.0],
+        };
+        let dynamic_states = [
+            vk::DynamicState::Viewport,
+            vk::DynamicState::Scissor,
+        ];
+        let dynamic_state = vk::VkPipelineDynamicStateCreateInfo {
+            s_type: vk::StructureType::PipelineDynamicStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            dynamic_state_count: 2,
+            p_dynamic_states: dynamic_states.as_ptr(),
+        };
+        let pipeline_info = vk::VkGraphicsPipelineCreateInfo {
+            s_type: vk::StructureType::GraphicsPipelineCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            stage_count: 2,
+            p_stages: stages.as_ptr(),
+            p_vertex_input_state: &vertex_input,
+            p_input_assembly_state: &input_assembly,
+            p_tessellation_state: std::ptr::null(),
+            p_viewport_state: &viewport_state,
+            p_rasterization_state: &rasterization,
+            p_multisample_state: &multisample,
+            p_depth_stencil_state: &depth_stencil,
+            p_color_blend_state: &color_blend,
+            p_dynamic_state: &dynamic_state,
+            layout: pipeline_layout,
+            render_pass: self.render_pass,
+            subpass: 0,
+            base_pipeline_handle: std::ptr::null_mut(),
+            base_pipeline_index: -1,
+        };
+        let mut pipeline = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_graphics_pipelines.unwrap())(
+                self.device,
+                std::ptr::null_mut(),
+                1,
+                &pipeline_info,
+                std::ptr::null(),
+                &mut pipeline,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: the mesh's graphics pipeline failed",
+            ));
+        }
+        self.mesh_pipeline = pipeline;
+        Ok(())
+    }
+
+    /// The mesh's descriptor set writes: the camera block at binding 0 and
+    /// the texture's combined image sampler at binding 1 (the default
+    /// texture's view when no texture is bound).
+    fn write_mesh_descriptors(
+        &self,
+        set: vk::VkDescriptorSet,
+        uniform_buffer: vk::VkBuffer,
+        uniform_size: usize,
+        image_view: Option<vk::VkImageView>,
+        sampler: vk::VkSampler,
+    ) {
+        let buffer_info = vk::VkDescriptorBufferInfo {
+            buffer: uniform_buffer,
+            offset: 0,
+            range: uniform_size as u64,
+        };
+        // The default texture's view: the 1x1 white texture the setup
+        // created (a None means the texture has no view, the descriptor
+        // keeps the null view and the draw reports the violation instead
+        // of crashing).
+        let image_info = vk::VkDescriptorImageInfo {
+            sampler,
+            image_view: image_view.unwrap_or(std::ptr::null_mut()),
+            image_layout: vk::ImageLayout::ShaderReadOnlyOptimal,
+        };
+        let writes = [
+            vk::VkWriteDescriptorSet {
+                s_type: vk::StructureType::WriteDescriptorSet,
+                p_next: std::ptr::null(),
+                dst_set: set,
+                dst_binding: 0,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::UniformBuffer,
+                p_image_info: std::ptr::null(),
+                p_buffer_info: &buffer_info,
+                p_texel_buffer_view: std::ptr::null(),
+            },
+            vk::VkWriteDescriptorSet {
+                s_type: vk::StructureType::WriteDescriptorSet,
+                p_next: std::ptr::null(),
+                dst_set: set,
+                dst_binding: 1,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                p_image_info: &image_info,
+                p_buffer_info: std::ptr::null(),
+                p_texel_buffer_view: std::ptr::null(),
+            },
+        ];
+        unsafe {
+            (self.loader.vk_update_descriptor_sets.unwrap())(
+                self.device,
+                2,
+                writes.as_ptr(),
+                0,
+                std::ptr::null(),
+            );
+        }
+    }
+
+    /// The mesh's descriptor's texture write (binding 1 only): the draw
+    /// path rewrites the sampler's image view when the bind_texture state
+    /// changed between the upload and the draw.
+    fn write_mesh_texture_descriptor(
+        &self,
+        set: vk::VkDescriptorSet,
+        image_view: vk::VkImageView,
+    ) {
+        let image_info = vk::VkDescriptorImageInfo {
+            sampler: self.mesh_sampler,
+            image_view,
+            image_layout: vk::ImageLayout::ShaderReadOnlyOptimal,
+        };
+        let write = vk::VkWriteDescriptorSet {
+            s_type: vk::StructureType::WriteDescriptorSet,
+            p_next: std::ptr::null(),
+            dst_set: set,
+            dst_binding: 1,
+            dst_array_element: 0,
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::CombinedImageSampler,
+            p_image_info: &image_info,
+            p_buffer_info: std::ptr::null(),
+            p_texel_buffer_view: std::ptr::null(),
+        };
+        unsafe {
+            (self.loader.vk_update_descriptor_sets.unwrap())(
+                self.device,
+                1,
+                &write,
+                0,
+                std::ptr::null(),
+            );
+        }
+    }
+
+    /// The generic draw path: the mesh's buffers, the descriptor set (the
+    /// camera block the set_camera state writes, the model matrix the
+    /// submission carries) and the indexed draw into the open frame's
+    /// command buffer. A draw with no open frame counts one violation (the
+    /// same rule the diagnostic draw's clear-first contract follows).
+    fn draw_mesh_by_id(&mut self, mesh_id: usize, model: Mat4) {
+        if self.command_buffer.is_null() || !self.pass_open {
+            self.violations += 1;
+            return;
+        }
+        let index = match self.meshes.get(mesh_id) {
+            Some(Some(_state)) => mesh_id,
+            _ => {
+                self.violations += 1;
+                return;
+            }
+        };
+        if !self.mesh_pipeline_ready {
+            return;
+        }
+        // The uniform block: the view-projection matrix from the
+        // set_camera state (the same matrices the camera path builds) and
+        // the model matrix the submission carries.
+        let aspect = self.config.width as f32 / self.config.height as f32;
+        let camera = self.camera;
+        let view = Mat4::look_at(camera.eye, camera.target, camera.up);
+        let projection =
+            Mat4::perspective(camera.fov_y_rad, aspect, camera.near, camera.far);
+        let view_projection = projection.multiply(view);
+        let uniform = MeshUniform {
+            view_projection: view_projection.m,
+            model: model.m,
+        };
+        {
+            let state = self.meshes[index].as_ref().unwrap();
+            if !state.uniform_map.is_null() {
+                let map = state.uniform_map;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &uniform as *const MeshUniform as *const u8,
+                        map as *mut u8,
+                        std::mem::size_of::<MeshUniform>(),
+                    );
+                }
+            }
+            // The bound texture's view: the bind_texture state's index (the
+            // default texture's view when the None carries). The write
+            // runs each draw (the descriptor write is cheap; the
+            // alternative is a per-draw set, which the generic path's
+            // first step does not need).
+            let bound_view = self
+                .bound_texture
+                .and_then(|i| self.textures_2d.get(i))
+                .filter(|t| !t.released)
+                .map(|t| t.view)
+                .or_else(|| self.default_texture.as_ref().map(|t| t.view));
+            if let Some(view) = bound_view {
+                self.write_mesh_texture_descriptor(state.descriptor_set, view);
+            }
+        }
+        let (vertex_buffer, index_buffer, descriptor_set, index_count) = {
+            let state = self.meshes[index].as_ref().unwrap();
+            (
+                state.vertex_buffer.handle,
+                state.index_buffer.handle,
+                state.descriptor_set,
+                state.index_count,
+            )
+        };
+        let viewports = [vk::VkViewport {
+            x: 0.0,
+            y: 0.0,
+            width: self.config.width as f32,
+            height: self.config.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+        let scissors = [vk::VkRect2D {
+            offset: vk::VkOffset2D { x: 0, y: 0 },
+            extent: vk::VkExtent2D {
+                width: self.config.width,
+                height: self.config.height,
+            },
+        }];
+        let offsets = [0u64];
+        let descriptor_sets = [descriptor_set];
+        unsafe {
+            (self.loader.vk_cmd_bind_pipeline.unwrap())(
+                self.command_buffer,
+                vk::PipelineBindPoint::Graphics,
+                self.mesh_pipeline,
+            );
+            (self.loader.vk_cmd_set_viewport.unwrap())(
+                self.command_buffer,
+                0,
+                1,
+                viewports.as_ptr(),
+            );
+            (self.loader.vk_cmd_set_scissor.unwrap())(
+                self.command_buffer,
+                0,
+                1,
+                scissors.as_ptr(),
+            );
+            (self.loader.vk_cmd_bind_descriptor_sets.unwrap())(
+                self.command_buffer,
+                vk::PipelineBindPoint::Graphics,
+                self.mesh_pipeline_layout,
+                0,
+                1,
+                descriptor_sets.as_ptr(),
+                0,
+                std::ptr::null(),
+            );
+            (self.loader.vk_cmd_bind_vertex_buffers.unwrap())(
+                self.command_buffer,
+                0,
+                1,
+                &vertex_buffer,
+                offsets.as_ptr(),
+            );
+            (self.loader.vk_cmd_bind_index_buffer.unwrap())(
+                self.command_buffer,
+                index_buffer,
+                0,
+                vk::IndexType::Uint32,
+            );
+            (self.loader.vk_cmd_draw_indexed.unwrap())(
+                self.command_buffer,
+                index_count,
+                1,
+                0,
+                0,
+                0,
+            );
+        }
+    }
+
     /// The triangle's mesh buffers, uniform buffer and descriptor set.
     /// The vertex data is the three vertices of the diagnostic triangle in
     /// NDC; the uniform buffer carries the std140 block the shader library
@@ -2182,14 +2831,15 @@ impl RenderBackend for VulkanBackend {
         }
         // The clear opens the frame's command buffer and the render pass
         // (the attachments load the clear colour), then the diagnostic
-        // draw runs on the default framebuffer only. The frame's end
-        // submits the command buffer (the same rule the OpenGL backend's
-        // clear follows).
+        // draw runs on the default framebuffer only. The frame stays open:
+        // the generic draw path records into the same pass, and the frame's
+        // end (the swap_buffers path's submit) closes and submits the
+        // command buffer (the same rule the OpenGL backend's clear
+        // follows).
         self.begin_frame();
         if self.config.draw_triangle {
             self.draw_triangle();
         }
-        self.submit_frame();
     }
 
     fn width(&self) -> u32 {
@@ -2237,8 +2887,12 @@ impl RenderBackend for VulkanBackend {
                 "create_gpu_mesh: the backend is shut down",
             ));
         }
+        // The mesh's slot: the handle's id indexes the state vector. The
+        // slot stays None until upload_mesh gives it the buffers.
+        let slot = self.meshes.len();
         Ok(GpuMesh {
             inner: Arc::new(Mutex::new(GpuMeshInner {
+                id: slot,
                 vertex_count: 0,
                 index_count: 0,
                 uploaded: false,
@@ -2269,6 +2923,146 @@ impl RenderBackend for VulkanBackend {
                 "upload_mesh: the vertex data is not a multiple of the stride",
             ));
         }
+        let mesh_id = mesh.inner.lock().unwrap().id;
+        while self.meshes.len() <= mesh_id {
+            self.meshes.push(None);
+        }
+        if self.meshes[mesh_id].is_some() {
+            return Err(RenderError::from(
+                "upload_mesh: the mesh was already uploaded",
+            ));
+        }
+        if indices.is_empty() {
+            return Err(RenderError::from(
+                "upload_mesh: the index data is empty",
+            ));
+        }
+        // The pipeline's descriptor set layout and the sampler must exist
+        // before the per-mesh descriptor set is allocated (the mesh path's
+        // ensure, the same lazy rule the diagnostic triangle follows).
+        self.ensure_mesh_pipeline();
+        if !self.mesh_pipeline_ready {
+            return Err(RenderError::from(
+                "upload_mesh: the mesh pipeline could not be created",
+            ));
+        }
+        let vertex_size = vertices.len();
+        let index_size = indices.len() * 4;
+        let uniform_size = std::mem::size_of::<MeshUniform>();
+        let (vertex_buffer, vertex_memory) = self.create_host_buffer(
+            vertex_size,
+            vk::BufferUsage::VertexBuffer,
+        )?;
+        let (index_buffer, index_memory) = self.create_host_buffer(
+            index_size,
+            vk::BufferUsage::IndexBuffer,
+        )?;
+        let (uniform_buffer, uniform_memory) = self.create_host_buffer(
+            uniform_size,
+            vk::BufferUsage::UniformBuffer,
+        )?;
+        let vertex_map = self.map_memory(vertex_memory)?;
+        let index_map = self.map_memory(index_memory)?;
+        let uniform_map = self.map_memory(uniform_memory)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                vertices.as_ptr(),
+                vertex_map as *mut u8,
+                vertex_size,
+            );
+            std::ptr::copy_nonoverlapping(
+                indices.as_ptr() as *const u8,
+                index_map as *mut u8,
+                index_size,
+            );
+        }
+        // The per-mesh descriptor set: the camera block at binding 0 (the
+        // uniform buffer) and the default texture's combined image sampler
+        // at binding 1 (the material path rewrites the write when a draw
+        // binds a texture).
+        let pool_sizes = [
+            vk::VkDescriptorPoolSize {
+                descriptor_type: vk::DescriptorType::UniformBuffer,
+                descriptor_count: 1,
+            },
+            vk::VkDescriptorPoolSize {
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                descriptor_count: 1,
+            },
+        ];
+        let pool_info = vk::VkDescriptorPoolCreateInfo {
+            s_type: vk::StructureType::DescriptorPoolCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            max_sets: 1,
+            pool_size_count: 2,
+            p_pool_sizes: pool_sizes.as_ptr(),
+        };
+        let mut pool = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_descriptor_pool.unwrap())(
+                self.device,
+                &pool_info,
+                std::ptr::null(),
+                &mut pool,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "upload_mesh: vkCreateDescriptorPool failed",
+            ));
+        }
+        let set_layouts = [self.mesh_set_layout];
+        let alloc_info = vk::VkDescriptorSetAllocateInfo {
+            s_type: vk::StructureType::DescriptorSetAllocateInfo,
+            p_next: std::ptr::null(),
+            descriptor_pool: pool,
+            descriptor_set_count: 1,
+            p_set_layouts: set_layouts.as_ptr(),
+        };
+        let mut set = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_allocate_descriptor_sets.unwrap())(
+                self.device,
+                &alloc_info,
+                &mut set,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "upload_mesh: vkAllocateDescriptorSets failed",
+            ));
+        }
+        let default_view = self.default_texture.as_ref().map(|t| t.view);
+        self.write_mesh_descriptors(
+            set,
+            uniform_buffer,
+            uniform_size,
+            default_view,
+            self.mesh_sampler,
+        );
+        self.meshes[mesh_id] = Some(VulkanMeshState {
+            stride: layout.stride,
+            vertex_buffer: VulkanResource {
+                handle: vertex_buffer,
+                memory: vertex_memory,
+                released: false,
+            },
+            index_buffer: VulkanResource {
+                handle: index_buffer,
+                memory: index_memory,
+                released: false,
+            },
+            uniform_buffer: VulkanResource {
+                handle: uniform_buffer,
+                memory: uniform_memory,
+                released: false,
+            },
+            uniform_map,
+            descriptor_set: set,
+            vertex_count: (vertices.len() as u32) / layout.stride,
+            index_count: indices.len() as u32,
+        });
         {
             let mut inner = mesh.inner.lock().unwrap();
             inner.vertex_count = (vertices.len() as u32) / layout.stride;
@@ -2286,7 +3080,11 @@ impl RenderBackend for VulkanBackend {
         let inner = mesh.inner.lock().unwrap();
         if !inner.uploaded {
             self.violations += 1;
+            return;
         }
+        let mesh_id = inner.id;
+        drop(inner);
+        self.draw_mesh_by_id(mesh_id, Mat4::IDENTITY);
     }
 
     fn submit(&mut self, submission: &DrawSubmission) {
@@ -2299,6 +3097,11 @@ impl RenderBackend for VulkanBackend {
                 self.violations += 1;
             }
         }
+        // The generic path: the model matrix from the submission, the
+        // camera block from the set_camera state (the same uniform buffer
+        // the draw() path writes).
+        let mesh_id = submission.mesh.inner.lock().unwrap().id;
+        self.draw_mesh_by_id(mesh_id, submission.model);
     }
 
     fn create_render_target(
@@ -2490,9 +3293,30 @@ impl RenderBackend for VulkanBackend {
         }
     }
 
-    fn bind_texture(&mut self, _view: Option<&TextureView>, _unit: u32) {
+    fn bind_texture(&mut self, view: Option<&TextureView>, unit: u32) {
         if self.shutdown {
             self.violations += 1;
+            return;
+        }
+        // The first sampler unit: the mesh path's descriptor set samples
+        // the bound texture (the default texture's view when none is
+        // bound). The later units record the bound view without the
+        // descriptor write (the generic path's first step carries one
+        // unit).
+        if unit != 0 {
+            return;
+        }
+        match view {
+            None => {
+                self.bound_texture = None;
+            }
+            Some(v) => {
+                let index = self
+                    .textures_2d
+                    .iter()
+                    .position(|x| Arc::ptr_eq(&x.inner, &v.inner));
+                self.bound_texture = index.map(|i| i);
+            }
         }
     }
 
@@ -2507,7 +3331,11 @@ impl RenderBackend for VulkanBackend {
             desc.width,
             desc.height,
             self.to_vk_format(desc.format),
-            vk::ImageUsage::TransferDst as u32,
+            // The Sampled bit joins the transfer destination: the fill
+            // writes through the transfer path and the shader reads through
+            // the sampled view (the same usage pair every sampled texture
+            // needs).
+            vk::ImageUsage::TransferDst as u32 | vk::ImageUsage::Sampled as u32,
         )?;
         let texture = VulkanTexture2D {
             inner: Arc::new(Mutex::new(TextureViewInner {
@@ -2585,6 +3413,133 @@ impl RenderBackend for VulkanBackend {
                 expected
             )));
         }
+        if self.readback_command.is_null() {
+            return Err(RenderError::from(
+                "fill_texture_2d: the command path is not initialised",
+            ));
+        }
+        // The staging upload: one host-visible buffer, the CPU writes the
+        // texels, the one-off command buffer copies it into the image (the
+        // transition the write needs: Undefined -> TransferDst -> the
+        // shader read).
+        let (width, height, format) = {
+            let inner = view.inner.lock().unwrap();
+            (inner.width, inner.height, inner.format)
+        };
+        let index = _index;
+        let image = self.textures_2d[index].image;
+        let (staging, staging_memory) = self.create_host_buffer(
+            data.len(),
+            vk::BufferUsage::TransferSrc,
+        )?;
+        let map = self.map_memory(staging_memory)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                map as *mut u8,
+                data.len(),
+            );
+        }
+        // The one-off command buffer: the reset, the begin, the copy.
+        unsafe {
+            (self.loader.vk_reset_command_buffer.unwrap())(
+                self.readback_command,
+                0,
+            );
+        }
+        let begin_info = vk::VkCommandBufferBeginInfo {
+            s_type: vk::StructureType::CommandBufferBeginInfo,
+            p_next: std::ptr::null(),
+            flags: vk::CommandBufferUsage::OneTimeSubmit as u32,
+            p_inheritance_info: std::ptr::null(),
+        };
+        let result = unsafe {
+            (self.loader.vk_begin_command_buffer.unwrap())(
+                self.readback_command,
+                &begin_info,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "fill_texture_2d: the command buffer could not begin",
+            ));
+        }
+        let copy = vk::VkBufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::VkImageSubresourceLayers {
+                aspect_mask: vk::ImageAspect::Color as u32,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::VkOffset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::VkExtent3D {
+                width,
+                height,
+                depth: 1,
+            },
+        };
+        self.transition_image_layout(
+            self.readback_command,
+            image,
+            vk::ImageAspect::Color as u32,
+            vk::ImageLayout::Undefined,
+            vk::ImageLayout::TransferDstOptimal,
+        );
+        unsafe {
+            (self.loader.vk_cmd_copy_buffer_to_image.unwrap())(
+                self.readback_command,
+                staging,
+                image,
+                vk::ImageLayout::TransferDstOptimal,
+                1,
+                &copy,
+            );
+        }
+        self.transition_image_layout(
+            self.readback_command,
+            image,
+            vk::ImageAspect::Color as u32,
+            vk::ImageLayout::TransferDstOptimal,
+            vk::ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let result = unsafe {
+            (self.loader.vk_end_command_buffer.unwrap())(
+                self.readback_command,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "fill_texture_2d: the command buffer could not end",
+            ));
+        }
+        let submit = vk::VkSubmitInfo {
+            s_type: vk::StructureType::SubmitInfo,
+            p_next: std::ptr::null(),
+            wait_semaphore_count: 0,
+            p_wait_semaphores: std::ptr::null(),
+            p_wait_dst_stage_mask: std::ptr::null(),
+            command_buffer_count: 1,
+            p_command_buffers: &self.readback_command,
+            signal_semaphore_count: 0,
+            p_signal_semaphores: std::ptr::null(),
+        };
+        unsafe {
+            (self.loader.vk_queue_submit.unwrap())(
+                self.queue,
+                1,
+                &submit,
+                std::ptr::null_mut(),
+            );
+            (self.loader.vk_queue_wait_idle.unwrap())(self.queue);
+        }
+        // The texture's usage must carry the Sampled bit for the shader
+        // read: the creation path's TransferDst-only usage cannot satisfy
+        // the descriptor, so the fill records the stage the shader reads
+        // and the draw path's validation catches the missing bit.
+        let _ = (width, height, format);
         Ok(())
     }
 
@@ -2643,6 +3598,12 @@ impl RenderBackend for VulkanBackend {
             self.violations += 1;
             return;
         }
+        // The frame's end: the render pass closes, the command buffer
+        // ends and the queue submits (the same rule the OpenGL backend's
+        // swap follows; the diagnostic triangle's old path submitted the
+        // frame inside the clear — the generic draw path needs the pass
+        // open across the contract's calls).
+        self.submit_frame();
         // The readback happens before the present (the same pre-present
         // rule the OpenGL backend follows). The off-screen frame is not
         // presented: its command buffer already ran at the frame's end.

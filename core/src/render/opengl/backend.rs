@@ -22,6 +22,7 @@ use super::super::{
 };
 use super::gl_loader::{GlLoader, *};
 use super::shader_library::{TRIANGLE_FRAGMENT_SHADER, TRIANGLE_VERTEX_SHADER};
+use super::shader_library::{MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER};
 use crate::math::{Mat4, Vec3};
 use std::sync::{Arc, Mutex};
 use std::os::raw::{c_char, c_void};
@@ -72,6 +73,18 @@ struct OpenGlTexture2D {
     inner: Arc<Mutex<TextureViewInner>>,
     texture: u32,
     released: bool,
+}
+
+/// The OpenGL backend's own mesh state: the VAO (the attribute pointers),
+/// the vertex and the index buffers, and the counts the draw path needs.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct OpenGlMeshState {
+    vao: u32,
+    vertex_buffer: u32,
+    index_buffer: u32,
+    vertex_count: u32,
+    index_count: u32,
 }
 
 /// The OpenGL backend's own render target: a GL framebuffer object plus the
@@ -125,6 +138,23 @@ pub struct OpenGlBackend {
     tri_uniform_mvp: i32,
     tri_uniform_color: i32,
     tri_ready: bool,
+    // The generic mesh path's shared program (the PNU + camera + sampler
+    // shader pair the shader library carries; one program serves every
+    // mesh, the way the triangle's program serves the diagnostic draw).
+    mesh_program: u32,
+    mesh_uniform_view_projection: i32,
+    mesh_uniform_model: i32,
+    mesh_uniform_sampler: i32,
+    mesh_ready: bool,
+    /// The per-mesh state: the VAO (the attribute pointers), the vertex
+    /// and the index buffers, the vertex/index counts (the create order
+    /// matches the handle's id).
+    meshes: Vec<Option<OpenGlMeshState>>,
+    /// The sampler unit 0's bound texture (the texture's index in the
+    /// textures_2d vector; None keeps the default texture).
+    bound_texture: Option<usize>,
+    /// The default texture's index (the 1x1 white texel the setup creates).
+    default_texture: Option<usize>,
     clear_color: ClearColor,
     clear_depth: f32,
     clear_stencil: i32,
@@ -137,6 +167,7 @@ pub struct OpenGlBackend {
     violations: u64,
     targets: Vec<OpenGlRenderTarget>,
     textures_2d: Vec<OpenGlTexture2D>,
+    next_mesh_id: usize,
     readback_queue: Vec<(u32, u32)>,
     last_readback: Vec<ReadbackSample>,
     has_center: bool,
@@ -184,6 +215,14 @@ impl OpenGlBackend {
             tri_uniform_mvp: -1,
             tri_uniform_color: -1,
             tri_ready: false,
+            mesh_program: 0,
+            mesh_uniform_view_projection: -1,
+            mesh_uniform_model: -1,
+            mesh_uniform_sampler: -1,
+            mesh_ready: false,
+            meshes: Vec::new(),
+            bound_texture: None,
+            default_texture: None,
             clear_color: ClearColor {
                 r: 0,
                 g: 0,
@@ -201,6 +240,7 @@ impl OpenGlBackend {
             violations: 0,
             targets: Vec::new(),
             textures_2d: Vec::new(),
+            next_mesh_id: 0,
             readback_queue: Vec::new(),
             last_readback: Vec::new(),
             has_center: false,
@@ -385,6 +425,23 @@ impl OpenGlBackend {
                 self.config.height as i32,
             );
         }
+        // The default texture: one 1x1 opaque white texel the mesh path's
+        // sampler reads when no texture is bound (the same default the
+        // Vulkan path carries).
+        let desc = Texture2DDesc {
+            width: 1,
+            height: 1,
+            format: PixelFormat::Rgba8,
+        };
+        let view = self.create_texture_2d(&desc)?;
+        let white = [255u8, 255, 255, 255];
+        self.fill_texture_2d(&view, &white)?;
+        let index = self
+            .textures_2d
+            .iter()
+            .position(|t| Arc::ptr_eq(&t.inner, &view.inner))
+            .expect("the default texture's slot");
+        self.default_texture = Some(index);
         self.frame_open = true;
         Ok(())
     }
@@ -683,6 +740,161 @@ impl OpenGlBackend {
             self.draw_triangle();
         }
     }
+    /// The mesh path's shared program: the two mesh shaders from the
+    /// library, compiled at runtime by the driver (the same lazy ensure
+    /// the triangle path follows).
+    pub(crate) fn ensure_mesh_resources(&mut self) -> bool {
+        if self.mesh_ready {
+            return true;
+        }
+        let program = unsafe {
+            (self.loader.gl_create_program.unwrap())()
+        };
+        if program == 0 {
+            return false;
+        }
+        let vs = unsafe { (self.loader.gl_create_shader.unwrap())(GL_VERTEX_SHADER) };
+        let fs = unsafe {
+            (self.loader.gl_create_shader.unwrap())(GL_FRAGMENT_SHADER)
+        };
+        if vs == 0 || fs == 0 {
+            return false;
+        }
+        let vs_source = [MESH_VERTEX_SHADER.as_ptr() as *const c_char];
+        let vs_len = [MESH_VERTEX_SHADER.len() as i32];
+        let fs_source = [MESH_FRAGMENT_SHADER.as_ptr() as *const c_char];
+        let fs_len = [MESH_FRAGMENT_SHADER.len() as i32];
+        unsafe {
+            (self.loader.gl_shader_source.unwrap())(
+                vs,
+                1,
+                vs_source.as_ptr(),
+                vs_len.as_ptr(),
+            );
+            (self.loader.gl_compile_shader.unwrap())(vs);
+            (self.loader.gl_shader_source.unwrap())(
+                fs,
+                1,
+                fs_source.as_ptr(),
+                fs_len.as_ptr(),
+            );
+            (self.loader.gl_compile_shader.unwrap())(fs);
+            (self.loader.gl_attach_shader.unwrap())(program, vs);
+            (self.loader.gl_attach_shader.unwrap())(program, fs);
+            (self.loader.gl_link_program.unwrap())(program);
+        }
+        let mut linked: i32 = 0;
+        unsafe {
+            (self.loader.gl_get_programiv.unwrap())(
+                program,
+                GL_LINK_STATUS,
+                &mut linked,
+            );
+        }
+        if linked != GL_TRUE as i32 {
+            unsafe {
+                (self.loader.gl_delete_shader.unwrap())(vs);
+                (self.loader.gl_delete_shader.unwrap())(fs);
+                (self.loader.gl_delete_program.unwrap())(program);
+            }
+            return false;
+        }
+        unsafe {
+            (self.loader.gl_delete_shader.unwrap())(vs);
+            (self.loader.gl_delete_shader.unwrap())(fs);
+        }
+        self.mesh_program = program;
+        self.mesh_uniform_view_projection = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"view_projection\0".as_ptr() as *const c_char,
+            )
+        };
+        self.mesh_uniform_model = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"model\0".as_ptr() as *const c_char,
+            )
+        };
+        self.mesh_uniform_sampler = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"surface_texture\0".as_ptr() as *const c_char,
+            )
+        };
+        self.mesh_ready = true;
+        true
+    }
+
+    /// The generic draw path: the mesh's VAO, the camera uniforms (the
+    /// set_camera state's view-projection and the submission's model) and
+    /// the indexed draw. A draw with no open frame counts one violation
+    /// (the same rule the Vulkan path follows).
+    fn draw_mesh_by_id(&mut self, mesh_id: usize, model: Mat4) {
+        if !self.frame_open {
+            self.violations += 1;
+            return;
+        }
+        let (vao, index_count) = match self.meshes.get(mesh_id) {
+            Some(Some(state)) => (state.vao, state.index_count),
+            _ => {
+                self.violations += 1;
+                return;
+            }
+        };
+        if !self.mesh_ready {
+            return;
+        }
+        // The camera uniforms: the set_camera state's view-projection
+        // (the same matrices the camera path builds) and the model matrix
+        // the submission carries.
+        let camera = self.camera;
+        let aspect = self.config.width as f32 / self.config.height as f32;
+        let view = Mat4::look_at(camera.eye, camera.target, camera.up);
+        let projection =
+            Mat4::perspective(camera.fov_y_rad, aspect, camera.near, camera.far);
+        let view_projection = projection.multiply(view);
+        let texture = self.bound_texture
+            .and_then(|i| self.textures_2d.get(i))
+            .filter(|t| !t.released)
+            .map(|t| t.texture)
+            .unwrap_or(
+                self.default_texture
+                    .and_then(|i| self.textures_2d.get(i))
+                    .filter(|t| !t.released)
+                    .map(|t| t.texture)
+                    .unwrap_or(0),
+            );
+        unsafe {
+            (self.loader.gl_use_program.unwrap())(self.mesh_program);
+            (self.loader.gl_uniform_matrix_4fv.unwrap())(
+                self.mesh_uniform_view_projection,
+                1,
+                GL_FALSE,
+                view_projection.m.as_ptr() as *const f32,
+            );
+            (self.loader.gl_uniform_matrix_4fv.unwrap())(
+                self.mesh_uniform_model,
+                1,
+                GL_FALSE,
+                model.m.as_ptr() as *const f32,
+            );
+            (self.loader.gl_active_texture.unwrap())(GL_TEXTURE0);
+            (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_2D, texture);
+            (self.loader.gl_uniform_1i.unwrap())(
+                self.mesh_uniform_sampler,
+                0,
+            );
+            (self.loader.gl_bind_vertex_array.unwrap())(vao);
+            (self.loader.gl_draw_elements.unwrap())(
+                GL_TRIANGLES,
+                index_count as i32,
+                GL_UNSIGNED_INT,
+                std::ptr::null(),
+            );
+            (self.loader.gl_bind_vertex_array.unwrap())(0);
+        }
+    }
 }
 
 /// Copies a NUL-terminated C string out of a GL string pointer.
@@ -804,8 +1016,11 @@ impl RenderBackend for OpenGlBackend {
                 "create_gpu_mesh: the backend is shut down",
             ));
         }
+        let id = self.next_mesh_id;
+        self.next_mesh_id += 1;
         Ok(GpuMesh {
             inner: Arc::new(Mutex::new(GpuMeshInner {
+                id,
                 vertex_count: 0,
                 index_count: 0,
                 uploaded: false,
@@ -855,20 +1070,99 @@ impl RenderBackend for OpenGlBackend {
             inner.index_count = indices.len() as u32;
             inner.uploaded = true;
         }
+        // The mesh's GPU buffers: one VAO (the attribute pointers), one
+        // vertex buffer (the PNU bytes) and one index buffer (the u32s).
+        // The generic path's first layout is the PNU the mesh module's
+        // pnu_layout() builds; the pointers come from the layout's
+        // attributes (position at 0, normal at 12, texcoord0 at 24).
+        let mesh_id = mesh.inner.lock().unwrap().id;
+        let mut vao: u32 = 0;
+        let mut vbo: u32 = 0;
+        let ibo: u32;
+        unsafe {
+            (self.loader.gl_gen_vertex_arrays.unwrap())(1, &mut vao);
+            (self.loader.gl_gen_buffers.unwrap())(2, &mut vbo);
+            ibo = vbo.wrapping_add(1);
+            (self.loader.gl_bind_vertex_array.unwrap())(vao);
+            (self.loader.gl_bind_buffer.unwrap())(GL_ARRAY_BUFFER, vbo);
+            (self.loader.gl_buffer_data.unwrap())(
+                GL_ARRAY_BUFFER,
+                vertices.len() as isize,
+                vertices.as_ptr() as *const c_void,
+                GL_STATIC_DRAW,
+            );
+            // The attribute pointers: one per layout attribute, the
+            // semantic mapping onto the shader's locations (position 0,
+            // normal 1, texcoord0 2).
+            for attribute in &layout.attributes {
+                let location = match attribute.semantic {
+                    crate::render::VertexSemantic::Position => 0,
+                    crate::render::VertexSemantic::Normal => 1,
+                    crate::render::VertexSemantic::TexCoord0 => 2,
+                    crate::render::VertexSemantic::Color => 3,
+                };
+                let (size, gl_type) = match attribute.component_type {
+                    crate::render::ComponentType::Float32 => (
+                        attribute.components as i32,
+                        GL_FLOAT,
+                    ),
+                    crate::render::ComponentType::Uint8Normalized => (
+                        attribute.components as i32,
+                        GL_UNSIGNED_BYTE,
+                    ),
+                };
+                (self.loader.gl_vertex_attrib_pointer.unwrap())(
+                    location,
+                    size,
+                    gl_type,
+                    GL_FALSE,
+                    layout.stride as i32,
+                    attribute.offset as *const c_void,
+                );
+                (self.loader.gl_enable_vertex_attrib_array.unwrap())(location);
+            }
+            (self.loader.gl_bind_buffer.unwrap())(
+                GL_ELEMENT_ARRAY_BUFFER,
+                ibo,
+            );
+            (self.loader.gl_buffer_data.unwrap())(
+                GL_ELEMENT_ARRAY_BUFFER,
+                (indices.len() * std::mem::size_of::<u32>()) as isize,
+                indices.as_ptr() as *const c_void,
+                GL_STATIC_DRAW,
+            );
+            (self.loader.gl_bind_vertex_array.unwrap())(0);
+            (self.loader.gl_bind_buffer.unwrap())(GL_ARRAY_BUFFER, 0);
+            (self.loader.gl_bind_buffer.unwrap())(GL_ELEMENT_ARRAY_BUFFER, 0);
+        }
+        // The mesh path's program: the same lazy ensure the triangle path
+        // follows (one program serves every mesh).
+        if !self.ensure_mesh_resources() {
+            return Err(RenderError::from(
+                "upload_mesh: the mesh's shader program failed to compile",
+            ));
+        }
+        let state = OpenGlMeshState {
+            vao,
+            vertex_buffer: vbo,
+            index_buffer: ibo,
+            vertex_count: (vertices.len() as u32) / layout.stride,
+            index_count: indices.len() as u32,
+        };
+        if self.meshes.len() <= mesh_id {
+            self.meshes.resize(mesh_id + 1, None);
+        }
+        self.meshes[mesh_id] = Some(state);
         Ok(())
     }
-
     fn draw(&mut self, mesh: &GpuMesh, _program: &ShaderProgram) {
         if self.shutdown {
             self.violations += 1;
             return;
         }
-        let inner = mesh.inner.lock().unwrap();
-        if !inner.uploaded {
-            self.violations += 1;
-        }
+        let mesh_id = mesh.inner.lock().unwrap().id;
+        self.draw_mesh_by_id(mesh_id, Mat4::IDENTITY);
     }
-
     fn submit(&mut self, submission: &crate::render::DrawSubmission) {
         if self.shutdown {
             self.violations += 1;
@@ -879,6 +1173,8 @@ impl RenderBackend for OpenGlBackend {
                 self.violations += 1;
             }
         }
+        let mesh_id = submission.mesh.inner.lock().unwrap().id;
+        self.draw_mesh_by_id(mesh_id, submission.model);
     }
 
     fn create_render_target(
@@ -1156,6 +1452,23 @@ impl RenderBackend for OpenGlBackend {
     fn bind_texture(&mut self, _view: Option<&TextureView>, _unit: u32) {
         if self.shutdown {
             self.violations += 1;
+            return;
+        }
+        // The first sampler unit: the mesh path's draw binds the texture
+        // (the later units record without the draw's use).
+        if _unit != 0 {
+            return;
+        }
+        match _view {
+            None => {
+                self.bound_texture = None;
+            }
+            Some(v) => {
+                self.bound_texture = self
+                    .textures_2d
+                    .iter()
+                    .position(|t| Arc::ptr_eq(&t.inner, &v.inner));
+            }
         }
     }
 

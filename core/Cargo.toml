@@ -39,5 +39,9 @@ name = "mtl_smoke"
 required-features = ["metal"]
 
 [[example]]
+name = "cube_smoke_mtl"
+required-features = ["metal"]
+
+[[example]]
 name = "d3d12_smoke"
 required-features = ["d3d12"]

@@ -520,14 +520,18 @@ impl MetalBackend {
     /// Compiles the two MSL sources into one MTLLibrary (the device's own
     /// compiler; a nil return is the compile failure's signal).
     fn compile_stage(
-        &mut self,
+        &self,
         source: &str,
         stage: &'static str,
-    ) -> Option<super::mtl_loader::MTLLibraryHandle> {
+    ) -> Result<super::mtl_loader::MTLLibraryHandle, String> {
+        // The compile failure's text travels back to the caller as the
+        // Err value (the lit path's failures must land in `lit_error`,
+        // not the triangle path's `tri_error` — the upload's error
+        // message reads the lit one, and an empty message hides the
+        // compile failure's text).
         let source_string = self.make_ns_string(source);
         if source_string.is_null() {
-            self.tri_error = format!("{}: the source's NSString failed", stage);
-            return None;
+            return Err(format!("{}: the source's NSString failed", stage));
         }
         let options = unsafe {
             self.loader
@@ -551,14 +555,13 @@ impl MetalBackend {
             )
         };
         if library.is_null() {
-            self.tri_error = if compile_error.is_null() {
+            Err(if compile_error.is_null() {
                 format!("{}: the library creation returned nil", stage)
             } else {
                 format!("{}: {}", stage, self.ns_error_text(compile_error))
-            };
-            None
+            })
         } else {
-            Some(library)
+            Ok(library)
         }
     }
 
@@ -815,8 +818,11 @@ impl MetalBackend {
             super::shader_library::MESH_VERTEX_SHADER,
             "the mesh vertex stage's library",
         ) {
-            Some(library) => library,
-            None => return false,
+            Ok(library) => library,
+            Err(message) => {
+                self.mesh_error = message;
+                return false;
+            }
         };
         let vertex_function =
             match self.new_function(vertex_library, "meshVertexMain") {
@@ -831,8 +837,11 @@ impl MetalBackend {
             super::shader_library::MESH_FRAGMENT_SHADER,
             "the mesh fragment stage's library",
         ) {
-            Some(library) => library,
-            None => return false,
+            Ok(library) => library,
+            Err(message) => {
+                self.mesh_error = message;
+                return false;
+            }
         };
         let fragment_function =
             match self.new_function(fragment_library, "meshFragmentMain") {
@@ -1036,8 +1045,11 @@ impl MetalBackend {
             super::shader_library::LIT_VERTEX_SHADER,
             "the lit vertex stage's library",
         ) {
-            Some(library) => library,
-            None => return false,
+            Ok(library) => library,
+            Err(message) => {
+                self.lit_error = message;
+                return false;
+            }
         };
         let vertex_function =
             match self.new_function(vertex_library, "litVertexMain") {
@@ -1052,8 +1064,11 @@ impl MetalBackend {
             super::shader_library::LIT_FRAGMENT_SHADER,
             "the lit fragment stage's library",
         ) {
-            Some(library) => library,
-            None => return false,
+            Ok(library) => library,
+            Err(message) => {
+                self.lit_error = message;
+                return false;
+            }
         };
         let fragment_function =
             match self.new_function(fragment_library, "litFragmentMain") {
@@ -1240,8 +1255,11 @@ impl MetalBackend {
             super::shader_library::TRIANGLE_VERTEX_SHADER,
             "the vertex stage's library",
         ) {
-            Some(library) => library,
-            None => return false,
+            Ok(library) => library,
+            Err(message) => {
+                self.tri_error = message;
+                return false;
+            }
         };
         let vertex_function =
             match self.new_function(vertex_library, "vertexMain") {
@@ -1255,8 +1273,11 @@ impl MetalBackend {
             super::shader_library::TRIANGLE_FRAGMENT_SHADER,
             "the fragment stage's library",
         ) {
-            Some(library) => library,
-            None => return false,
+            Ok(library) => library,
+            Err(message) => {
+                self.tri_error = message;
+                return false;
+            }
         };
         let fragment_function =
             match self.new_function(fragment_library, "fragmentMain") {

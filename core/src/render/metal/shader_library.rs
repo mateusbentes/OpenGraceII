@@ -147,7 +147,14 @@ vertex LitVertexOut litVertexMain(MeshVertexIn in [[stage_in]],
     LitVertexOut out;
     float4 world = camera.model * float4(in.position, 1.0);
     out.position = camera.view_projection * world;
-    out.normal = (float3x3)(camera.model) * in.normal;
+    // The matrix cast float4x4 -> float3x3 does not exist in the Metal
+    // shading language: the 3x3 normal matrix is built from the model's
+    // columns (the uniform scale keeps the normal direction).
+    float3x3 normal_matrix = float3x3(
+        camera.model[0].xyz,
+        camera.model[1].xyz,
+        camera.model[2].xyz);
+    out.normal = normal_matrix * in.normal;
     out.uv = in.uv;
     out.world = world.xyz;
     return out;
@@ -192,12 +199,14 @@ fragment float4 litFragmentMain(LitVertexOut in [[stage_in]],
             break;
         }
         float3 to_light = lights.point_position_radius[i].xyz - in.world;
-        float distance = length(to_light);
-        to_light /= distance;
+        // The variable cannot be named `distance` — the shadowing
+        // of the builtin function confuses the Metal front end.
+        float dist = length(to_light);
+        to_light /= dist;
         float radius = lights.point_position_radius[i].w;
-        float window = 1.0 - (distance / radius) * (distance / radius);
-        float attenuation = window * window / (1.0 + distance * distance);
-        if (distance >= radius) {
+        float window = 1.0 - (dist / radius) * (dist / radius);
+        float attenuation = window * window / (1.0 + dist * dist);
+        if (dist >= radius) {
             attenuation = 0.0;
         }
         float diffuse = max(dot(normal, to_light), 0.0);

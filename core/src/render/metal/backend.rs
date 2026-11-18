@@ -34,8 +34,7 @@ use super::mtl_loader::{
     MTLLA_CLEAR, MTLSA_STORE,
     MTLPT_TRIANGLE,
     MTLVF_FLOAT2, MTLVF_FLOAT3, MTLSF_PER_VERTEX, MTLSM_SHARED, MTLSM_PRIVATE,
-    MTLSMF_NEAREST, MTLWINDING_COUNTER_CLOCKWISE, MTLCULL_NONE,
-    MTLSAM_CLAMP_TO_EDGE, MTLLA_LOAD,
+    MTLSMF_NEAREST, MTLSAM_CLAMP_TO_EDGE, MTLLA_LOAD,
     MTLIT_UINT32, MTLCF_LESS,
     MTLBLOPT_DEPTH_FROM_DEPTH_STENCIL, MTLBLOPT_STENCIL_FROM_DEPTH_STENCIL,
     MTLCU_RENDER_TARGET, MTLCU_SHADER_READ,
@@ -890,18 +889,15 @@ impl MetalBackend {
                 self.loader.sel("setStencilAttachmentPixelFormat:"),
                 self.depth_format,
             );
-            // The winding rule and the cull mode: no culling (the same
-            // forgiving rule the Vulkan path's first step records).
-            self.loader.send_void_ul(
-                descriptor,
-                self.loader.sel("setWinding:"),
-                MTLWINDING_COUNTER_CLOCKWISE,
-            );
-            self.loader.send_void_ul(
-                descriptor,
-                self.loader.sel("setCullMode:"),
-                MTLCULL_NONE,
-            );
+            // The winding rule and the cull mode stay at the API's own
+            // defaults (front-facing = counter-clockwise, cull = none —
+            // the same forgiving rule the Vulkan path's first step
+            // records). The pipeline descriptor carries no winding/cull
+            // setters at all: those are render-command-encoder state, and
+            // sending setWinding:/setCullMode: to the descriptor raises
+            // the unrecognized-selector exception the Rust runtime cannot
+            // catch (the hardware run's abort at the descriptor block
+            // caught it).
         }
         let pipeline = unsafe {
             let mut pipeline_error: *mut c_void = std::ptr::null_mut();
@@ -2342,20 +2338,20 @@ impl RenderBackend for MetalBackend {
             let f: unsafe extern "C" fn(
                 *mut c_void,
                 *mut c_void,
+                MtlRegion,
+                super::mtl_loader::NsUInteger,
                 *const c_void,
                 super::mtl_loader::NsUInteger,
-                super::mtl_loader::NsUInteger,
-                MtlRegion,
             ) = std::mem::transmute(self.loader.objc_msg_send.unwrap());
             f(
                 texture,
                 self.loader.sel(
                     "replaceRegion:mipmapLevel:withBytes:bytesPerRow:",
                 ),
-                data.as_ptr() as *const c_void,
-                0,
-                bytes_per_row as super::mtl_loader::NsUInteger,
                 region,
+                0,
+                data.as_ptr() as *const c_void,
+                bytes_per_row as super::mtl_loader::NsUInteger,
             );
         }
         Ok(())

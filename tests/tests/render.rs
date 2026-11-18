@@ -20,6 +20,9 @@ const CLEAR_COLOR: ClearColor = ClearColor {
     b: 50,
     a: 255,
 };
+// The backends' smokes carry the triangle colour; the featureless
+// build compiles none of them, so the constant is gated the same way.
+#[cfg(any(feature = "vulkan", feature = "metal", feature = "d3d12"))]
 const TRIANGLE_COLOR: ClearColor = ClearColor {
     r: 200,
     g: 40,

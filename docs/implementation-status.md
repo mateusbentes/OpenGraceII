@@ -17,7 +17,7 @@ The `.docx` files in this directory are generated from the `.md` sources with
 | 2 | Render contract and the first backend: Vulkan on Linux (lavapipe); the Android hardware run follows | Done |
 | 3 | The remaining backends: OpenGL (Windows/Linux), Metal (macOS/iOS), Direct3D 12 (Windows) | Done (OpenGL and Vulkan validated on Linux hardware, Metal on the macOS hardware run, Direct3D 12 under Wine with vkd3d; the Android Vulkan run stays open) |
 | 4 | Render foundation: math, mesh, shader, material | Done (the math and the mesh modules carry their unit tests; the textured cube runs through the real mesh path on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
-| 5 | Forward lighting: light types, shadow mapping | Planned |
+| 5 | Forward lighting: light types, shadow mapping | Done (the Blinn-Phong path with the sun and up to four point lights runs on all four backends; the shadow mapping follows in a later milestone) |
 | 6 | Deferred lighting: MRT G-buffer, the lighting pass | Planned |
 | 7 | Post-processing chain: HDR, bloom, filmic tonemapping, depth of field, morphological anti-aliasing, SSAO-STF | Planned |
 | 8 | Global illumination by light volume propagation | Planned |
@@ -351,6 +351,69 @@ The validation runs, all through the same contract:
 The four smokes carry the same two-readback pattern the triangle smokes
 established (the centre and the corner of one frame), and the triangle
 smokes keep passing — nothing the milestone touched broke.
+
+---
+
+## Milestone 5: Forward lighting
+
+Milestone 5 lands the engine's own forward lighting — the Blinn-Phong
+reference the shaders carry, the light types the submissions carry and
+the first lit draw through the real mesh path on every backend.
+
+**The lighting reference** (`core/src/lighting.rs`): the pure functions
+the shaders translate — `point_attenuation` (the windowed
+inverse-square falloff), `spot_falloff` (the smooth cone), `blinn_phong`
+(the diffuse/specular pair) and `sun_contribution` (the direction's
+negation). 8 deterministic unit tests carry the numeric accuracy: the
+attenuation is one at the origin and zero at the radius, the diffuse
+peaks at the full-facing surface and vanishes at the grazing one, and
+the specular peaks at the half vector.
+
+**The lights' uniform contract** (the M5c rule, the same shape the
+camera block established): one API-neutral 256-byte block each backend
+maps onto its own language — the sun's direction and colour+intensity,
+up to four point lights' position+radius and colour+intensity, and the
+params (the active point lights' count). The submissions carry the sun
+and the point lights; the upload path writes the block once and every
+backend's draw binds it.
+
+**The integration test** follows the M4 rule: a lit cube drawn through
+the real path with a pixel readback at the frame's end. The sun's
+intensity is 0.5 and the light hits the front face at full strength, so
+the centre reads 90, 90, 90 — the 180 grey scaled by the intensity, a
+value the unlit path cannot produce (a silent fallback to unlit would
+read 180 and fail the check). The corner carries the clear colour, and
+the protocol stays clean (zero violations).
+
+The validation runs, all through the same contract:
+
+- **Vulkan** (`cube_lit`, lavapipe in the sandbox, Iris Xe on the
+  LucDev hardware): centre 90, 90, 90, depth 0.8876, corner clear, zero
+  violations.
+- **OpenGL** (`cube_lit_gl`, EGL surfaceless + GL 3.3 core in the
+  sandbox, Mesa 26.0.8 GL 4.6 core on the LucDev): centre 90, 90, 90,
+  depth 0.9438, corner clear, zero violations.
+- **Direct3D 12** (`cube_lit_d3d12`, Wine with vkd3d): centre 90, 90,
+  90, depth 0.8876, corner clear, zero violations. The run's own
+  findings: the lights' CBV sits at register(b1) with the mesh heap
+  grown to three slots, and the lights' block carries the 256-byte
+  padding the cbuffer reads.
+- **Metal** (`cube_lit_mtl`, the A18 Pro's hardware run): centre 90,
+  90, 90, depth 0.8876, corner clear, zero violations. The run's own
+  findings, both fixed in the same milestone: the lit vertex shader's
+  normal transform used the float4x4-to-float3x3 cast the Metal
+  shading language does not support (the 3x3 normal matrix is built
+  from the model's columns), and the fragment's `distance` variable
+  shadowed the builtin function of the same name (the variable is now
+  `dist`). The earlier empty error message was its own defect: the
+  compile stage wrote the lit path's failures into the triangle path's
+  error string, so the upload's diagnostic read empty — the compile
+  stage now returns the failure's text to the caller, which records it
+  in its own error string.
+
+The lit smokes carry the same two-readback pattern the unlit smokes
+established, and the unlit smokes and the triangle smokes keep passing —
+nothing the milestone touched broke.
 
 ---
 

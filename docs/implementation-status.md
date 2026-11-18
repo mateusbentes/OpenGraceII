@@ -16,7 +16,7 @@ The `.docx` files in this directory are generated from the `.md` sources with
 | 1 | Rust skeleton: Cargo workspace, module layout, the validation matrix (build, test, docs checks), the pinned toolchain | Done |
 | 2 | Render contract and the first backend: Vulkan on Linux (lavapipe); the Android hardware run follows | Done |
 | 3 | The remaining backends: OpenGL (Windows/Linux), Metal (macOS/iOS), Direct3D 12 (Windows) | Done (OpenGL and Vulkan validated on Linux hardware, Metal on the macOS hardware run, Direct3D 12 under Wine with vkd3d; the Android Vulkan run stays open) |
-| 4 | Render foundation: math, mesh, shader, material | Planned |
+| 4 | Render foundation: math, mesh, shader, material | Done (the math and the mesh modules carry their unit tests; the textured cube runs through the real mesh path on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
 | 5 | Forward lighting: light types, shadow mapping | Planned |
 | 6 | Deferred lighting: MRT G-buffer, the lighting pass | Planned |
 | 7 | Post-processing chain: HDR, bloom, filmic tonemapping, depth of field, morphological anti-aliasing, SSAO-STF | Planned |
@@ -278,6 +278,79 @@ development platforms: Linux x86_64 (Vulkan and OpenGL on hardware),
 Windows x86_64 (the D3D12 path under Wine with vkd3d plus the
 windows-gnu cross-build) and macOS arm64 (Metal on the A18 Pro's
 hardware).
+
+---
+
+## Milestone 4: Render foundation
+
+Milestone 4 lands the engine's own render foundation — the math library
+the shaders consume, the mesh module the draws submit and the first
+textured draw through the real mesh path on every backend.
+
+**The math library** (`core/src/math.rs`): `Vec2`/`Vec3`/`Vec4`, the
+column-major `Mat4` (OpenGL clip convention, `m[c][r]`), the complete
+`Quat` (axis-angle, multiplication, slerp, the `Mat4` conversion),
+`Aabb`, `Plane`, `Frustum` (the view volume and the culling test) and
+`Transform` (the compose/roundtrip pair). 18 deterministic unit tests
+carry the numeric accuracy the contract demands.
+
+**The mesh module** (`core/src/mesh.rs`): the formal PNU vertex layout
+(`pnu_layout()` — position, normal, uv; 32-byte stride), the `MeshData`
+container and the `cube(size)`/`quad()` builders. 5 unit tests carry
+the layout offsets, the cube's shape and indexing, the normals' unit
+length and outward direction, the AABB and the quad.
+
+**The uniform contract** (the M4c rule, documented on the `GpuMesh`
+handle): the vertex stage carries the camera block — the view-projection
+matrix the `set_camera` state builds and the model matrix the submission
+writes — as one API-neutral byte layout each backend maps onto its own
+language (Vulkan's std140 block, OpenGL's uniforms, D3D12's cbuffer,
+Metal's constant struct). The two matrices are column-major; one upload
+path serves all four backends.
+
+**The integration test** is the honest one: a textured cube drawn
+through the real path (`create_gpu_mesh` + `upload_mesh` + `set_camera`
++ `draw`/`submit`) with a pixel readback at the frame's end — no
+special-case shortcut. The texture is a 4x4 whose centre samples red
+and whose edge row is green (the sampler's NEAREST read of the upload);
+the camera looks at the origin from +Z, so the cube's front face fills
+the frame's centre. The checks: the centre carries the texture's red
+with a depth in front of the far plane, the corner carries the clear
+colour, and the protocol stays clean (zero violations). The spin is not
+in the smoke yet — the model matrix is identity there; the rotation by
+quaternion follows in a later milestone.
+
+The validation runs, all through the same contract:
+
+- **Vulkan** (`cube_smoke`, lavapipe in the sandbox, Iris Xe on the
+  LucDev hardware): centre red, depth 0.8876, corner clear, zero
+  violations.
+- **OpenGL** (`cube_smoke_gl`, EGL surfaceless + GL 3.3 core in the
+  sandbox, Mesa 26.0.8 GL 4.6 core on the LucDev): centre red, depth
+  0.9438, corner clear, zero violations.
+- **Direct3D 12** (`cube_smoke_d3d12`, Wine with vkd3d): centre red,
+  depth 0.8876, corner clear, zero violations. The run's own debug
+  findings, fixed in the loader and the backend: the shader-visible
+  heap flag is 1 (not 2), the pixel-shader-resource state is 0x80, the
+  SRV descriptor's real 4-field shape, the 256-byte CBV alignment
+  vkd3d requires, the subresource-index destination form the
+  CopyTextureRegion needs (the footprint-to-footprint copy is not
+  implemented under vkd3d), the real staging footprint the upload's
+  copy must carry, and the GPU handle's by-value pass.
+- **Metal** (`cube_smoke_mtl`, the A18 Pro's hardware run): centre red,
+  depth 0.8876, corner clear, zero violations. The MSL libraries compile
+  at runtime (one per stage, the M3 rule), the vertex descriptor carries
+  the three PNU attributes at buffer index 1, and the run's own finding
+  is now a recorded lesson: the pipeline descriptor carries no
+  winding/cull setters — those are render-command-encoder state, and
+  sending `setWinding:`/`setCullMode:` to the descriptor raises the
+  unrecognized-selector exception the Rust runtime cannot catch. The
+  API's own defaults (front-facing = counter-clockwise, cull = none) are
+  the forgiving rule the first step wanted.
+
+The four smokes carry the same two-readback pattern the triangle smokes
+established (the centre and the corner of one frame), and the triangle
+smokes keep passing — nothing the milestone touched broke.
 
 ---
 

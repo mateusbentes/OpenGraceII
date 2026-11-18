@@ -111,11 +111,12 @@ use super::d3d12_loader::{
 
 };
 use super::super::{
-    bytes_per_pixel, CameraParams, ClearBuffer, ClearColor, DrawSubmission,
-    GpuMesh, GpuMeshInner, PixelFormat, ReadbackSample, RenderBackend,
-    RenderError, RenderTarget, RenderTargetDesc, RenderTargetInner,
-    ShaderProgram, ShaderProgramInner, Texture2DDesc, TextureView,
-    TextureViewInner, VertexLayout, DEPTH_ATTACHMENT,
+    bytes_per_pixel, CameraParams, ClearBuffer, ClearColor,
+    DirectionalLight, DrawSubmission, DynamicLight, GpuMesh, GpuMeshInner,
+    PixelFormat, ReadbackSample, RenderBackend, RenderError, RenderTarget,
+    RenderTargetDesc, RenderTargetInner, ShaderProgram, ShaderProgramInner,
+    Texture2DDesc, TextureView, TextureViewInner, VertexLayout,
+    DEPTH_ATTACHMENT,
 };
 use crate::math::{Mat4, Vec3};
 use std::os::raw::{c_char, c_void};
@@ -215,6 +216,77 @@ const STAGING_STENCIL_OFFSET: usize =
 struct TriUniform {
     mvp: [[f32; 4]; 4],
     color: [f32; 4],
+}
+
+/// The lights' uniform block (M5): the same layout every backend maps —
+/// the sun's direction (xyz + pad), the sun's colour (xyz) and intensity
+/// (w), the four point lights' position (xyz) and radius (w), the four
+/// point lights' colour (xyz) and intensity (w), the params (x = the
+/// live point-light count). The block is exactly 256 bytes (the CBV's
+/// alignment rule the vkd3d validation recorded).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LightsUniform {
+    sun_direction: [f32; 4],
+    sun_color_intensity: [f32; 4],
+    point_position_radius: [[f32; 4]; 4],
+    point_color_intensity: [[f32; 4]; 4],
+    params: [f32; 4],
+    // The tail pad: the block's byte size the CBV reads (256; the
+    // declared fields land at 176, the pad completes the buffer — the
+    // copies' 256-byte reads stay in bounds).
+    _pad: [f32; 20],
+}
+
+impl LightsUniform {
+    /// The default block: no lights (the intensity zero, the count
+    /// zero — the lit draw renders the texture unlit rather than black).
+    fn none() -> Self {
+        LightsUniform {
+            sun_direction: [0.0, -1.0, 0.0, 0.0],
+            sun_color_intensity: [0.0, 0.0, 0.0, 0.0],
+            point_position_radius: [[0.0; 4]; 4],
+            point_color_intensity: [[0.0; 4]; 4],
+            params: [0.0, 0.0, 0.0, 0.0],
+            _pad: [0.0; 20],
+        }
+    }
+
+    /// The block from the contract's lights: the sun (the direction
+    /// normalised) plus up to four point lights (the rest stay zero).
+    fn from_lights(sun: &DirectionalLight, lights: &[DynamicLight]) -> Self {
+        let direction = sun.direction.normalised();
+        let mut block = LightsUniform {
+            sun_direction: [direction.x, direction.y, direction.z, 0.0],
+            sun_color_intensity: [
+                sun.color.x, sun.color.y, sun.color.z, sun.intensity,
+            ],
+            point_position_radius: [[0.0; 4]; 4],
+            point_color_intensity: [[0.0; 4]; 4],
+            params: [0.0, 0.0, 0.0, 0.0],
+            _pad: [0.0; 20],
+        };
+        for (index, dynamic) in lights.iter().take(4).enumerate() {
+            // The spot light's cone falloff waits for the next step (the
+            // first lit step carries the point lights).
+            if let DynamicLight::Point(light) = dynamic {
+                block.point_position_radius[index] = [
+                    light.position.x,
+                    light.position.y,
+                    light.position.z,
+                    light.radius,
+                ];
+                block.point_color_intensity[index] = [
+                    light.color.x,
+                    light.color.y,
+                    light.color.z,
+                    light.intensity,
+                ];
+            }
+        }
+        block.params[0] = lights.len().min(4) as f32;
+        block
+    }
 }
 
 /// The D3D12 backend's configuration. The same fields the other backends'
@@ -349,6 +421,14 @@ pub struct D3d12Backend {
     mesh_ready: bool,
     mesh_root_signature: d3d::D3d12RootSignatureHandle,
     mesh_pipeline: d3d::D3d12PipelineStateHandle,
+    // The lit mesh path's state (M5): the lit PSO and its root signature
+    // (the CBV at b0, the SRV at t0, the lights' CBV at b1) plus the
+    // shared 256-byte lights' buffer the draws write.
+    lit_ready: bool,
+    lit_root_signature: d3d::D3d12RootSignatureHandle,
+    lit_pipeline: d3d::D3d12PipelineStateHandle,
+    lit_lights_buffer: d3d::D3d12ResourceHandle,
+    lit_block: LightsUniform,
     bound_texture: Option<usize>,
     default_texture: Option<usize>,
     readback_queue: Vec<(u32, u32)>,
@@ -971,6 +1051,11 @@ impl D3d12Backend {
             mesh_ready: false,
             mesh_root_signature: std::ptr::null_mut(),
             mesh_pipeline: std::ptr::null_mut(),
+            lit_ready: false,
+            lit_root_signature: std::ptr::null_mut(),
+            lit_pipeline: std::ptr::null_mut(),
+            lit_lights_buffer: std::ptr::null_mut(),
+            lit_block: LightsUniform::none(),
             bound_texture: None,
             default_texture: None,
             readback_queue: Vec::new(),
@@ -1722,6 +1807,330 @@ impl D3d12Backend {
         true
     }
 
+    /// The lit mesh path's resources (M5): the LIT shader pair compiled
+    /// by D3DCompile, the root signature whose table carries the frame's
+    /// CBV at b0, the texture's SRV at t0 and the lights' CBV at b1, and
+    /// the PSO whose input layout carries the PNU's three attributes.
+    /// The same lazy ensure the unlit path follows; the compilation
+    /// happens before a frame opens (the upload's ensure, not the
+    /// draw's).
+    fn ensure_lit_resources(&mut self) -> bool {
+        if self.lit_ready {
+            return true;
+        }
+        let mut vs_blob: D3dBlobHandle = std::ptr::null_mut();
+        let mut ps_blob: D3dBlobHandle = std::ptr::null_mut();
+        let mut rs_blob: D3dBlobHandle = std::ptr::null_mut();
+        let mut error_blob: D3dBlobHandle = std::ptr::null_mut();
+        let vs_source = super::shader_library::LIT_VERTEX_SHADER;
+        let ps_source = super::shader_library::LIT_PIXEL_SHADER;
+        unsafe {
+            let compile = self
+                .loader
+                .d3d_compile
+                .expect("the loader resolved D3DCompile");
+            let hr = compile(
+                vs_source.as_ptr() as *const c_void,
+                vs_source.len() as u64,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                b"vsMain\0".as_ptr() as *const c_char,
+                b"vs_5_0\0".as_ptr() as *const c_char,
+                0,
+                0,
+                &mut vs_blob,
+                &mut error_blob,
+            );
+            if hr != S_OK || vs_blob.is_null() {
+                return false;
+            }
+            let hr = compile(
+                ps_source.as_ptr() as *const c_void,
+                ps_source.len() as u64,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                b"psMain\0".as_ptr() as *const c_char,
+                b"ps_5_0\0".as_ptr() as *const c_char,
+                0,
+                0,
+                &mut ps_blob,
+                &mut error_blob,
+            );
+            if hr != S_OK || ps_blob.is_null() {
+                return false;
+            }
+        }
+        let vs_blob_size = unsafe {
+            call_slot_u64_0(vs_blob as ComObject, BLOB_GET_BUFFER_SIZE)
+        };
+        let ps_blob_size = unsafe {
+            call_slot_u64_0(ps_blob as ComObject, BLOB_GET_BUFFER_SIZE)
+        };
+        // The root signature: one descriptor table (the frame's CBV at
+        // b0, the SRV at t0, the lights' CBV at b1 — the heap's slots 0,
+        // 1 and 2) and one static sampler at s0.
+        let ranges = [
+            d3d::D3d12DescriptorRange {
+                range_type: d3d::D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+                num_descriptors: 1,
+                base_shader_register: 0,
+                register_space: 0,
+                offset_in_descriptors_from_table_start: 0,
+            },
+            d3d::D3d12DescriptorRange {
+                range_type: d3d::D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                num_descriptors: 1,
+                base_shader_register: 0,
+                register_space: 0,
+                offset_in_descriptors_from_table_start: 1,
+            },
+            d3d::D3d12DescriptorRange {
+                range_type: d3d::D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+                num_descriptors: 1,
+                base_shader_register: 1,
+                register_space: 0,
+                offset_in_descriptors_from_table_start: 2,
+            },
+        ];
+        let table = d3d::D3d12RootDescriptorTable {
+            num_descriptor_ranges: 3,
+            descriptor_ranges: ranges.as_ptr(),
+        };
+        let parameter = D3d12RootParameter {
+            parameter_type: d3d::D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            union_head_padding: [0],
+            constants_or_table: d3d::D3d12RootParameterUnion { table },
+            union_tail_padding: [0],
+            visibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let static_sampler = d3d::D3d12StaticSamplerDesc {
+            filter: d3d::D3D12_FILTER_MIN_MAG_MIP_POINT,
+            address_u: d3d::D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+            address_v: d3d::D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+            address_w: d3d::D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+            mip_lod_bias: 0.0,
+            max_anisotropy: 0,
+            comparison_func: d3d::D3D12_COMPARISON_FUNC_ALWAYS,
+            border_color: d3d::D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+            min_lod: 0.0,
+            max_lod: 3.402823466e38,
+            shader_register: 0,
+            register_space: 0,
+            shader_visibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let root_signature_desc = D3d12RootSignatureDesc {
+            num_parameters: 1,
+            parameters: &parameter,
+            num_static_samplers: 1,
+            static_samplers: &static_sampler as *const _ as *const c_void,
+            flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+        };
+        unsafe {
+            let serialize = self
+                .loader
+                .d3d12_serialize_root_signature
+                .expect("the loader resolved D3D12SerializeRootSignature");
+            let hr = serialize(
+                &root_signature_desc,
+                d3d::D3D_ROOT_SIGNATURE_VERSION_1_0,
+                &mut rs_blob,
+                &mut error_blob,
+            );
+            if hr != S_OK || rs_blob.is_null() {
+                return false;
+            }
+            let rs_bytes = std::slice::from_raw_parts(
+                call_slot_ptr_0(
+                    rs_blob as ComObject,
+                    BLOB_GET_BUFFER_POINTER,
+                ) as *const u8,
+                call_slot_u64_0(
+                    rs_blob as ComObject,
+                    BLOB_GET_BUFFER_SIZE,
+                ) as usize,
+            );
+            let mut root_signature: *mut c_void = std::ptr::null_mut();
+            let hr = call_slot_i32_5(
+                self.device as ComObject,
+                DEVICE_CREATE_ROOT_SIGNATURE,
+                0 as *mut c_void,
+                rs_bytes.as_ptr() as *const c_void as *mut c_void,
+                rs_bytes.len() as *mut c_void,
+                IID_ID3D12_ROOT_SIGNATURE_WORDS.as_ptr() as *mut c_void,
+                &mut root_signature as *mut _ as *mut c_void,
+            );
+            if hr != S_OK || root_signature.is_null() {
+                return false;
+            }
+            self.lit_root_signature = root_signature;
+        }
+        // The PSO: the same states the mesh PSO carries (the PNU input
+        // layout, LESS depth, no culling), the LIT shaders' bytecode.
+        let position = b"POSITION\0";
+        let normal = b"NORMAL\0";
+        let texcoord = b"TEXCOORD\0";
+        let input_elements = [
+            D3d12InputElementDesc {
+                semantic_name: position.as_ptr() as *const c_char,
+                semantic_index: 0,
+                format: DXGI_FORMAT_R32G32B32_FLOAT,
+                input_slot: 0,
+                aligned_byte_offset: 0,
+                input_slot_class: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                instance_data_step_rate: 0,
+            },
+            D3d12InputElementDesc {
+                semantic_name: normal.as_ptr() as *const c_char,
+                semantic_index: 0,
+                format: DXGI_FORMAT_R32G32B32_FLOAT,
+                input_slot: 0,
+                aligned_byte_offset: 12,
+                input_slot_class: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                instance_data_step_rate: 0,
+            },
+            D3d12InputElementDesc {
+                semantic_name: texcoord.as_ptr() as *const c_char,
+                semantic_index: 0,
+                format: DXGI_FORMAT_R32G32_FLOAT,
+                input_slot: 0,
+                aligned_byte_offset: 24,
+                input_slot_class: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                instance_data_step_rate: 0,
+            },
+        ];
+        let blend_target = D3d12RenderTargetBlendDesc {
+            blend_enable: 0,
+            logic_op_enable: 0,
+            src_blend: D3D12_BLEND_ONE,
+            dest_blend: D3D12_BLEND_ZERO,
+            blend_op: D3D12_BLEND_OP_ADD,
+            src_blend_alpha: D3D12_BLEND_ONE,
+            dest_blend_alpha: D3D12_BLEND_ZERO,
+            blend_op_alpha: D3D12_BLEND_OP_ADD,
+            logic_op: 0,
+            render_target_write_mask: D3D12_COLOR_WRITE_ENABLE_ALL,
+        };
+        let blend_state = D3d12BlendDesc {
+            alpha_to_coverage_enable: 0,
+            independent_blend_enable: 0,
+            render_target: [blend_target; 8],
+        };
+        let rasterizer = D3d12RasterizerDesc {
+            fill_mode: D3D12_FILL_MODE_SOLID,
+            cull_mode: D3D12_CULL_MODE_NONE,
+            front_counter_clockwise: 0,
+            depth_bias: 0,
+            depth_bias_clamp: 0.0,
+            slope_scaled_depth_bias: 0.0,
+            depth_clip_enable: 1,
+            multisample_enable: 0,
+            antialiased_line_enable: 0,
+            forced_sample_count: 0,
+            conservative_raster: 0,
+        };
+        let depth_stencil = D3d12DepthStencilDesc {
+            depth_enable: 1,
+            depth_write_mask: D3D12_DEPTH_WRITE_MASK_ALL,
+            depth_func: D3D12_COMPARISON_FUNC_LESS,
+            stencil_enable: 0,
+            stencil_read_mask: 0,
+            stencil_write_mask: 0,
+            front_face: D3d12DepthStencilopDesc {
+                stencil_fail_op: 0,
+                stencil_depth_fail_op: 0,
+                stencil_pass_op: 0,
+                stencil_func: 0,
+            },
+            back_face: D3d12DepthStencilopDesc {
+                stencil_fail_op: 0,
+                stencil_depth_fail_op: 0,
+                stencil_pass_op: 0,
+                stencil_func: 0,
+            },
+        };
+        let input_layout = D3d12InputLayoutDesc {
+            num_elements: 3,
+            elements: input_elements.as_ptr(),
+        };
+        let (vs_bytecode, ps_bytecode) = unsafe {
+            (
+                call_slot_ptr_0(vs_blob as ComObject, BLOB_GET_BUFFER_POINTER),
+                call_slot_ptr_0(ps_blob as ComObject, BLOB_GET_BUFFER_POINTER),
+            )
+        };
+        let pso_desc = D3d12GraphicsPipelineStateDesc {
+            root_signature: self.lit_root_signature,
+            vs: D3d12ShaderBytecode {
+                bytecode: vs_bytecode,
+                length: vs_blob_size,
+            },
+            ps: D3d12ShaderBytecode {
+                bytecode: ps_bytecode,
+                length: ps_blob_size,
+            },
+            ds: D3d12ShaderBytecode {
+                bytecode: std::ptr::null(),
+                length: 0,
+            },
+            hs: D3d12ShaderBytecode {
+                bytecode: std::ptr::null(),
+                length: 0,
+            },
+            gs: D3d12ShaderBytecode {
+                bytecode: std::ptr::null(),
+                length: 0,
+            },
+            stream_output: D3d12StreamOutputDesc {
+                so_declaration: std::ptr::null(),
+                num_entries: 0,
+                head_padding: [0],
+                buffer_strides: std::ptr::null(),
+                num_strides: 0,
+                rasterized_stream: 0,
+            },
+            blend_state,
+            sample_mask: 0xffffffff,
+            rasterizer_state: rasterizer,
+            depth_stencil_state: depth_stencil,
+            input_layout,
+            ib_strip_cut_value: 0,
+            primitive_topology_type: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            num_render_targets: 1,
+            rtv_formats: [
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                0, 0, 0, 0, 0, 0, 0,
+            ],
+            dsv_format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+            sample_desc: D3d12SampleDesc { count: 1, quality: 0 },
+            node_mask: 0,
+            cached_pso: D3d12CachedPipelineState {
+                cached_blob: std::ptr::null_mut(),
+                cached_blob_size: 0,
+            },
+            flags: 0,
+        };
+        let mut pipeline: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            let hr = call_slot_i32_4(
+                self.device as ComObject,
+                DEVICE_CREATE_GRAPHICS_PIPELINE_STATE,
+                &pso_desc as *const D3d12GraphicsPipelineStateDesc
+                    as *mut c_void,
+                IID_ID3D12_PIPELINE_STATE_WORDS.as_ptr() as *mut c_void,
+                &mut pipeline as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if hr != S_OK || pipeline.is_null() {
+                return false;
+            }
+        }
+        self.lit_pipeline = pipeline;
+        self.lit_ready = true;
+        true
+    }
+
     /// Builds the triangle's uniform block bytes (the MVP column-major
     /// followed by the colour).
     fn build_tri_uniform(&self) -> TriUniform {
@@ -2257,6 +2666,20 @@ impl D3d12Backend {
     /// follow).
 
     pub(crate) fn draw_mesh_by_id(&mut self, mesh_id: usize, model: Mat4) {
+        self.draw_mesh_inner(mesh_id, model, false);
+    }
+
+    /// The lit draw (M5): the same path, the lit PSO and the lights'
+    /// CBV at b1 (the submit path carries the lights).
+    fn draw_mesh_lit_by_id(&mut self, mesh_id: usize, model: Mat4) {
+        self.draw_mesh_inner(mesh_id, model, true);
+    }
+
+    /// The mesh draw's shared body: the unlit path binds the mesh PSO
+    /// and the mesh's two-descriptor table; the lit path binds the lit
+    /// PSO, writes the lights' block into the shared buffer and points
+    /// the table's third descriptor (the lights' CBV at b1) at it.
+    fn draw_mesh_inner(&mut self, mesh_id: usize, model: Mat4, lit: bool) {
         if !self.frame_open {
             self.violations += 1;
             return;
@@ -2266,6 +2689,9 @@ impl D3d12Backend {
             return;
         }
         if !self.mesh_ready {
+            return;
+        }
+        if lit && !self.lit_ready {
             return;
         }
         let camera = self.camera;
@@ -2289,6 +2715,22 @@ impl D3d12Backend {
         uniform[64..128].copy_from_slice(unsafe {
             std::slice::from_raw_parts(model.m.as_ptr() as *const u8, 64)
         });
+        // The lights' block bytes (the lit path writes them into the
+        // shared buffer; the block the frame's draws read).
+        let lights_bytes = if lit {
+            let block = self.lit_block;
+            let mut bytes = [0u8; 256];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &block as *const LightsUniform as *const u8,
+                    bytes.as_mut_ptr(),
+                    256,
+                );
+            }
+            Some(bytes)
+        } else {
+            None
+        };
         let state = self.meshes[mesh_id].as_ref().unwrap();
         let uniform_address = unsafe {
             call_slot_u64_0(
@@ -2337,6 +2779,43 @@ impl D3d12Backend {
                     .map(|t| t.resource)
             });
         let texture_resource = texture_resource.unwrap_or(std::ptr::null_mut());
+        // The lights' CBV (the lit path): the shared buffer's address
+        // (the descriptor the table's slot 2 reads). The block's write
+        // runs through the Map/Unmap pair (the same rule the upload
+        // follows).
+        let lights_address = if lit {
+            unsafe {
+                let mut map: *mut c_void = std::ptr::null_mut();
+                let hr = call_slot_i32_4(
+                    self.lit_lights_buffer as ComObject,
+                    RESOURCE_MAP,
+                    0 as *mut c_void,
+                    &D3d12Range { begin: 0, end: 0 } as *const D3d12Range
+                        as *mut c_void,
+                    &mut map as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                );
+                if hr == S_OK && !map.is_null() {
+                    std::ptr::copy_nonoverlapping(
+                        lights_bytes.as_ref().unwrap().as_ptr(),
+                        map as *mut u8,
+                        256,
+                    );
+                    call_slot_i32_2(
+                        self.lit_lights_buffer as ComObject,
+                        RESOURCE_UNMAP,
+                        0 as *mut c_void,
+                        std::ptr::null_mut(),
+                    );
+                }
+                call_slot_u64_0(
+                    self.lit_lights_buffer as ComObject,
+                    RESOURCE_GET_GPU_VIRTUAL_ADDRESS,
+                )
+            }
+        } else {
+            0
+        };
         let srv_desc = d3d::D3d12ShaderResourceViewDesc {
             format: DXGI_FORMAT_R8G8B8A8_UNORM,
             view_dimension: d3d::D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -2352,6 +2831,11 @@ impl D3d12Backend {
         };
         let cbv_desc = d3d::D3d12ConstantBufferViewDesc {
             buffer_location: uniform_address,
+            size_in_bytes: 256,
+            union_tail_padding: [0],
+        };
+        let lights_cbv_desc = d3d::D3d12ConstantBufferViewDesc {
+            buffer_location: lights_address,
             size_in_bytes: 256,
             union_tail_padding: [0],
         };
@@ -2405,6 +2889,20 @@ impl D3d12Backend {
                     0,
                 ).ptr as *mut c_void,
             );
+            if lit {
+                call_slot_i32_2(
+                    self.device as ComObject,
+                    DEVICE_CREATE_CONSTANT_BUFFER_VIEW,
+                    &lights_cbv_desc as *const d3d::D3d12ConstantBufferViewDesc
+                        as *mut c_void,
+                    self_heap_cpu_handle_offset(
+                        state.srv_heap,
+                        self.device,
+                        d3d::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        2,
+                    ).ptr as *mut c_void,
+                );
+            }
             call_slot_i32_3(
                 self.device as ComObject,
                 DEVICE_CREATE_SHADER_RESOURCE_VIEW,
@@ -2421,7 +2919,7 @@ impl D3d12Backend {
             call_slot_i32_2(
                 self.command_list as ComObject,
                 COMMAND_LIST_SET_PIPELINE_STATE,
-                self.mesh_pipeline,
+                if lit { self.lit_pipeline } else { self.mesh_pipeline },
                 std::ptr::null_mut(),
             );
             // The frame's render targets: the same OMSetRenderTargets
@@ -2441,7 +2939,11 @@ impl D3d12Backend {
             call_slot_i32_2(
                 self.command_list as ComObject,
                 COMMAND_LIST_SET_GRAPHICS_ROOT_SIGNATURE,
-                self.mesh_root_signature,
+                if lit {
+                    self.lit_root_signature
+                } else {
+                    self.mesh_root_signature
+                },
                 std::ptr::null_mut(),
             );
             let heaps = [state.srv_heap];
@@ -2659,6 +3161,27 @@ impl RenderBackend for D3d12Backend {
                 "upload_mesh: the mesh's shader program failed to compile",
             ));
         }
+        // The lit path's ensure (M5): the same before-the-frame rule (the
+        // PSO's creation inside an open frame's recording is the
+        // software rasterizer's crash the debug run caught).
+        if !self.ensure_lit_resources() {
+            return Err(RenderError::from(
+                "upload_mesh: the lit shader program failed to compile",
+            ));
+        }
+        // The lights' shared buffer (M5): one 256-byte UPLOAD-heap buffer
+        // the lit draw's CBV at b1 reads (the block the D3D12 rule keeps
+        // 256-byte aligned; one buffer serves every mesh's lit draws).
+        if self.lit_lights_buffer.is_null() {
+            self.lit_lights_buffer = unsafe {
+                self_create_buffer(
+                    self.device,
+                    256,
+                    D3D12_HEAP_TYPE_UPLOAD,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                )?
+            };
+        }
         // The two UPLOAD-heap buffers: the CPU writes them through the
         // Map/Unmap pair (the same rule the triangle's vertex buffer
         // follows). The vertex buffer carries the PNU bytes, the index
@@ -2736,12 +3259,13 @@ impl RenderBackend for D3d12Backend {
         }
         // The mesh's SRV heap: one CBV_SRV_UAV descriptor heap with two
         // descriptors the draw's root table reads (the CBV at slot 0,
-        // the SRV at slot 1).
+        // the SRV at slot 1) — three when the lit path draws (the
+        // lights' CBV at slot 2, M5).
         let srv_heap = unsafe {
             self_create_descriptor_heap(
                 self.device,
                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                2,
+                3,
                 D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             )?
         };
@@ -2797,6 +3321,25 @@ impl RenderBackend for D3d12Backend {
             }
         }
         let mesh_id = submission.mesh.inner.lock().unwrap().id;
+        let has_lights = submission.sun.is_some() || !submission.lights.is_empty();
+        if has_lights {
+            // The lit path (M5): the lights' block from the submission's
+            // sun and point lights (the sun absent means intensity zero),
+            // the lit PSO draws.
+            let default_sun = DirectionalLight {
+                direction: Vec3::new(0.0, -1.0, 0.0),
+                color: Vec3::new(0.0, 0.0, 0.0),
+                intensity: 0.0,
+            };
+            let sun = submission.sun.as_ref().unwrap_or(&default_sun);
+            self.lit_block = LightsUniform::from_lights(sun, &submission.lights);
+            if self.lit_ready {
+                self.draw_mesh_lit_by_id(mesh_id, submission.model);
+                return;
+            }
+            // The lit path's failure falls back to the unlit draw (the
+            // render keeps going).
+        }
         self.draw_mesh_by_id(mesh_id, submission.model);
     }
 

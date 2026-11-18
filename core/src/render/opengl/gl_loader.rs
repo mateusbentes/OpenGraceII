@@ -185,6 +185,8 @@ pub type PfnGlUniform1f = unsafe extern "C" fn(location: i32, v: f32);
 pub type PfnGlUniform1i = unsafe extern "C" fn(location: i32, v: i32);
 pub type PfnGlUniform4f =
     unsafe extern "C" fn(location: i32, a: f32, b: f32, c: f32, d: f32);
+pub type PfnGlUniform4fv =
+    unsafe extern "C" fn(location: i32, count: i32, value: *const f32);
 pub type PfnGlUniformMatrix4fv = unsafe extern "C" fn(
     location: i32,
     count: i32,
@@ -346,6 +348,7 @@ pub struct GlLoader {
     pub gl_uniform_1f: Option<PfnGlUniform1f>,
     pub gl_uniform_1i: Option<PfnGlUniform1i>,
     pub gl_uniform_4f: Option<PfnGlUniform4f>,
+    pub gl_uniform_4fv: Option<PfnGlUniform4fv>,
     pub gl_uniform_matrix_4fv: Option<PfnGlUniformMatrix4fv>,
     pub gl_vertex_attrib_pointer: Option<PfnGlVertexAttribPointer>,
     pub gl_enable_vertex_attrib_array: Option<PfnGlEnableVertexAttribArray>,
@@ -421,6 +424,7 @@ impl GlLoader {
             gl_uniform_1f: None,
             gl_uniform_1i: None,
             gl_uniform_4f: None,
+            gl_uniform_4fv: None,
             gl_uniform_matrix_4fv: None,
             gl_vertex_attrib_pointer: None,
             gl_enable_vertex_attrib_array: None,
@@ -637,6 +641,7 @@ impl GlLoader {
         load_gl!(gl_uniform_1f, "glUniform1f");
         load_gl!(gl_uniform_1i, "glUniform1i");
         load_gl!(gl_uniform_4f, "glUniform4f");
+        load_gl!(gl_uniform_4fv, "glUniform4fv");
         load_gl!(gl_uniform_matrix_4fv, "glUniformMatrix4fv");
         load_gl!(gl_vertex_attrib_pointer, "glVertexAttribPointer");
         load_gl!(gl_enable_vertex_attrib_array, "glEnableVertexAttribArray");

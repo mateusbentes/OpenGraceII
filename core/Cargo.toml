@@ -43,5 +43,29 @@ name = "cube_smoke_mtl"
 required-features = ["metal"]
 
 [[example]]
+name = "cube_smoke"
+required-features = ["vulkan"]
+
+[[example]]
+name = "cube_smoke_gl"
+required-features = ["opengl"]
+
+[[example]]
+name = "cube_lit"
+required-features = ["vulkan"]
+
+[[example]]
+name = "cube_lit_gl"
+required-features = ["opengl"]
+
+[[example]]
+name = "cube_lit_d3d12"
+required-features = ["d3d12"]
+
+[[example]]
+name = "cube_lit_mtl"
+required-features = ["metal"]
+
+[[example]]
 name = "d3d12_smoke"
 required-features = ["d3d12"]

@@ -38,6 +38,83 @@ struct MeshUniform {
     model: [[f32; 4]; 4],
 }
 
+/// The lights' uniform block (std140, 256 bytes): the sun's direction
+/// (xyz + pad), the sun's colour (xyz) and intensity (w), the four point
+/// lights' position (xyz) and radius (w), the four point lights' colour
+/// (xyz) and intensity (w), the params (x = the live point-light count,
+/// yzw pad). The same byte layout every backend maps (the M4c rule
+/// extended to M5's lights).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LightsUniform {
+    sun_direction: [f32; 4],
+    sun_color_intensity: [f32; 4],
+    point_position_radius: [[f32; 4]; 4],
+    point_color_intensity: [[f32; 4]; 4],
+    params: [f32; 4],
+    // The tail pad: the block's byte size the uniform buffer carries
+    // (256; the declared fields land at 176, the pad completes the
+    // buffer the CBV reads — the copies' 256-byte reads stay in bounds).
+    _pad: [f32; 20],
+}
+
+impl LightsUniform {
+    /// The block's byte size (256; the D3D12 path's CBV alignment rule
+    /// requires the 256-byte alignment and the std140 layout lands at
+    /// exactly 256).
+    const SIZE: usize = 256;
+
+    /// The default block: no lights (the intensity zero, the count
+    /// zero — the lit draw renders the texture unlit rather than black).
+    fn none() -> Self {
+        LightsUniform {
+            sun_direction: [0.0, -1.0, 0.0, 0.0],
+            sun_color_intensity: [0.0, 0.0, 0.0, 0.0],
+            point_position_radius: [[0.0; 4]; 4],
+            point_color_intensity: [[0.0; 4]; 4],
+            params: [0.0, 0.0, 0.0, 0.0],
+            _pad: [0.0; 20],
+        }
+    }
+
+    /// The block from the contract's lights: the sun (the direction
+    /// normalised) plus up to four point lights (the rest stay zero).
+    fn from_lights(sun: &DirectionalLight, lights: &[DynamicLight]) -> Self {
+        let direction = sun.direction.normalised();
+        let mut block = LightsUniform {
+            sun_direction: [direction.x, direction.y, direction.z, 0.0],
+            sun_color_intensity: [
+                sun.color.x, sun.color.y, sun.color.z, sun.intensity,
+            ],
+            point_position_radius: [[0.0; 4]; 4],
+            point_color_intensity: [[0.0; 4]; 4],
+            params: [0.0, 0.0, 0.0, 0.0],
+            _pad: [0.0; 20],
+        };
+        for (index, dynamic) in lights.iter().take(4).enumerate() {
+            // The spot light's cone falloff waits for the next step (the
+            // first lit step carries the point lights; the spot enters
+            // the block as its position/direction's approximation later).
+            if let DynamicLight::Point(light) = dynamic {
+                block.point_position_radius[index] = [
+                    light.position.x,
+                    light.position.y,
+                    light.position.z,
+                    light.radius,
+                ];
+                block.point_color_intensity[index] = [
+                    light.color.x,
+                    light.color.y,
+                    light.color.z,
+                    light.intensity,
+                ];
+            }
+        }
+        block.params[0] = lights.len().min(4) as f32;
+        block
+    }
+}
+
 /// The Vulkan backend's configuration.
 #[derive(Clone, Debug)]
 pub struct VulkanBackendConfig {
@@ -182,6 +259,20 @@ pub struct VulkanBackend {
     mesh_set_layout: vk::VkDescriptorSetLayout,
     mesh_pool: vk::VkDescriptorPool,
     mesh_sampler: vk::VkSampler,
+    // The lit mesh path's state (M5): the lit pipeline (the same vertex
+    // shape, the LIT shaders), its descriptor set layout (the camera
+    // block plus the sampler plus the lights' block) and the lights'
+    // uniform buffer (one shared host buffer the draws write).
+    lit_pipeline: vk::VkPipeline,
+    lit_pipeline_ready: bool,
+    lit_pipeline_layout: vk::VkPipelineLayout,
+    lit_set_layout: vk::VkDescriptorSetLayout,
+    lit_lights_buffer: Option<VulkanResource>,
+    lit_lights_map: *mut std::os::raw::c_void,
+    lit_block: LightsUniform,
+    lit_descriptor_set: vk::VkDescriptorSet,
+    lit_camera_buffer: Option<VulkanResource>,
+    lit_camera_map: *mut std::os::raw::c_void,
     // The diagnostic triangle resources.
     tri_mesh: Option<GpuMesh>,
     tri_shader: Option<ShaderProgram>,
@@ -309,6 +400,16 @@ impl VulkanBackend {
             mesh_set_layout: std::ptr::null_mut(),
             mesh_pool: std::ptr::null_mut(),
             mesh_sampler: std::ptr::null_mut(),
+            lit_pipeline: std::ptr::null_mut(),
+            lit_pipeline_ready: false,
+            lit_pipeline_layout: std::ptr::null_mut(),
+            lit_set_layout: std::ptr::null_mut(),
+            lit_lights_buffer: None,
+            lit_lights_map: std::ptr::null_mut(),
+            lit_block: LightsUniform::none(),
+            lit_descriptor_set: std::ptr::null_mut(),
+            lit_camera_buffer: None,
+            lit_camera_map: std::ptr::null_mut(),
             tri_mesh: None,
             tri_shader: None,
             tri_pipeline: std::ptr::null_mut(),
@@ -2099,15 +2200,237 @@ impl VulkanBackend {
         self.mesh_pipeline_ready = true;
     }
 
+    /// The lit path's ensure: the lit pipeline plus the lights' shared
+    /// uniform buffer (the one host buffer every lit draw writes).
+    fn ensure_lit_pipeline(&mut self) -> bool {
+        if self.lit_pipeline_ready {
+            return true;
+        }
+        if self.create_lit_pipeline().is_err() {
+            return false;
+        }
+        // The lights' uniform buffer: host-visible, 256 bytes (the block
+        // the D3D12 path's CBV alignment rule requires holds).
+        let (buffer, memory) = match self
+            .create_host_buffer(
+                LightsUniform::SIZE,
+                vk::BufferUsage::UniformBuffer,
+            ) {
+            Ok(pair) => pair,
+            Err(_) => return false,
+        };
+        let map = match self.map_memory(memory) {
+            Ok(map) => map,
+            Err(_) => return false,
+        };
+        // The default block (no lights): the draws before the first lit
+        // submission render unlit rather than reading garbage.
+        let default = LightsUniform::none();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &default as *const LightsUniform as *const u8,
+                map as *mut u8,
+                LightsUniform::SIZE,
+            );
+        }
+        self.lit_lights_buffer = Some(VulkanResource {
+            handle: buffer,
+            memory,
+            released: false,
+        });
+        self.lit_lights_map = map;
+        // The lit path's camera buffer (a global one: the camera is the
+        // same for every mesh the frame draws, the mesh path's per-mesh
+        // buffers stay the unlit path's shape).
+        let (camera_buffer, camera_memory) = match self.create_host_buffer(
+            std::mem::size_of::<MeshUniform>(),
+            vk::BufferUsage::UniformBuffer,
+        ) {
+            Ok(pair) => pair,
+            Err(_) => return false,
+        };
+        let camera_map = match self.map_memory(camera_memory) {
+            Ok(map) => map,
+            Err(_) => return false,
+        };
+        self.lit_camera_buffer = Some(VulkanResource {
+            handle: camera_buffer,
+            memory: camera_memory,
+            released: false,
+        });
+        self.lit_camera_map = camera_map;
+        // The lit descriptor set: the camera block at binding 0, the
+        // texture's combined sampler at binding 1, the lights' block at
+        // binding 2.
+        let pool_sizes = [
+            vk::VkDescriptorPoolSize {
+                descriptor_type: vk::DescriptorType::UniformBuffer,
+                descriptor_count: 2,
+            },
+            vk::VkDescriptorPoolSize {
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                descriptor_count: 1,
+            },
+        ];
+        let pool_info = vk::VkDescriptorPoolCreateInfo {
+            s_type: vk::StructureType::DescriptorPoolCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            max_sets: 1,
+            pool_size_count: 2,
+            p_pool_sizes: pool_sizes.as_ptr(),
+        };
+        let mut pool = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_descriptor_pool.unwrap())(
+                self.device,
+                &pool_info,
+                std::ptr::null(),
+                &mut pool,
+            )
+        };
+        if result != vk::Result::Success {
+            return false;
+        }
+        let set_layouts = [self.lit_set_layout];
+        let alloc_info = vk::VkDescriptorSetAllocateInfo {
+            s_type: vk::StructureType::DescriptorSetAllocateInfo,
+            p_next: std::ptr::null(),
+            descriptor_pool: pool,
+            descriptor_set_count: 1,
+            p_set_layouts: set_layouts.as_ptr(),
+        };
+        let mut set = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_allocate_descriptor_sets.unwrap())(
+                self.device,
+                &alloc_info,
+                &mut set,
+            )
+        };
+        if result != vk::Result::Success {
+            return false;
+        }
+        self.lit_descriptor_set = set;
+        let default_view = self.default_texture.as_ref().map(|t| t.view);
+        self.write_lit_descriptors(set, camera_buffer, default_view, buffer);
+        true
+    }
+
+    /// The lit set's three writes: the camera block (binding 0), the
+    /// texture's combined sampler (binding 1) and the lights' block
+    /// (binding 2).
+    fn write_lit_descriptors(
+        &self,
+        set: vk::VkDescriptorSet,
+        camera_buffer: vk::VkBuffer,
+        image_view: Option<vk::VkImageView>,
+        lights_buffer: vk::VkBuffer,
+    ) {
+        let camera_info = vk::VkDescriptorBufferInfo {
+            buffer: camera_buffer,
+            offset: 0,
+            range: std::mem::size_of::<MeshUniform>() as u64,
+        };
+        let lights_info = vk::VkDescriptorBufferInfo {
+            buffer: lights_buffer,
+            offset: 0,
+            range: LightsUniform::SIZE as u64,
+        };
+        let image_info = vk::VkDescriptorImageInfo {
+            sampler: self.mesh_sampler,
+            image_view: image_view.unwrap_or(std::ptr::null_mut()),
+            image_layout: vk::ImageLayout::ShaderReadOnlyOptimal,
+        };
+        let writes = [
+            vk::VkWriteDescriptorSet {
+                s_type: vk::StructureType::WriteDescriptorSet,
+                p_next: std::ptr::null(),
+                dst_set: set,
+                dst_binding: 0,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::UniformBuffer,
+                p_image_info: std::ptr::null(),
+                p_buffer_info: &camera_info,
+                p_texel_buffer_view: std::ptr::null(),
+            },
+            vk::VkWriteDescriptorSet {
+                s_type: vk::StructureType::WriteDescriptorSet,
+                p_next: std::ptr::null(),
+                dst_set: set,
+                dst_binding: 1,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                p_image_info: &image_info,
+                p_buffer_info: std::ptr::null(),
+                p_texel_buffer_view: std::ptr::null(),
+            },
+            vk::VkWriteDescriptorSet {
+                s_type: vk::StructureType::WriteDescriptorSet,
+                p_next: std::ptr::null(),
+                dst_set: set,
+                dst_binding: 2,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::UniformBuffer,
+                p_image_info: std::ptr::null(),
+                p_buffer_info: &lights_info,
+                p_texel_buffer_view: std::ptr::null(),
+            },
+        ];
+        unsafe {
+            (self.loader.vk_update_descriptor_sets.unwrap())(
+                self.device,
+                3,
+                writes.as_ptr(),
+                0,
+                std::ptr::null(),
+            );
+        }
+    }
+
     fn create_mesh_pipeline(&mut self) -> Result<(), RenderError> {
-        let vertex_module =
-            self.create_shader_module(&shader_library::spirv::CUBE_VERTEX_SHADER_SPIRV)?;
-        let fragment_module =
-            self.create_shader_module(&shader_library::spirv::CUBE_FRAGMENT_SHADER_SPIRV)?;
+        self.mesh_pipeline = self.create_mesh_pipeline_inner(
+            &shader_library::spirv::CUBE_VERTEX_SHADER_SPIRV,
+            &shader_library::spirv::CUBE_FRAGMENT_SHADER_SPIRV,
+            false,
+        )?;
+        self.mesh_pipeline_ready = true;
+        Ok(())
+    }
+
+    /// The lit mesh pipeline (M5): the same vertex shape, the LIT
+    /// shaders, the lights' uniform block at binding 2. The lit and the
+    /// unlit pipelines share the sampler.
+    fn create_lit_pipeline(&mut self) -> Result<(), RenderError> {
+        self.lit_pipeline = self.create_mesh_pipeline_inner(
+            &shader_library::spirv::LIT_VERTEX_SHADER_SPIRV,
+            &shader_library::spirv::LIT_FRAGMENT_SHADER_SPIRV,
+            true,
+        )?;
+        self.lit_pipeline_ready = true;
+        Ok(())
+    }
+
+    /// The mesh pipeline's shared builder: the PNU vertex input, the
+    /// depth test (LESS, the write on), no culling, the given shader
+    /// modules, and — when `lit` — the lights' uniform block at binding
+    /// 2. Returns the pipeline; the caller stores it (the layout and the
+    /// set layout land in the lit fields, the unlit path keeps its own).
+    fn create_mesh_pipeline_inner(
+        &mut self,
+        vertex_spirv: &[u32],
+        fragment_spirv: &[u32],
+        lit: bool,
+    ) -> Result<vk::VkPipeline, RenderError> {
+        let vertex_module = self.create_shader_module(vertex_spirv)?;
+        let fragment_module = self.create_shader_module(fragment_spirv)?;
         // The descriptor set layout: binding 0 is the std140 camera block
         // (the vertex stage reads it), binding 1 is the combined image
         // sampler (the fragment stage reads it).
-        let bindings = [
+        let mut bindings = vec![
             vk::VkDescriptorSetLayoutBinding {
                 binding: 0,
                 descriptor_type: vk::DescriptorType::UniformBuffer,
@@ -2123,11 +2446,20 @@ impl VulkanBackend {
                 p_immutable_samplers: std::ptr::null(),
             },
         ];
+        if lit {
+            bindings.push(vk::VkDescriptorSetLayoutBinding {
+                binding: 2,
+                descriptor_type: vk::DescriptorType::UniformBuffer,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStage::Fragment as u32,
+                p_immutable_samplers: std::ptr::null(),
+            });
+        }
         let layout_info = vk::VkDescriptorSetLayoutCreateInfo {
             s_type: vk::StructureType::DescriptorSetLayoutCreateInfo,
             p_next: std::ptr::null(),
             flags: 0,
-            binding_count: 2,
+            binding_count: bindings.len() as u32,
             p_bindings: bindings.as_ptr(),
         };
         let mut set_layout = std::ptr::null_mut();
@@ -2144,7 +2476,11 @@ impl VulkanBackend {
                 "VulkanBackend: the mesh's descriptor set layout failed",
             ));
         }
-        self.mesh_set_layout = set_layout;
+        if lit {
+            self.lit_set_layout = set_layout;
+        } else {
+            self.mesh_set_layout = set_layout;
+        }
         let set_layouts = [set_layout];
         let pipeline_layout_info = vk::VkPipelineLayoutCreateInfo {
             s_type: vk::StructureType::PipelineLayoutCreateInfo,
@@ -2169,7 +2505,11 @@ impl VulkanBackend {
                 "VulkanBackend: the mesh's pipeline layout failed",
             ));
         }
-        self.mesh_pipeline_layout = pipeline_layout;
+        if lit {
+            self.lit_pipeline_layout = pipeline_layout;
+        } else {
+            self.mesh_pipeline_layout = pipeline_layout;
+        }
         // The sampler: linear filtering, clamp to edge (the mip-map
         // machinery stays out of the first generic path).
         let sampler_info = vk::VkSamplerCreateInfo {
@@ -2206,7 +2546,9 @@ impl VulkanBackend {
                 "VulkanBackend: the mesh's sampler failed",
             ));
         }
-        self.mesh_sampler = sampler;
+        if !lit {
+            self.mesh_sampler = sampler;
+        }
         // The graphics pipeline: the PNU vertex (one binding at stride 32,
         // three attributes: position at 0, normal at 12, uv at 24), the
         // depth test on (LESS, the depth write on), no culling (the cube's
@@ -2421,8 +2763,7 @@ impl VulkanBackend {
                 "VulkanBackend: the mesh's graphics pipeline failed",
             ));
         }
-        self.mesh_pipeline = pipeline;
-        Ok(())
+        Ok(pipeline)
     }
 
     /// The mesh's descriptor set writes: the camera block at binding 0 and
@@ -2529,6 +2870,28 @@ impl VulkanBackend {
     /// command buffer. A draw with no open frame counts one violation (the
     /// same rule the diagnostic draw's clear-first contract follows).
     fn draw_mesh_by_id(&mut self, mesh_id: usize, model: Mat4) {
+        self.draw_mesh_inner(mesh_id, model, false);
+    }
+
+    /// The lit draw (M5): the same path, the lit pipeline and the
+    /// lights' uniform block bound (the submit path carries the lights).
+    fn draw_mesh_lit_by_id(&mut self, mesh_id: usize, model: Mat4) {
+        self.draw_mesh_inner(mesh_id, model, true);
+    }
+
+    /// The current lights block's copy (the read the draw's write makes).
+    fn lit_uniform_block(&self) -> LightsUniform {
+        self.lit_block
+    }
+
+    /// The mesh draw's shared body: the unlit path binds the mesh
+    /// pipeline and the mesh descriptor set; the lit path binds the lit
+    /// pipeline and a descriptor set that carries the lights' block at
+    /// binding 2 (the per-mesh set's second buffer write, or the lit
+    /// set). The first lit step reuses the mesh descriptor set: the lit
+    /// layout's binding 2 write lands once per frame (the buffer write
+    /// is idempotent at the same offsets).
+    fn draw_mesh_inner(&mut self, mesh_id: usize, model: Mat4, lit: bool) {
         if self.command_buffer.is_null() || !self.pass_open {
             self.violations += 1;
             return;
@@ -2541,6 +2904,9 @@ impl VulkanBackend {
             }
         };
         if !self.mesh_pipeline_ready {
+            return;
+        }
+        if lit && !self.lit_pipeline_ready {
             return;
         }
         // The uniform block: the view-projection matrix from the
@@ -2556,6 +2922,30 @@ impl VulkanBackend {
             view_projection: view_projection.m,
             model: model.m,
         };
+        // The lit path's lights block: the shared buffer's copy runs
+        // before the draw (the uniform's write the frame's draws read;
+        // the buffer stays host-visible, the write is immediate).
+        if lit {
+            let block = self.lit_uniform_block();
+            if !self.lit_lights_map.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &block as *const LightsUniform as *const u8,
+                        self.lit_lights_map as *mut u8,
+                        LightsUniform::SIZE,
+                    );
+                }
+            }
+            if !self.lit_camera_map.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &uniform as *const MeshUniform as *const u8,
+                        self.lit_camera_map as *mut u8,
+                        std::mem::size_of::<MeshUniform>(),
+                    );
+                }
+            }
+        }
         {
             let state = self.meshes[index].as_ref().unwrap();
             if !state.uniform_map.is_null() {
@@ -2580,7 +2970,12 @@ impl VulkanBackend {
                 .map(|t| t.view)
                 .or_else(|| self.default_texture.as_ref().map(|t| t.view));
             if let Some(view) = bound_view {
-                self.write_mesh_texture_descriptor(state.descriptor_set, view);
+                let set = if lit {
+                    self.lit_descriptor_set
+                } else {
+                    state.descriptor_set
+                };
+                self.write_mesh_texture_descriptor(set, view);
             }
         }
         let (vertex_buffer, index_buffer, descriptor_set, index_count) = {
@@ -2588,7 +2983,11 @@ impl VulkanBackend {
             (
                 state.vertex_buffer.handle,
                 state.index_buffer.handle,
-                state.descriptor_set,
+                if lit {
+                    self.lit_descriptor_set
+                } else {
+                    state.descriptor_set
+                },
                 state.index_count,
             )
         };
@@ -2609,11 +3008,16 @@ impl VulkanBackend {
         }];
         let offsets = [0u64];
         let descriptor_sets = [descriptor_set];
+        let (pipeline, layout) = if lit {
+            (self.lit_pipeline, self.lit_pipeline_layout)
+        } else {
+            (self.mesh_pipeline, self.mesh_pipeline_layout)
+        };
         unsafe {
             (self.loader.vk_cmd_bind_pipeline.unwrap())(
                 self.command_buffer,
                 vk::PipelineBindPoint::Graphics,
-                self.mesh_pipeline,
+                pipeline,
             );
             (self.loader.vk_cmd_set_viewport.unwrap())(
                 self.command_buffer,
@@ -2630,7 +3034,7 @@ impl VulkanBackend {
             (self.loader.vk_cmd_bind_descriptor_sets.unwrap())(
                 self.command_buffer,
                 vk::PipelineBindPoint::Graphics,
-                self.mesh_pipeline_layout,
+                layout,
                 0,
                 1,
                 descriptor_sets.as_ptr(),
@@ -2946,6 +3350,11 @@ impl RenderBackend for VulkanBackend {
                 "upload_mesh: the mesh pipeline could not be created",
             ));
         }
+        // The lit pipeline's ensure (M5): the same before-the-frame rule
+        // (the pipeline and the buffers' creation inside an open frame's
+        // recording is the software rasterizer's crash the debug run
+        // caught).
+        self.ensure_lit_pipeline();
         let vertex_size = vertices.len();
         let index_size = indices.len() * 4;
         let uniform_size = std::mem::size_of::<MeshUniform>();
@@ -3101,6 +3510,26 @@ impl RenderBackend for VulkanBackend {
         // camera block from the set_camera state (the same uniform buffer
         // the draw() path writes).
         let mesh_id = submission.mesh.inner.lock().unwrap().id;
+        let has_lights = submission.sun.is_some() || !submission.lights.is_empty();
+        if has_lights {
+            // The lit path (M5): the lights' block from the submission's
+            // sun and point lights (the sun absent means intensity zero),
+            // the lit pipeline draws.
+            let default_sun = DirectionalLight {
+                direction: Vec3::new(0.0, -1.0, 0.0),
+                color: Vec3::new(0.0, 0.0, 0.0),
+                intensity: 0.0,
+            };
+            let sun = submission.sun.as_ref().unwrap_or(&default_sun);
+            self.lit_block = LightsUniform::from_lights(sun, &submission.lights);
+            if self.ensure_lit_pipeline() {
+                self.draw_mesh_lit_by_id(mesh_id, submission.model);
+                return;
+            }
+            // The lit path's failure falls back to the unlit draw (the
+            // render keeps going; the fallback is the milestone's first
+            // step's forgiveness).
+        }
         self.draw_mesh_by_id(mesh_id, submission.model);
     }
 
@@ -3715,9 +4144,13 @@ extern "system" {
     fn LoadLibraryW(
         name: *const u16,
     ) -> *mut std::os::raw::c_void;
-    fn GetProcAddress_vk(
+    // The name parameter is the C char (the same signature the D3D12
+    // loader's kernel32 extern carries: the two declarations share the
+    // one symbol, the redeclaration mismatch is the linker's clash the
+    // combined-feature builds warn about).
+    fn GetProcAddress(
         module: *mut std::os::raw::c_void,
-        name: *const u8,
+        name: *const std::os::raw::c_char,
     ) -> *mut std::os::raw::c_void;
 }
 
@@ -3732,7 +4165,7 @@ unsafe fn get_library_proc(
     bytes.push(0);
     #[cfg(windows)]
     {
-        GetProcAddress_vk(library, bytes.as_ptr() as *const u8)
+        GetProcAddress(library, bytes.as_ptr() as *const std::os::raw::c_char)
     }
     #[cfg(not(windows))]
     {
@@ -3757,7 +4190,7 @@ unsafe extern "system" fn LoadLibraryW(
 #[allow(non_snake_case, dead_code)]
 unsafe extern "system" fn GetProcAddress(
     _module: *mut std::os::raw::c_void,
-    _name: *const u8,
+    _name: *const std::os::raw::c_char,
 ) -> *mut std::os::raw::c_void {
     std::ptr::null_mut()
 }

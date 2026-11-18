@@ -40,11 +40,12 @@ use super::mtl_loader::{
     MTLCU_RENDER_TARGET, MTLCU_SHADER_READ,
 };
 use super::super::{
-    bytes_per_pixel, CameraParams, ClearBuffer, ClearColor, DrawSubmission,
-    GpuMesh, GpuMeshInner, PixelFormat, ReadbackSample, RenderBackend,
-    RenderError, RenderTarget, RenderTargetDesc, RenderTargetInner,
-    ShaderProgram, ShaderProgramInner, Texture2DDesc, TextureView,
-    TextureViewInner, VertexLayout, DEPTH_ATTACHMENT,
+    bytes_per_pixel, CameraParams, ClearBuffer, ClearColor,
+    DirectionalLight, DrawSubmission, DynamicLight, GpuMesh, GpuMeshInner,
+    PixelFormat, ReadbackSample, RenderBackend, RenderError, RenderTarget,
+    RenderTargetDesc, RenderTargetInner, ShaderProgram, ShaderProgramInner,
+    Texture2DDesc, TextureView, TextureViewInner, VertexLayout,
+    DEPTH_ATTACHMENT,
 };
 use crate::math::{Mat4, Vec3};
 use std::os::raw::c_void;
@@ -68,6 +69,74 @@ struct MeshUniform {
     model: [[f32; 4]; 4],
 }
 
+/// The lights' uniform block (M5): the same layout every backend maps —
+/// the sun's direction (xyz + pad), the sun's colour (xyz) and intensity
+/// (w), the four point lights' position (xyz) and radius (w), the four
+/// point lights' colour (xyz) and intensity (w), the params (x = the
+/// live point-light count). The tail pad completes the 256 bytes the
+/// other backends' uniform buffers carry (the copies' 256-byte writes
+/// stay in bounds).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LightsUniform {
+    sun_direction: [f32; 4],
+    sun_color_intensity: [f32; 4],
+    point_position_radius: [[f32; 4]; 4],
+    point_color_intensity: [[f32; 4]; 4],
+    params: [f32; 4],
+    _pad: [f32; 20],
+}
+
+impl LightsUniform {
+    /// The default block: no lights (the intensity zero, the count
+    /// zero — the lit draw renders the texture unlit rather than black).
+    fn none() -> Self {
+        LightsUniform {
+            sun_direction: [0.0, -1.0, 0.0, 0.0],
+            sun_color_intensity: [0.0, 0.0, 0.0, 0.0],
+            point_position_radius: [[0.0; 4]; 4],
+            point_color_intensity: [[0.0; 4]; 4],
+            params: [0.0, 0.0, 0.0, 0.0],
+            _pad: [0.0; 20],
+        }
+    }
+
+    /// The block from the contract's lights: the sun (the direction
+    /// normalised) plus up to four point lights (the rest stay zero).
+    fn from_lights(sun: &DirectionalLight, lights: &[DynamicLight]) -> Self {
+        let direction = sun.direction.normalised();
+        let mut block = LightsUniform {
+            sun_direction: [direction.x, direction.y, direction.z, 0.0],
+            sun_color_intensity: [
+                sun.color.x, sun.color.y, sun.color.z, sun.intensity,
+            ],
+            point_position_radius: [[0.0; 4]; 4],
+            point_color_intensity: [[0.0; 4]; 4],
+            params: [0.0, 0.0, 0.0, 0.0],
+            _pad: [0.0; 20],
+        };
+        for (index, dynamic) in lights.iter().take(4).enumerate() {
+            // The spot light's cone falloff waits for the next step (the
+            // first lit step carries the point lights).
+            if let DynamicLight::Point(light) = dynamic {
+                block.point_position_radius[index] = [
+                    light.position.x,
+                    light.position.y,
+                    light.position.z,
+                    light.radius,
+                ];
+                block.point_color_intensity[index] = [
+                    light.color.x,
+                    light.color.y,
+                    light.color.z,
+                    light.intensity,
+                ];
+            }
+        }
+        block.params[0] = lights.len().min(4) as f32;
+        block
+    }
+}
 /// The backend-owned state of one uploaded generic mesh: the vertex and
 /// index buffers (shared storage, the CPU writes them directly), the
 /// per-mesh uniform buffer and the counts.
@@ -202,6 +271,15 @@ pub struct MetalBackend {
     mesh_resources: Option<MetalMeshResources>,
     mesh_ready: bool,
     mesh_error: String,
+    // The lit mesh path's state (M5): the lit pipeline's resources (the
+    // same depth/stencil state and sampler the unlit path shares) and
+    // the lights' shared buffer (one 256-byte block the draws write and
+    // the fragment stage's [[buffer(1)]] reads).
+    lit_resources: Option<MetalMeshResources>,
+    lit_ready: bool,
+    lit_error: String,
+    lit_lights_buffer: *mut c_void,
+    lit_block: LightsUniform,
     /// The default texture's index into `textures_2d` (the 1x1 white
     /// texture the setup created; the draws fall back to it when no
     /// texture is bound) and the bound texture's index (the
@@ -292,6 +370,11 @@ impl MetalBackend {
             mesh_resources: None,
             mesh_ready: false,
             mesh_error: String::new(),
+            lit_resources: None,
+            lit_ready: false,
+            lit_error: String::new(),
+            lit_lights_buffer: std::ptr::null_mut(),
+            lit_block: LightsUniform::none(),
             default_texture: None,
             bound_texture: None,
             readback_queue: Vec::new(),
@@ -940,6 +1023,208 @@ impl MetalBackend {
         true
     }
 
+    /// The lit mesh path's pipeline (M5): the LIT MSL library pair
+    /// compiles, the same vertex descriptor (the PNU attributes at
+    /// buffer 1), the colour/depth/stencil pixel formats, the depth
+    /// state and the sampler the unlit path shares. The same lazy
+    /// before-the-frame rule the unlit path follows.
+    fn ensure_lit_resources(&mut self) -> bool {
+        if self.lit_ready {
+            return true;
+        }
+        let vertex_library = match self.compile_stage(
+            super::shader_library::LIT_VERTEX_SHADER,
+            "the lit vertex stage's library",
+        ) {
+            Some(library) => library,
+            None => return false,
+        };
+        let vertex_function =
+            match self.new_function(vertex_library, "litVertexMain") {
+                Some(function) => function,
+                None => {
+                    self.lit_error =
+                        "litVertexMain lookup failed".to_string();
+                    return false;
+                }
+            };
+        let fragment_library = match self.compile_stage(
+            super::shader_library::LIT_FRAGMENT_SHADER,
+            "the lit fragment stage's library",
+        ) {
+            Some(library) => library,
+            None => return false,
+        };
+        let fragment_function =
+            match self.new_function(fragment_library, "litFragmentMain") {
+                Some(function) => function,
+                None => {
+                    self.lit_error =
+                        "litFragmentMain lookup failed".to_string();
+                    return false;
+                }
+            };
+        let descriptor = unsafe {
+            self.loader
+                .alloc_init(self.loader.cls_mtl_render_pipeline_descriptor)
+        };
+        if descriptor.is_null() {
+            self.lit_error =
+                "the lit pipeline descriptor alloc failed".to_string();
+            return false;
+        }
+        let vertex_descriptor = unsafe {
+            self.loader.send0(
+                self.loader.cls_mtl_vertex_descriptor,
+                self.loader.sel("vertexDescriptor"),
+            )
+        };
+        if vertex_descriptor.is_null() {
+            self.lit_error =
+                "the lit vertex descriptor's constructor failed"
+                    .to_string();
+            return false;
+        }
+        let attributes = unsafe {
+            self.loader.send0(
+                vertex_descriptor,
+                self.loader.sel("attributes"),
+            )
+        };
+        let layouts = unsafe {
+            self.loader.send0(vertex_descriptor, self.loader.sel("layouts"))
+        };
+        unsafe {
+            // The same three attributes the unlit mesh path carries
+            // (position, normal, uv at buffer index 1).
+            for (index, (format, offset)) in [
+                (MTLVF_FLOAT3, 0usize),
+                (MTLVF_FLOAT3, 12usize),
+                (MTLVF_FLOAT2, 24usize),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let attribute = self.loader.send_ul_ret_ptr(
+                    attributes,
+                    self.loader.sel("objectAtIndexedSubscript:"),
+                    index as super::mtl_loader::NsUInteger,
+                );
+                self.loader.send_void_ul(
+                    attribute,
+                    self.loader.sel("setFormat:"),
+                    *format,
+                );
+                self.loader.send_void_ul(
+                    attribute,
+                    self.loader.sel("setBufferIndex:"),
+                    1,
+                );
+                self.loader.send_void_ul(
+                    attribute,
+                    self.loader.sel("setOffset:"),
+                    *offset as super::mtl_loader::NsUInteger,
+                );
+            }
+            let layout_1 = self.loader.send_ul_ret_ptr(
+                layouts,
+                self.loader.sel("objectAtIndexedSubscript:"),
+                1,
+            );
+            self.loader.send_void_ul(
+                layout_1,
+                self.loader.sel("setStride:"),
+                32,
+            );
+            self.loader.send_void_ul(
+                layout_1,
+                self.loader.sel("setStepFunction:"),
+                MTLSF_PER_VERTEX,
+            );
+            self.loader.send_void_ptr(
+                descriptor,
+                self.loader.sel("setVertexDescriptor:"),
+                vertex_descriptor,
+            );
+            let colour_attachments = self.loader.send0(
+                descriptor,
+                self.loader.sel("colorAttachments"),
+            );
+            let colour_attachment_0 = self.loader.send_ul_ret_ptr(
+                colour_attachments,
+                self.loader.sel("objectAtIndexedSubscript:"),
+                0,
+            );
+            self.loader.send_void_ul(
+                colour_attachment_0,
+                self.loader.sel("setPixelFormat:"),
+                MTLPX_RGBA8_UNORM,
+            );
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setDepthAttachmentPixelFormat:"),
+                self.depth_format,
+            );
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setStencilAttachmentPixelFormat:"),
+                self.depth_format,
+            );
+            // The winding rule and the cull mode stay at the API's own
+            // defaults (the M4 fix's rule: the pipeline descriptor
+            // carries no winding/cull setters).
+            self.loader.send_void_ptr(
+                descriptor,
+                self.loader.sel("setVertexFunction:"),
+                vertex_function,
+            );
+            self.loader.send_void_ptr(
+                descriptor,
+                self.loader.sel("setFragmentFunction:"),
+                fragment_function,
+            );
+        }
+        let pipeline = unsafe {
+            let mut pipeline_error: *mut c_void = std::ptr::null_mut();
+            let pipeline = self.loader.send_ptr_arg2(
+                self.device,
+                self.loader
+                    .sel("newRenderPipelineStateWithDescriptor:error:"),
+                descriptor,
+                &mut pipeline_error as *mut *mut c_void as *mut c_void,
+            );
+            if pipeline.is_null() {
+                self.lit_error = if pipeline_error.is_null() {
+                    "the lit pipeline state creation returned nil"
+                        .to_string()
+                } else {
+                    self.ns_error_text(pipeline_error)
+                };
+                return false;
+            }
+            pipeline
+        };
+        let depth_state = self.create_mesh_depth_state();
+        if depth_state.is_null() {
+            self.lit_error =
+                "the lit depth/stencil state creation failed".to_string();
+            return false;
+        }
+        let sampler = self.create_mesh_sampler();
+        if sampler.is_null() {
+            self.lit_error =
+                "the lit sampler state creation failed".to_string();
+            return false;
+        }
+        self.lit_resources = Some(MetalMeshResources {
+            pipeline,
+            depth_state,
+            sampler,
+        });
+        self.lit_ready = true;
+        true
+    }
+
     /// The diagnostic triangle's pipeline: the MSL library compiles, the
     /// vertex descriptor carries the Float3 attribute, the colour
     /// attachment's pixel format follows the frame target's.
@@ -1488,6 +1773,29 @@ impl MetalBackend {
         mesh_id: usize,
         model: Mat4,
     ) {
+        self.draw_mesh_inner(mesh_id, model, false);
+    }
+
+    /// The lit draw (M5): the same path, the lit pipeline and the
+    /// lights' buffer at the fragment stage's buffer index 1.
+    fn draw_mesh_lit_by_id(
+        &mut self,
+        mesh_id: usize,
+        model: Mat4,
+    ) {
+        self.draw_mesh_inner(mesh_id, model, true);
+    }
+
+    /// The mesh draw's shared body: the unlit path binds the mesh
+    /// pipeline; the lit path binds the lit pipeline, writes the lights'
+    /// block into the shared buffer and binds it at the fragment stage's
+    /// buffer index 1 (the LIT shader's `buffer(1)` qualifier).
+    fn draw_mesh_inner(
+        &mut self,
+        mesh_id: usize,
+        model: Mat4,
+        lit: bool,
+    ) {
         let command_buffer = self.frame_command_buffer;
         if self.shutdown || command_buffer.is_null() {
             self.violations += 1;
@@ -1501,6 +1809,9 @@ impl MetalBackend {
             }
         };
         if !self.mesh_ready {
+            return;
+        }
+        if lit && !self.lit_ready {
             return;
         }
         // The uniform block: the view-projection matrix from the
@@ -1525,8 +1836,42 @@ impl MetalBackend {
         // descriptor's creation needs the &mut self borrow; the handles
         // are plain pointers, the copy is the borrow's clean split).
         let (pipeline, depth_state, sampler) = {
-            let resources = self.mesh_resources.as_ref().unwrap();
+            let resources = if lit {
+                self.lit_resources.as_ref().unwrap()
+            } else {
+                self.mesh_resources.as_ref().unwrap()
+            };
             (resources.pipeline, resources.depth_state, resources.sampler)
+        };
+        // The lights' buffer (the lit path): the block's copy into the
+        // shared buffer's contents (the same write the uniform's copy
+        // runs).
+        let lights_buffer = if lit {
+            if self.lit_lights_buffer.is_null() {
+                self.violations += 1;
+                return;
+            }
+            let contents = unsafe {
+                self.loader.send0(
+                    self.lit_lights_buffer,
+                    self.loader.sel("contents"),
+                )
+            };
+            if contents.is_null() {
+                self.violations += 1;
+                return;
+            }
+            let block = self.lit_block;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &block as *const LightsUniform as *const u8,
+                    contents as *mut u8,
+                    256,
+                );
+            }
+            self.lit_lights_buffer
+        } else {
+            std::ptr::null_mut()
         };
         let texture = self
             .bound_texture
@@ -1596,6 +1941,17 @@ impl MetalBackend {
                 0,
                 0,
             );
+            if lit {
+                // The lights' buffer at the fragment stage's buffer index
+                // 1 (the LIT shader's `buffer(1)` qualifier).
+                self.loader.send_void_ptr_ul2(
+                    encoder,
+                    self.loader.sel("setFragmentBuffer:offset:atIndex:"),
+                    lights_buffer,
+                    0,
+                    1,
+                );
+            }
             // The vertex buffer at index 1 (the vertex descriptor's
             // attributes point there).
             self.loader.send_void_ptr_ul2(
@@ -1960,6 +2316,27 @@ impl RenderBackend for MetalBackend {
                 self.mesh_error
             )));
         }
+        // The lit pipeline's ensure (M5): the same before-the-frame rule
+        // (the pipeline's creation inside an open frame's encoder is the
+        // software path's crash the debug runs caught).
+        if !self.ensure_lit_resources() {
+            return Err(RenderError::from(format!(
+                "upload_mesh: the lit pipeline could not be created ({})",
+                self.lit_error
+            )));
+        }
+        // The lights' shared buffer (M5): one 256-byte shared-storage
+        // buffer every lit draw writes (the fragment stage's
+        // [[buffer(1)]] reads it).
+        if self.lit_lights_buffer.is_null() {
+            self.lit_lights_buffer =
+                self.create_shared_buffer(&[0u8; 256]);
+            if self.lit_lights_buffer.is_null() {
+                return Err(RenderError::from(
+                    "upload_mesh: the lights buffer could not be allocated",
+                ));
+            }
+        }
         let mesh_id = mesh.inner.lock().unwrap().id;
         while self.meshes.len() <= mesh_id {
             self.meshes.push(None);
@@ -2045,6 +2422,25 @@ impl RenderBackend for MetalBackend {
         }
         let mesh_id = inner.id;
         drop(inner);
+        let has_lights = submission.sun.is_some() || !submission.lights.is_empty();
+        if has_lights {
+            // The lit path (M5): the lights' block from the submission's
+            // sun and point lights (the sun absent means intensity zero),
+            // the lit pipeline draws.
+            let default_sun = DirectionalLight {
+                direction: Vec3::new(0.0, -1.0, 0.0),
+                color: Vec3::new(0.0, 0.0, 0.0),
+                intensity: 0.0,
+            };
+            let sun = submission.sun.as_ref().unwrap_or(&default_sun);
+            self.lit_block = LightsUniform::from_lights(sun, &submission.lights);
+            if self.lit_ready {
+                self.draw_mesh_lit_by_id(mesh_id, submission.model);
+                return;
+            }
+            // The lit path's failure falls back to the unlit draw (the
+            // render keeps going).
+        }
         self.draw_mesh_by_id(mesh_id, submission.model);
     }
 

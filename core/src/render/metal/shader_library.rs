@@ -117,3 +117,93 @@ fragment float4 meshFragmentMain(MeshVertexOut in [[stage_in]],
     return surface_texture.sample(surface_sampler, in.uv);
 }
 ";
+
+/// The lit mesh's vertex shader (M5): the world position and the
+/// world-space normal join the outputs (the lighting's inputs).
+pub const LIT_VERTEX_SHADER: &str = r"
+#include <metal_stdlib>
+using namespace metal;
+struct Camera
+{
+    float4x4 view_projection;
+    float4x4 model;
+};
+struct MeshVertexIn
+{
+    float3 position [[attribute(0)]];
+    float3 normal [[attribute(1)]];
+    float2 uv [[attribute(2)]];
+};
+struct LitVertexOut
+{
+    float4 position [[position]];
+    float3 normal;
+    float2 uv;
+    float3 world;
+};
+vertex LitVertexOut litVertexMain(MeshVertexIn in [[stage_in]],
+                                  constant Camera& camera [[buffer(0)]])
+{
+    LitVertexOut out;
+    float4 world = camera.model * float4(in.position, 1.0);
+    out.position = camera.view_projection * world;
+    out.normal = (float3x3)(camera.model) * in.normal;
+    out.uv = in.uv;
+    out.world = world.xyz;
+    return out;
+}
+";
+
+/// The lit mesh's fragment shader (M5): the same Blinn-Phong shading
+/// the other libraries carry (the sun plus up to four point lights with
+/// the windowed inverse-square attenuation). The lights' buffer is
+/// [[buffer(1)]] — the same byte layout the other backends map.
+pub const LIT_FRAGMENT_SHADER: &str = r"
+#include <metal_stdlib>
+using namespace metal;
+struct LitVertexOut
+{
+    float4 position [[position]];
+    float3 normal;
+    float2 uv;
+    float3 world;
+};
+struct Lights
+{
+    float4 sun_direction;
+    float4 sun_color_intensity;
+    float4 point_position_radius[4];
+    float4 point_color_intensity[4];
+    float4 params;
+};
+fragment float4 litFragmentMain(LitVertexOut in [[stage_in]],
+                                texture2d<float> surface_texture [[texture(0)]],
+                                sampler surface_sampler [[sampler(0)]],
+                                constant Lights& lights [[buffer(1)]])
+{
+    float3 normal = normalize(in.normal);
+    float3 base = surface_texture.sample(surface_sampler, in.uv).rgb;
+    float3 sun_dir = normalize(-lights.sun_direction.xyz);
+    float sun_diffuse = max(dot(normal, sun_dir), 0.0);
+    float3 colour = base * lights.sun_color_intensity.rgb
+        * lights.sun_color_intensity.a * sun_diffuse;
+    for (int i = 0; i < 4; i++) {
+        if (float(i) >= lights.params.x) {
+            break;
+        }
+        float3 to_light = lights.point_position_radius[i].xyz - in.world;
+        float distance = length(to_light);
+        to_light /= distance;
+        float radius = lights.point_position_radius[i].w;
+        float window = 1.0 - (distance / radius) * (distance / radius);
+        float attenuation = window * window / (1.0 + distance * distance);
+        if (distance >= radius) {
+            attenuation = 0.0;
+        }
+        float diffuse = max(dot(normal, to_light), 0.0);
+        colour += base * lights.point_color_intensity[i].rgb
+            * lights.point_color_intensity[i].a * attenuation * diffuse;
+    }
+    return float4(colour, 1.0);
+}
+";

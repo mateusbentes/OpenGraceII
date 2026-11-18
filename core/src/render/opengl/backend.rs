@@ -14,15 +14,17 @@
 //! runs the readback before the frame ends.
 
 use super::super::{
-    bytes_per_pixel, CameraParams, ClearBuffer, ClearColor, GpuMesh,
-    GpuMeshInner, PixelFormat, ReadbackSample, RenderBackend, RenderError,
-    RenderTarget, RenderTargetDesc, RenderTargetInner, ShaderProgram,
-    ShaderProgramInner, Texture2DDesc, TextureView, TextureViewInner,
-    VertexLayout, DEPTH_ATTACHMENT,
+    bytes_per_pixel, CameraParams, ClearBuffer, ClearColor,
+    DirectionalLight, DynamicLight, GpuMesh, GpuMeshInner, PixelFormat,
+    ReadbackSample, RenderBackend, RenderError, RenderTarget,
+    RenderTargetDesc, RenderTargetInner, ShaderProgram, ShaderProgramInner,
+    Texture2DDesc, TextureView, TextureViewInner, VertexLayout,
+    DEPTH_ATTACHMENT,
 };
 use super::gl_loader::{GlLoader, *};
 use super::shader_library::{TRIANGLE_FRAGMENT_SHADER, TRIANGLE_VERTEX_SHADER};
 use super::shader_library::{MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER};
+use super::shader_library::{LIT_FRAGMENT_SHADER, LIT_VERTEX_SHADER};
 use crate::math::{Mat4, Vec3};
 use std::sync::{Arc, Mutex};
 use std::os::raw::{c_char, c_void};
@@ -87,6 +89,72 @@ struct OpenGlMeshState {
     index_count: u32,
 }
 
+/// The lights' uniform block (M5): the same layout every backend maps —
+/// the sun's direction (xyz + pad), the sun's colour (xyz) and intensity
+/// (w), the four point lights' position (xyz) and radius (w), the four
+/// point lights' colour (xyz) and intensity (w), the params (x = the
+/// live point-light count). The GL path uploads the fields as the lit
+/// fragment shader's named uniform arrays (the same layout the other
+/// backends' uniform blocks carry).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LightsUniform {
+    sun_direction: [f32; 4],
+    sun_color_intensity: [f32; 4],
+    point_position_radius: [[f32; 4]; 4],
+    point_color_intensity: [[f32; 4]; 4],
+    params: [f32; 4],
+}
+
+impl LightsUniform {
+    /// The default block: no lights (the intensity zero, the count
+    /// zero — the lit draw renders the texture unlit rather than black).
+    fn none() -> Self {
+        LightsUniform {
+            sun_direction: [0.0, -1.0, 0.0, 0.0],
+            sun_color_intensity: [0.0, 0.0, 0.0, 0.0],
+            point_position_radius: [[0.0; 4]; 4],
+            point_color_intensity: [[0.0; 4]; 4],
+            params: [0.0, 0.0, 0.0, 0.0],
+        }
+    }
+
+    /// The block from the contract's lights: the sun (the direction
+    /// normalised) plus up to four point lights (the rest stay zero).
+    fn from_lights(sun: &DirectionalLight, lights: &[DynamicLight]) -> Self {
+        let direction = sun.direction.normalised();
+        let mut block = LightsUniform {
+            sun_direction: [direction.x, direction.y, direction.z, 0.0],
+            sun_color_intensity: [
+                sun.color.x, sun.color.y, sun.color.z, sun.intensity,
+            ],
+            point_position_radius: [[0.0; 4]; 4],
+            point_color_intensity: [[0.0; 4]; 4],
+            params: [0.0, 0.0, 0.0, 0.0],
+        };
+        for (index, dynamic) in lights.iter().take(4).enumerate() {
+            // The spot light's cone falloff waits for the next step (the
+            // first lit step carries the point lights).
+            if let DynamicLight::Point(light) = dynamic {
+                block.point_position_radius[index] = [
+                    light.position.x,
+                    light.position.y,
+                    light.position.z,
+                    light.radius,
+                ];
+                block.point_color_intensity[index] = [
+                    light.color.x,
+                    light.color.y,
+                    light.color.z,
+                    light.intensity,
+                ];
+            }
+        }
+        block.params[0] = lights.len().min(4) as f32;
+        block
+    }
+}
+
 /// The OpenGL backend's own render target: a GL framebuffer object plus the
 /// contract's shared handle state.
 // The framebuffer object is written at creation; the release path (the
@@ -146,6 +214,20 @@ pub struct OpenGlBackend {
     mesh_uniform_model: i32,
     mesh_uniform_sampler: i32,
     mesh_ready: bool,
+    // The lit mesh path's program (M5): the same PNU vertex shape, the
+    // LIT shader pair, the lights' uniforms driven by name.
+    lit_program: u32,
+    lit_uniform_view_projection: i32,
+    lit_uniform_model: i32,
+    lit_uniform_sampler: i32,
+    lit_uniform_sun_direction: i32,
+    lit_uniform_sun_color_intensity: i32,
+    lit_uniform_point_position_radius: i32,
+    lit_uniform_point_color_intensity: i32,
+    lit_uniform_params: i32,
+    lit_ready: bool,
+    // The submission's lights block (the draw's uniform writes read it).
+    lit_block: LightsUniform,
     /// The per-mesh state: the VAO (the attribute pointers), the vertex
     /// and the index buffers, the vertex/index counts (the create order
     /// matches the handle's id).
@@ -220,6 +302,17 @@ impl OpenGlBackend {
             mesh_uniform_model: -1,
             mesh_uniform_sampler: -1,
             mesh_ready: false,
+            lit_program: 0,
+            lit_uniform_view_projection: -1,
+            lit_uniform_model: -1,
+            lit_uniform_sampler: -1,
+            lit_uniform_sun_direction: -1,
+            lit_uniform_sun_color_intensity: -1,
+            lit_uniform_point_position_radius: -1,
+            lit_uniform_point_color_intensity: -1,
+            lit_uniform_params: -1,
+            lit_ready: false,
+            lit_block: LightsUniform::none(),
             meshes: Vec::new(),
             bound_texture: None,
             default_texture: None,
@@ -826,11 +919,142 @@ impl OpenGlBackend {
         true
     }
 
+    /// The lit mesh path's program (M5): the LIT shader pair from the
+    /// library, compiled at runtime by the driver (the same lazy ensure
+    /// the unlit mesh path follows; the compilation happens outside an
+    /// open frame — the upload's ensure, not the draw's).
+    pub(crate) fn ensure_lit_program(&mut self) -> bool {
+        if self.lit_ready {
+            return true;
+        }
+        let program = unsafe {
+            (self.loader.gl_create_program.unwrap())()
+        };
+        if program == 0 {
+            return false;
+        }
+        let vs = unsafe { (self.loader.gl_create_shader.unwrap())(GL_VERTEX_SHADER) };
+        let fs = unsafe {
+            (self.loader.gl_create_shader.unwrap())(GL_FRAGMENT_SHADER)
+        };
+        if vs == 0 || fs == 0 {
+            return false;
+        }
+        let vs_source = [LIT_VERTEX_SHADER.as_ptr() as *const c_char];
+        let vs_len = [LIT_VERTEX_SHADER.len() as i32];
+        let fs_source = [LIT_FRAGMENT_SHADER.as_ptr() as *const c_char];
+        let fs_len = [LIT_FRAGMENT_SHADER.len() as i32];
+        unsafe {
+            (self.loader.gl_shader_source.unwrap())(
+                vs,
+                1,
+                vs_source.as_ptr(),
+                vs_len.as_ptr(),
+            );
+            (self.loader.gl_compile_shader.unwrap())(vs);
+            (self.loader.gl_shader_source.unwrap())(
+                fs,
+                1,
+                fs_source.as_ptr(),
+                fs_len.as_ptr(),
+            );
+            (self.loader.gl_compile_shader.unwrap())(fs);
+            (self.loader.gl_attach_shader.unwrap())(program, vs);
+            (self.loader.gl_attach_shader.unwrap())(program, fs);
+            (self.loader.gl_link_program.unwrap())(program);
+        }
+        let mut linked: i32 = 0;
+        unsafe {
+            (self.loader.gl_get_programiv.unwrap())(
+                program,
+                GL_LINK_STATUS,
+                &mut linked,
+            );
+        }
+        if linked != GL_TRUE as i32 {
+            unsafe {
+                (self.loader.gl_delete_shader.unwrap())(vs);
+                (self.loader.gl_delete_shader.unwrap())(fs);
+                (self.loader.gl_delete_program.unwrap())(program);
+            }
+            return false;
+        }
+        unsafe {
+            (self.loader.gl_delete_shader.unwrap())(vs);
+            (self.loader.gl_delete_shader.unwrap())(fs);
+        }
+        self.lit_program = program;
+        self.lit_uniform_view_projection = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"view_projection\0".as_ptr() as *const c_char,
+            )
+        };
+        self.lit_uniform_model = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"model\0".as_ptr() as *const c_char,
+            )
+        };
+        self.lit_uniform_sampler = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"surface_texture\0".as_ptr() as *const c_char,
+            )
+        };
+        self.lit_uniform_sun_direction = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"sun_direction\0".as_ptr() as *const c_char,
+            )
+        };
+        self.lit_uniform_sun_color_intensity = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"sun_color_intensity\0".as_ptr() as *const c_char,
+            )
+        };
+        self.lit_uniform_point_position_radius = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"point_position_radius\0".as_ptr() as *const c_char,
+            )
+        };
+        self.lit_uniform_point_color_intensity = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"point_color_intensity\0".as_ptr() as *const c_char,
+            )
+        };
+        self.lit_uniform_params = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"params\0".as_ptr() as *const c_char,
+            )
+        };
+        self.lit_ready = true;
+        true
+    }
+
     /// The generic draw path: the mesh's VAO, the camera uniforms (the
     /// set_camera state's view-projection and the submission's model) and
     /// the indexed draw. A draw with no open frame counts one violation
     /// (the same rule the Vulkan path follows).
     fn draw_mesh_by_id(&mut self, mesh_id: usize, model: Mat4) {
+        self.draw_mesh_inner(mesh_id, model, false);
+    }
+
+    /// The lit draw (M5): the same path, the lit program and the
+    /// lights' uniforms uploaded (the submit path carries the lights).
+    fn draw_mesh_lit_by_id(&mut self, mesh_id: usize, model: Mat4) {
+        self.draw_mesh_inner(mesh_id, model, true);
+    }
+
+    /// The mesh draw's shared body: the unlit path binds the mesh
+    /// program; the lit path binds the lit program and uploads the
+    /// lights' uniforms (the same Blinn-Phong state the Vulkan path's
+    /// block carries).
+    fn draw_mesh_inner(&mut self, mesh_id: usize, model: Mat4, lit: bool) {
         if !self.frame_open {
             self.violations += 1;
             return;
@@ -843,6 +1067,9 @@ impl OpenGlBackend {
             }
         };
         if !self.mesh_ready {
+            return;
+        }
+        if lit && !self.lit_ready {
             return;
         }
         // The camera uniforms: the set_camera state's view-projection
@@ -866,15 +1093,27 @@ impl OpenGlBackend {
                     .unwrap_or(0),
             );
         unsafe {
-            (self.loader.gl_use_program.unwrap())(self.mesh_program);
+            (self.loader.gl_use_program.unwrap())(if lit {
+                self.lit_program
+            } else {
+                self.mesh_program
+            });
             (self.loader.gl_uniform_matrix_4fv.unwrap())(
-                self.mesh_uniform_view_projection,
+                if lit {
+                    self.lit_uniform_view_projection
+                } else {
+                    self.mesh_uniform_view_projection
+                },
                 1,
                 GL_FALSE,
                 view_projection.m.as_ptr() as *const f32,
             );
             (self.loader.gl_uniform_matrix_4fv.unwrap())(
-                self.mesh_uniform_model,
+                if lit {
+                    self.lit_uniform_model
+                } else {
+                    self.mesh_uniform_model
+                },
                 1,
                 GL_FALSE,
                 model.m.as_ptr() as *const f32,
@@ -882,9 +1121,44 @@ impl OpenGlBackend {
             (self.loader.gl_active_texture.unwrap())(GL_TEXTURE0);
             (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_2D, texture);
             (self.loader.gl_uniform_1i.unwrap())(
-                self.mesh_uniform_sampler,
+                if lit {
+                    self.lit_uniform_sampler
+                } else {
+                    self.mesh_uniform_sampler
+                },
                 0,
             );
+            if lit {
+                // The lights' uniforms: the block's fields, the arrays
+                // via the 4fv path (the same values the Vulkan path's
+                // block carries).
+                let block = self.lit_block;
+                (self.loader.gl_uniform_4fv.unwrap())(
+                    self.lit_uniform_sun_direction,
+                    1,
+                    block.sun_direction.as_ptr(),
+                );
+                (self.loader.gl_uniform_4fv.unwrap())(
+                    self.lit_uniform_sun_color_intensity,
+                    1,
+                    block.sun_color_intensity.as_ptr(),
+                );
+                (self.loader.gl_uniform_4fv.unwrap())(
+                    self.lit_uniform_point_position_radius,
+                    4,
+                    block.point_position_radius.as_ptr() as *const f32,
+                );
+                (self.loader.gl_uniform_4fv.unwrap())(
+                    self.lit_uniform_point_color_intensity,
+                    4,
+                    block.point_color_intensity.as_ptr() as *const f32,
+                );
+                (self.loader.gl_uniform_4fv.unwrap())(
+                    self.lit_uniform_params,
+                    1,
+                    block.params.as_ptr(),
+                );
+            }
             (self.loader.gl_bind_vertex_array.unwrap())(vao);
             (self.loader.gl_draw_elements.unwrap())(
                 GL_TRIANGLES,
@@ -1174,6 +1448,25 @@ impl RenderBackend for OpenGlBackend {
             }
         }
         let mesh_id = submission.mesh.inner.lock().unwrap().id;
+        let has_lights = submission.sun.is_some() || !submission.lights.is_empty();
+        if has_lights {
+            // The lit path (M5): the lights' block from the submission's
+            // sun and point lights (the sun absent means intensity zero),
+            // the lit program draws.
+            let default_sun = DirectionalLight {
+                direction: Vec3::new(0.0, -1.0, 0.0),
+                color: Vec3::new(0.0, 0.0, 0.0),
+                intensity: 0.0,
+            };
+            let sun = submission.sun.as_ref().unwrap_or(&default_sun);
+            self.lit_block = LightsUniform::from_lights(sun, &submission.lights);
+            if self.ensure_lit_program() {
+                self.draw_mesh_lit_by_id(mesh_id, submission.model);
+                return;
+            }
+            // The lit path's failure falls back to the unlit draw (the
+            // render keeps going).
+        }
         self.draw_mesh_by_id(mesh_id, submission.model);
     }
 

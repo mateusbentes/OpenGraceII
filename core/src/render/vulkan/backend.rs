@@ -273,6 +273,30 @@ pub struct VulkanBackend {
     lit_descriptor_set: vk::VkDescriptorSet,
     lit_camera_buffer: Option<VulkanResource>,
     lit_camera_map: *mut std::os::raw::c_void,
+    // The deferred lighting pass's resources (M6): the G-buffer's
+    // geometry pipeline (three colour attachments) and the lighting
+    // pass's fullscreen triangle pipeline (the G-buffer's attachments
+    // sample through the lighting set).
+    gbuffer_pipeline: vk::VkPipeline,
+    gbuffer_pipeline_ready: bool,
+    gbuffer_pipeline_layout: vk::VkPipelineLayout,
+    gbuffer_set_layout: vk::VkDescriptorSetLayout,
+    // The G-buffer's render pass: three colour attachments plus depth
+    // (the one pass the deferred path's geometry step opens; the
+    // per-target framebuffers build against it).
+    gbuffer_render_pass: vk::VkRenderPass,
+    gbuffer_camera_buffer: Option<VulkanResource>,
+    gbuffer_camera_map: *mut std::os::raw::c_void,
+    gbuffer_descriptor_set: vk::VkDescriptorSet,
+    gbuffer_descriptor_pool: vk::VkDescriptorPool,
+    lighting_pipeline: vk::VkPipeline,
+    lighting_pipeline_ready: bool,
+    lighting_pipeline_layout: vk::VkPipelineLayout,
+    lighting_set_layout: vk::VkDescriptorSetLayout,
+    lighting_lights_buffer: Option<VulkanResource>,
+    lighting_lights_map: *mut std::os::raw::c_void,
+    lighting_descriptor_set: vk::VkDescriptorSet,
+    lighting_descriptor_pool: vk::VkDescriptorPool,
     // The diagnostic triangle resources.
     tri_mesh: Option<GpuMesh>,
     tri_shader: Option<ShaderProgram>,
@@ -410,6 +434,23 @@ impl VulkanBackend {
             lit_descriptor_set: std::ptr::null_mut(),
             lit_camera_buffer: None,
             lit_camera_map: std::ptr::null_mut(),
+            gbuffer_pipeline: std::ptr::null_mut(),
+            gbuffer_pipeline_ready: false,
+            gbuffer_pipeline_layout: std::ptr::null_mut(),
+            gbuffer_set_layout: std::ptr::null_mut(),
+            gbuffer_render_pass: std::ptr::null_mut(),
+            gbuffer_camera_buffer: None,
+            gbuffer_camera_map: std::ptr::null_mut(),
+            gbuffer_descriptor_set: std::ptr::null_mut(),
+            gbuffer_descriptor_pool: std::ptr::null_mut(),
+            lighting_pipeline: std::ptr::null_mut(),
+            lighting_pipeline_ready: false,
+            lighting_pipeline_layout: std::ptr::null_mut(),
+            lighting_set_layout: std::ptr::null_mut(),
+            lighting_lights_buffer: None,
+            lighting_lights_map: std::ptr::null_mut(),
+            lighting_descriptor_set: std::ptr::null_mut(),
+            lighting_descriptor_pool: std::ptr::null_mut(),
             tri_mesh: None,
             tri_shader: None,
             tri_pipeline: std::ptr::null_mut(),
@@ -836,12 +877,30 @@ impl VulkanBackend {
              vk::ImageLayout::TransferDstOptimal) => (0, vk::Access::TransferWrite as u32),
             (vk::ImageLayout::TransferDstOptimal,
              vk::ImageLayout::ShaderReadOnlyOptimal) => (vk::Access::TransferWrite as u32, vk::Access::ShaderRead as u32),
+            // The deferred lighting pass's G-buffer transitions (M6): the
+            // geometry pass's colour attachments hand off to the lighting
+            // pass's shader reads, and hand back before the next frame's
+            // geometry pass opens the pass again.
+            (vk::ImageLayout::ColorAttachmentOptimal,
+             vk::ImageLayout::ShaderReadOnlyOptimal) => (vk::Access::ColorAttachmentWrite as u32, vk::Access::ShaderRead as u32),
+            (vk::ImageLayout::ShaderReadOnlyOptimal,
+             vk::ImageLayout::ColorAttachmentOptimal) => (vk::Access::ShaderRead as u32, vk::Access::ColorAttachmentWrite as u32),
             _ => (0, 0),
         };
         let (src_stage, dst_stage) = match (old_layout, new_layout) {
             (vk::ImageLayout::Undefined,
              vk::ImageLayout::ColorAttachmentOptimal) => {
                 (vk::PipelineStage::TopOfPipe,
+                 vk::PipelineStage::ColorAttachmentOutput)
+            }
+            (vk::ImageLayout::ColorAttachmentOptimal,
+             vk::ImageLayout::ShaderReadOnlyOptimal) => {
+                (vk::PipelineStage::ColorAttachmentOutput,
+                 vk::PipelineStage::FragmentShader)
+            }
+            (vk::ImageLayout::ShaderReadOnlyOptimal,
+             vk::ImageLayout::ColorAttachmentOptimal) => {
+                (vk::PipelineStage::FragmentShader,
                  vk::PipelineStage::ColorAttachmentOutput)
             }
             (vk::ImageLayout::Undefined,
@@ -2766,6 +2825,915 @@ impl VulkanBackend {
         Ok(pipeline)
     }
 
+    /// The G-buffer's geometry pipeline (M6): the same PNU vertex input
+    /// the mesh pipeline carries, the GBUFFER shaders, the three colour
+    /// attachments (the albedo, the normal, the world position) and the
+    /// depth test on. The render pass is the gbuffer_render_pass the
+    /// first three-attachment target's creation registers.
+    fn create_gbuffer_pipeline(&mut self) -> Result<(), RenderError> {
+        if self.gbuffer_render_pass.is_null() {
+            self.gbuffer_render_pass = self.create_gbuffer_render_pass()?;
+        }
+        let vertex_module = self.create_shader_module(
+            &shader_library::spirv::GBUFFER_VERTEX_SHADER_SPIRV,
+        )?;
+        let fragment_module = self.create_shader_module(
+            &shader_library::spirv::GBUFFER_FRAGMENT_SHADER_SPIRV,
+        )?;
+        // The descriptor set layout: the camera block at binding 0 (the
+        // vertex stage reads it), the surface texture at binding 1 (the
+        // fragment stage reads it). The same shape the mesh pipeline's
+        // set carries.
+        let bindings = [
+            vk::VkDescriptorSetLayoutBinding {
+                binding: 0,
+                descriptor_type: vk::DescriptorType::UniformBuffer,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStage::Vertex as u32,
+                p_immutable_samplers: std::ptr::null(),
+            },
+            vk::VkDescriptorSetLayoutBinding {
+                binding: 1,
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStage::Fragment as u32,
+                p_immutable_samplers: std::ptr::null(),
+            },
+        ];
+        let layout_info = vk::VkDescriptorSetLayoutCreateInfo {
+            s_type: vk::StructureType::DescriptorSetLayoutCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            binding_count: bindings.len() as u32,
+            p_bindings: bindings.as_ptr(),
+        };
+        let mut set_layout = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_descriptor_set_layout.unwrap())(
+                self.device,
+                &layout_info,
+                std::ptr::null(),
+                &mut set_layout,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: the G-buffer's set layout failed",
+            ));
+        }
+        self.gbuffer_set_layout = set_layout;
+        let set_layouts = [set_layout];
+        let pipeline_layout_info = vk::VkPipelineLayoutCreateInfo {
+            s_type: vk::StructureType::PipelineLayoutCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            set_layout_count: 1,
+            p_set_layouts: set_layouts.as_ptr(),
+            push_constant_range_count: 0,
+            p_push_constant_ranges: std::ptr::null(),
+        };
+        let mut pipeline_layout = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_pipeline_layout.unwrap())(
+                self.device,
+                &pipeline_layout_info,
+                std::ptr::null(),
+                &mut pipeline_layout,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: the G-buffer's pipeline layout failed",
+            ));
+        }
+        self.gbuffer_pipeline_layout = pipeline_layout;
+        // The graphics pipeline: the PNU vertex input, the depth test on
+        // (LESS, the write on), no culling, three colour attachments.
+        let vertex_entry = b"main\0";
+        let stages = [
+            vk::VkPipelineShaderStageCreateInfo {
+                s_type: vk::StructureType::PipelineShaderStageCreateInfo,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: vk::ShaderStage::Vertex,
+                module: vertex_module,
+                p_name: vertex_entry.as_ptr() as *const _,
+                p_specialization_info: std::ptr::null(),
+            },
+            vk::VkPipelineShaderStageCreateInfo {
+                s_type: vk::StructureType::PipelineShaderStageCreateInfo,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: vk::ShaderStage::Fragment,
+                module: fragment_module,
+                p_name: vertex_entry.as_ptr() as *const _,
+                p_specialization_info: std::ptr::null(),
+            },
+        ];
+        let bindings = [vk::VkVertexInputBindingDescription {
+            binding: 0,
+            stride: 32,
+            input_rate: vk::VertexInputRate::Vertex,
+        }];
+        let attributes = [
+            vk::VkVertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32B32Sfloat as u32,
+                offset: 0,
+            },
+            vk::VkVertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32B32Sfloat as u32,
+                offset: 12,
+            },
+            vk::VkVertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::Format::Rg32Sfloat as u32,
+                offset: 24,
+            },
+        ];
+        let vertex_input = vk::VkPipelineVertexInputStateCreateInfo {
+            s_type: vk::StructureType::PipelineVertexInputStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            vertex_binding_description_count: 1,
+            p_vertex_binding_descriptions: bindings.as_ptr(),
+            vertex_attribute_description_count: 3,
+            p_vertex_attribute_descriptions: attributes.as_ptr(),
+        };
+        let input_assembly = vk::VkPipelineInputAssemblyStateCreateInfo {
+            s_type: vk::StructureType::PipelineInputAssemblyStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            topology: vk::PrimitiveTopology::TriangleList,
+            primitive_restart_enable: 0,
+        };
+        let viewport = vk::VkViewport {
+            x: 0.0,
+            y: 0.0,
+            width: self.config.width as f32,
+            height: self.config.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = vk::VkRect2D {
+            offset: vk::VkOffset2D { x: 0, y: 0 },
+            extent: vk::VkExtent2D {
+                width: self.config.width,
+                height: self.config.height,
+            },
+        };
+        let viewport_state = vk::VkPipelineViewportStateCreateInfo {
+            s_type: vk::StructureType::PipelineViewportStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            viewport_count: 1,
+            p_viewports: &viewport,
+            scissor_count: 1,
+            p_scissors: &scissor,
+        };
+        let rasterization = vk::VkPipelineRasterizationStateCreateInfo {
+            s_type: vk::StructureType::PipelineRasterizationStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            depth_clamp_enable: 0,
+            rasterizer_discard_enable: 0,
+            polygon_mode: vk::PolygonMode::Fill,
+            cull_mode: 0,
+            front_face: vk::FrontFace::CounterClockwise,
+            depth_bias_enable: 0,
+            depth_bias_constant_factor: 0.0,
+            depth_bias_clamp: 0.0,
+            depth_bias_slope_factor: 0.0,
+            line_width: 1.0,
+        };
+        let multisample = vk::VkPipelineMultisampleStateCreateInfo {
+            s_type: vk::StructureType::PipelineMultisampleStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            rasterization_samples: vk::SampleCount::One,
+            sample_shading_enable: 0,
+            min_sample_shading: 1.0,
+            p_sample_mask: std::ptr::null(),
+            alpha_to_coverage_enable: 0,
+            alpha_to_one_enable: 0,
+        };
+        let depth_stencil = vk::VkPipelineDepthStencilStateCreateInfo {
+            s_type: vk::StructureType::PipelineDepthStencilStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            depth_test_enable: 1,
+            depth_write_enable: 1,
+            depth_compare_op: vk::CompareOp::Less,
+            depth_bounds_test_enable: 0,
+            stencil_test_enable: 0,
+            front: vk::VkStencilOpState {
+                fail_op: vk::StencilOp::Keep,
+                pass_op: vk::StencilOp::Keep,
+                depth_fail_op: vk::StencilOp::Keep,
+                compare_op: vk::CompareOp::Always,
+                compare_mask: 0,
+                write_mask: 0,
+                reference: 0,
+            },
+            back: vk::VkStencilOpState {
+                fail_op: vk::StencilOp::Keep,
+                pass_op: vk::StencilOp::Keep,
+                depth_fail_op: vk::StencilOp::Keep,
+                compare_op: vk::CompareOp::Always,
+                compare_mask: 0,
+                write_mask: 0,
+                reference: 0,
+            },
+            min_depth_bounds: 0.0,
+            max_depth_bounds: 1.0,
+        };
+        let blend_attachment = vk::VkPipelineColorBlendAttachmentState {
+            blend_enable: 0,
+            src_color_blend_factor: vk::BlendFactor::Zero,
+            dst_color_blend_factor: vk::BlendFactor::Zero,
+            color_blend_op: vk::BlendOp::Add,
+            src_alpha_blend_factor: vk::BlendFactor::Zero,
+            dst_alpha_blend_factor: vk::BlendFactor::Zero,
+            alpha_blend_op: vk::BlendOp::Add,
+            color_write_mask: 0xF,
+        };
+        let blend_attachments = [blend_attachment; 3];
+        let color_blend = vk::VkPipelineColorBlendStateCreateInfo {
+            s_type: vk::StructureType::PipelineColorBlendStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            logic_op_enable: 0,
+            logic_op: 0,
+            attachment_count: 3,
+            p_attachments: blend_attachments.as_ptr(),
+            blend_constants: [0.0, 0.0, 0.0, 0.0],
+        };
+        let dynamic_states = [
+            vk::DynamicState::Viewport,
+            vk::DynamicState::Scissor,
+        ];
+        let dynamic_state = vk::VkPipelineDynamicStateCreateInfo {
+            s_type: vk::StructureType::PipelineDynamicStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            dynamic_state_count: 2,
+            p_dynamic_states: dynamic_states.as_ptr(),
+        };
+        let pipeline_info = vk::VkGraphicsPipelineCreateInfo {
+            s_type: vk::StructureType::GraphicsPipelineCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            stage_count: 2,
+            p_stages: stages.as_ptr(),
+            p_vertex_input_state: &vertex_input,
+            p_input_assembly_state: &input_assembly,
+            p_tessellation_state: std::ptr::null(),
+            p_viewport_state: &viewport_state,
+            p_rasterization_state: &rasterization,
+            p_multisample_state: &multisample,
+            p_depth_stencil_state: &depth_stencil,
+            p_color_blend_state: &color_blend,
+            p_dynamic_state: &dynamic_state,
+            layout: pipeline_layout,
+            render_pass: self.gbuffer_render_pass,
+            subpass: 0,
+            base_pipeline_handle: std::ptr::null_mut(),
+            base_pipeline_index: -1,
+        };
+        let mut pipeline = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_graphics_pipelines.unwrap())(
+                self.device,
+                std::ptr::null_mut(),
+                1,
+                &pipeline_info,
+                std::ptr::null(),
+                &mut pipeline,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: the G-buffer's graphics pipeline failed",
+            ));
+        }
+        self.gbuffer_pipeline = pipeline;
+        Ok(())
+    }
+
+    /// The lighting pass's fullscreen triangle pipeline (M6): no vertex
+    /// input (the three vertices the vertex index generates), the
+    /// LIGHTING shaders, the depth test off, one colour attachment. The
+    /// four G-buffer samplers (the albedo, the normal, the world) and
+    /// the lights' block bind through the lighting set.
+    fn create_lighting_pipeline(&mut self) -> Result<(), RenderError> {
+        let vertex_module = self.create_shader_module(
+            &shader_library::spirv::LIGHTING_VERTEX_SHADER_SPIRV,
+        )?;
+        let fragment_module = self.create_shader_module(
+            &shader_library::spirv::LIGHTING_FRAGMENT_SHADER_SPIRV,
+        )?;
+        // The descriptor set layout: the lights' block at binding 0, the
+        // albedo at binding 1, the normal at binding 2, the world at
+        // binding 3 (the same set the lighting shaders declare).
+        let bindings = [
+            vk::VkDescriptorSetLayoutBinding {
+                binding: 0,
+                descriptor_type: vk::DescriptorType::UniformBuffer,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStage::Fragment as u32,
+                p_immutable_samplers: std::ptr::null(),
+            },
+            vk::VkDescriptorSetLayoutBinding {
+                binding: 1,
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStage::Fragment as u32,
+                p_immutable_samplers: std::ptr::null(),
+            },
+            vk::VkDescriptorSetLayoutBinding {
+                binding: 2,
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStage::Fragment as u32,
+                p_immutable_samplers: std::ptr::null(),
+            },
+            vk::VkDescriptorSetLayoutBinding {
+                binding: 3,
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStage::Fragment as u32,
+                p_immutable_samplers: std::ptr::null(),
+            },
+        ];
+        let layout_info = vk::VkDescriptorSetLayoutCreateInfo {
+            s_type: vk::StructureType::DescriptorSetLayoutCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            binding_count: bindings.len() as u32,
+            p_bindings: bindings.as_ptr(),
+        };
+        let mut set_layout = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_descriptor_set_layout.unwrap())(
+                self.device,
+                &layout_info,
+                std::ptr::null(),
+                &mut set_layout,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: the lighting set layout failed",
+            ));
+        }
+        self.lighting_set_layout = set_layout;
+        let set_layouts = [set_layout];
+        let pipeline_layout_info = vk::VkPipelineLayoutCreateInfo {
+            s_type: vk::StructureType::PipelineLayoutCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            set_layout_count: 1,
+            p_set_layouts: set_layouts.as_ptr(),
+            push_constant_range_count: 0,
+            p_push_constant_ranges: std::ptr::null(),
+        };
+        let mut pipeline_layout = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_pipeline_layout.unwrap())(
+                self.device,
+                &pipeline_layout_info,
+                std::ptr::null(),
+                &mut pipeline_layout,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: the lighting pipeline layout failed",
+            ));
+        }
+        self.lighting_pipeline_layout = pipeline_layout;
+        // The graphics pipeline: no vertex input, the depth test off,
+        // one colour attachment.
+        let vertex_entry = b"main\0";
+        let stages = [
+            vk::VkPipelineShaderStageCreateInfo {
+                s_type: vk::StructureType::PipelineShaderStageCreateInfo,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: vk::ShaderStage::Vertex,
+                module: vertex_module,
+                p_name: vertex_entry.as_ptr() as *const _,
+                p_specialization_info: std::ptr::null(),
+            },
+            vk::VkPipelineShaderStageCreateInfo {
+                s_type: vk::StructureType::PipelineShaderStageCreateInfo,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: vk::ShaderStage::Fragment,
+                module: fragment_module,
+                p_name: vertex_entry.as_ptr() as *const _,
+                p_specialization_info: std::ptr::null(),
+            },
+        ];
+        let vertex_input = vk::VkPipelineVertexInputStateCreateInfo {
+            s_type: vk::StructureType::PipelineVertexInputStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            vertex_binding_description_count: 0,
+            p_vertex_binding_descriptions: std::ptr::null(),
+            vertex_attribute_description_count: 0,
+            p_vertex_attribute_descriptions: std::ptr::null(),
+        };
+        let input_assembly = vk::VkPipelineInputAssemblyStateCreateInfo {
+            s_type: vk::StructureType::PipelineInputAssemblyStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            topology: vk::PrimitiveTopology::TriangleList,
+            primitive_restart_enable: 0,
+        };
+        let viewport = vk::VkViewport {
+            x: 0.0,
+            y: 0.0,
+            width: self.config.width as f32,
+            height: self.config.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = vk::VkRect2D {
+            offset: vk::VkOffset2D { x: 0, y: 0 },
+            extent: vk::VkExtent2D {
+                width: self.config.width,
+                height: self.config.height,
+            },
+        };
+        let viewport_state = vk::VkPipelineViewportStateCreateInfo {
+            s_type: vk::StructureType::PipelineViewportStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            viewport_count: 1,
+            p_viewports: &viewport,
+            scissor_count: 1,
+            p_scissors: &scissor,
+        };
+        let rasterization = vk::VkPipelineRasterizationStateCreateInfo {
+            s_type: vk::StructureType::PipelineRasterizationStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            depth_clamp_enable: 0,
+            rasterizer_discard_enable: 0,
+            polygon_mode: vk::PolygonMode::Fill,
+            cull_mode: 0,
+            front_face: vk::FrontFace::CounterClockwise,
+            depth_bias_enable: 0,
+            depth_bias_constant_factor: 0.0,
+            depth_bias_clamp: 0.0,
+            depth_bias_slope_factor: 0.0,
+            line_width: 1.0,
+        };
+        let multisample = vk::VkPipelineMultisampleStateCreateInfo {
+            s_type: vk::StructureType::PipelineMultisampleStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            rasterization_samples: vk::SampleCount::One,
+            sample_shading_enable: 0,
+            min_sample_shading: 1.0,
+            p_sample_mask: std::ptr::null(),
+            alpha_to_coverage_enable: 0,
+            alpha_to_one_enable: 0,
+        };
+        // The depth test off: the lighting pass's fullscreen triangle
+        // covers the whole frame and the depth attachment stays out of
+        // the pass's subpass.
+        let depth_stencil = vk::VkPipelineDepthStencilStateCreateInfo {
+            s_type: vk::StructureType::PipelineDepthStencilStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            depth_test_enable: 0,
+            depth_write_enable: 0,
+            depth_compare_op: vk::CompareOp::Always,
+            depth_bounds_test_enable: 0,
+            stencil_test_enable: 0,
+            front: vk::VkStencilOpState {
+                fail_op: vk::StencilOp::Keep,
+                pass_op: vk::StencilOp::Keep,
+                depth_fail_op: vk::StencilOp::Keep,
+                compare_op: vk::CompareOp::Always,
+                compare_mask: 0,
+                write_mask: 0,
+                reference: 0,
+            },
+            back: vk::VkStencilOpState {
+                fail_op: vk::StencilOp::Keep,
+                pass_op: vk::StencilOp::Keep,
+                depth_fail_op: vk::StencilOp::Keep,
+                compare_op: vk::CompareOp::Always,
+                compare_mask: 0,
+                write_mask: 0,
+                reference: 0,
+            },
+            min_depth_bounds: 0.0,
+            max_depth_bounds: 1.0,
+        };
+        let blend_attachment = vk::VkPipelineColorBlendAttachmentState {
+            blend_enable: 0,
+            src_color_blend_factor: vk::BlendFactor::Zero,
+            dst_color_blend_factor: vk::BlendFactor::Zero,
+            color_blend_op: vk::BlendOp::Add,
+            src_alpha_blend_factor: vk::BlendFactor::Zero,
+            dst_alpha_blend_factor: vk::BlendFactor::Zero,
+            alpha_blend_op: vk::BlendOp::Add,
+            color_write_mask: 0xF,
+        };
+        let color_blend = vk::VkPipelineColorBlendStateCreateInfo {
+            s_type: vk::StructureType::PipelineColorBlendStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            logic_op_enable: 0,
+            logic_op: 0,
+            attachment_count: 1,
+            p_attachments: &blend_attachment,
+            blend_constants: [0.0, 0.0, 0.0, 0.0],
+        };
+        let dynamic_states = [
+            vk::DynamicState::Viewport,
+            vk::DynamicState::Scissor,
+        ];
+        let dynamic_state = vk::VkPipelineDynamicStateCreateInfo {
+            s_type: vk::StructureType::PipelineDynamicStateCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            dynamic_state_count: 2,
+            p_dynamic_states: dynamic_states.as_ptr(),
+        };
+        let pipeline_info = vk::VkGraphicsPipelineCreateInfo {
+            s_type: vk::StructureType::GraphicsPipelineCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            stage_count: 2,
+            p_stages: stages.as_ptr(),
+            p_vertex_input_state: &vertex_input,
+            p_input_assembly_state: &input_assembly,
+            p_tessellation_state: std::ptr::null(),
+            p_viewport_state: &viewport_state,
+            p_rasterization_state: &rasterization,
+            p_multisample_state: &multisample,
+            p_depth_stencil_state: &depth_stencil,
+            p_color_blend_state: &color_blend,
+            p_dynamic_state: &dynamic_state,
+            layout: pipeline_layout,
+            render_pass: self.render_pass,
+            subpass: 0,
+            base_pipeline_handle: std::ptr::null_mut(),
+            base_pipeline_index: -1,
+        };
+        let mut pipeline = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_graphics_pipelines.unwrap())(
+                self.device,
+                std::ptr::null_mut(),
+                1,
+                &pipeline_info,
+                std::ptr::null(),
+                &mut pipeline,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: the lighting pipeline failed",
+            ));
+        }
+        self.lighting_pipeline = pipeline;
+        Ok(())
+    }
+
+    /// The deferred lighting path's ensure: the two pipelines (the
+    /// G-buffer's geometry pipeline and the lighting pass's fullscreen
+    /// triangle), the camera buffer and the lights' buffer, and the two
+    /// descriptor sets. The same lazy rule the lit path's ensure follows
+    /// (the creation happens before the frame's first deferred draw; the
+    /// creation inside an open frame's recording is the software
+    /// rasterizer's crash the M5 run taught).
+    fn ensure_deferred_pipeline(&mut self) -> bool {
+        if self.gbuffer_pipeline_ready && self.lighting_pipeline_ready {
+            return true;
+        }
+        if self.create_gbuffer_pipeline().is_err() {
+            return false;
+        }
+        if self.create_lighting_pipeline().is_err() {
+            return false;
+        }
+        // The G-buffer's camera buffer (the same MeshUniform block the
+        // mesh path's per-mesh uniform carries).
+        let (camera_buffer, camera_memory) = match self.create_host_buffer(
+            std::mem::size_of::<MeshUniform>(),
+            vk::BufferUsage::UniformBuffer,
+        ) {
+            Ok(pair) => pair,
+            Err(_) => return false,
+        };
+        let camera_map = match self.map_memory(camera_memory) {
+            Ok(map) => map,
+            Err(_) => return false,
+        };
+        self.gbuffer_camera_buffer = Some(VulkanResource {
+            handle: camera_buffer,
+            memory: camera_memory,
+            released: false,
+        });
+        self.gbuffer_camera_map = camera_map;
+        // The lighting pass's lights buffer (the same 256-byte block the
+        // lit path's lights buffer carries; the default block carries no
+        // lights so the draws before the first submission render
+        // unlit rather than reading garbage).
+        let (lights_buffer, lights_memory) = match self
+            .create_host_buffer(LightsUniform::SIZE, vk::BufferUsage::UniformBuffer)
+        {
+            Ok(pair) => pair,
+            Err(_) => return false,
+        };
+        let lights_map = match self.map_memory(lights_memory) {
+            Ok(map) => map,
+            Err(_) => return false,
+        };
+        let default = LightsUniform::none();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &default as *const LightsUniform as *const u8,
+                lights_map as *mut u8,
+                LightsUniform::SIZE,
+            );
+        }
+        self.lighting_lights_buffer = Some(VulkanResource {
+            handle: lights_buffer,
+            memory: lights_memory,
+            released: false,
+        });
+        self.lighting_lights_map = lights_map;
+        // The G-buffer's descriptor set: the camera block at binding 0,
+        // the surface texture's combined sampler at binding 1.
+        let pool_sizes = [
+            vk::VkDescriptorPoolSize {
+                descriptor_type: vk::DescriptorType::UniformBuffer,
+                descriptor_count: 1,
+            },
+            vk::VkDescriptorPoolSize {
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                descriptor_count: 1,
+            },
+        ];
+        let pool_info = vk::VkDescriptorPoolCreateInfo {
+            s_type: vk::StructureType::DescriptorPoolCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            max_sets: 1,
+            pool_size_count: 2,
+            p_pool_sizes: pool_sizes.as_ptr(),
+        };
+        let mut pool = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_descriptor_pool.unwrap())(
+                self.device,
+                &pool_info,
+                std::ptr::null(),
+                &mut pool,
+            )
+        };
+        if result != vk::Result::Success {
+            return false;
+        }
+        self.gbuffer_descriptor_pool = pool;
+        let set_layouts = [self.gbuffer_set_layout];
+        let alloc_info = vk::VkDescriptorSetAllocateInfo {
+            s_type: vk::StructureType::DescriptorSetAllocateInfo,
+            p_next: std::ptr::null(),
+            descriptor_pool: pool,
+            descriptor_set_count: 1,
+            p_set_layouts: set_layouts.as_ptr(),
+        };
+        let mut set = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_allocate_descriptor_sets.unwrap())(
+                self.device,
+                &alloc_info,
+                &mut set,
+            )
+        };
+        if result != vk::Result::Success {
+            return false;
+        }
+        self.gbuffer_descriptor_set = set;
+        let default_view = self.default_texture.as_ref().map(|t| t.view);
+        self.write_gbuffer_descriptors(set, camera_buffer, default_view);
+        // The lighting pass's descriptor set: the lights' block at
+        // binding 0, the three G-buffer attachments' combined samplers at
+        // bindings 1-3 (the views land on the pass's draw — the target's
+        // identity the submission carries).
+        let pool_sizes = [
+            vk::VkDescriptorPoolSize {
+                descriptor_type: vk::DescriptorType::UniformBuffer,
+                descriptor_count: 1,
+            },
+            vk::VkDescriptorPoolSize {
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                descriptor_count: 3,
+            },
+        ];
+        let pool_info = vk::VkDescriptorPoolCreateInfo {
+            s_type: vk::StructureType::DescriptorPoolCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            max_sets: 1,
+            pool_size_count: 2,
+            p_pool_sizes: pool_sizes.as_ptr(),
+        };
+        let mut pool = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_descriptor_pool.unwrap())(
+                self.device,
+                &pool_info,
+                std::ptr::null(),
+                &mut pool,
+            )
+        };
+        if result != vk::Result::Success {
+            return false;
+        }
+        self.lighting_descriptor_pool = pool;
+        let set_layouts = [self.lighting_set_layout];
+        let alloc_info = vk::VkDescriptorSetAllocateInfo {
+            s_type: vk::StructureType::DescriptorSetAllocateInfo,
+            p_next: std::ptr::null(),
+            descriptor_pool: pool,
+            descriptor_set_count: 1,
+            p_set_layouts: set_layouts.as_ptr(),
+        };
+        let mut set = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_allocate_descriptor_sets.unwrap())(
+                self.device,
+                &alloc_info,
+                &mut set,
+            )
+        };
+        if result != vk::Result::Success {
+            return false;
+        }
+        self.lighting_descriptor_set = set;
+        true
+    }
+
+    /// The G-buffer's descriptor set writes: the camera block at binding 0
+    /// and the surface texture's combined sampler at binding 1.
+    fn write_gbuffer_descriptors(
+        &self,
+        set: vk::VkDescriptorSet,
+        camera_buffer: vk::VkBuffer,
+        image_view: Option<vk::VkImageView>,
+    ) {
+        let camera_info = vk::VkDescriptorBufferInfo {
+            buffer: camera_buffer,
+            offset: 0,
+            range: std::mem::size_of::<MeshUniform>() as u64,
+        };
+        let image_info = vk::VkDescriptorImageInfo {
+            sampler: self.mesh_sampler,
+            image_view: image_view.unwrap_or(std::ptr::null_mut()),
+            image_layout: vk::ImageLayout::ShaderReadOnlyOptimal,
+        };
+        let writes = [
+            vk::VkWriteDescriptorSet {
+                s_type: vk::StructureType::WriteDescriptorSet,
+                p_next: std::ptr::null(),
+                dst_set: set,
+                dst_binding: 0,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::UniformBuffer,
+                p_image_info: std::ptr::null(),
+                p_buffer_info: &camera_info,
+                p_texel_buffer_view: std::ptr::null(),
+            },
+            vk::VkWriteDescriptorSet {
+                s_type: vk::StructureType::WriteDescriptorSet,
+                p_next: std::ptr::null(),
+                dst_set: set,
+                dst_binding: 1,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                p_image_info: &image_info,
+                p_buffer_info: std::ptr::null(),
+                p_texel_buffer_view: std::ptr::null(),
+            },
+        ];
+        unsafe {
+            (self.loader.vk_update_descriptor_sets.unwrap())(
+                self.device,
+                2,
+                writes.as_ptr(),
+                0,
+                std::ptr::null(),
+            );
+        }
+    }
+
+    /// The lighting pass's descriptor set writes: the lights' block at
+    /// binding 0 and the three G-buffer attachments' combined samplers at
+    /// bindings 1-3 (the albedo, the normal, the world position).
+    fn write_lighting_descriptors(
+        &self,
+        set: vk::VkDescriptorSet,
+        lights_buffer: vk::VkBuffer,
+        albedo_view: vk::VkImageView,
+        normal_view: vk::VkImageView,
+        world_view: vk::VkImageView,
+    ) {
+        let lights_info = vk::VkDescriptorBufferInfo {
+            buffer: lights_buffer,
+            offset: 0,
+            range: LightsUniform::SIZE as u64,
+        };
+        let albedo_info = vk::VkDescriptorImageInfo {
+            sampler: self.mesh_sampler,
+            image_view: albedo_view,
+            image_layout: vk::ImageLayout::ShaderReadOnlyOptimal,
+        };
+        let normal_info = vk::VkDescriptorImageInfo {
+            sampler: self.mesh_sampler,
+            image_view: normal_view,
+            image_layout: vk::ImageLayout::ShaderReadOnlyOptimal,
+        };
+        let world_info = vk::VkDescriptorImageInfo {
+            sampler: self.mesh_sampler,
+            image_view: world_view,
+            image_layout: vk::ImageLayout::ShaderReadOnlyOptimal,
+        };
+        let writes = [
+            vk::VkWriteDescriptorSet {
+                s_type: vk::StructureType::WriteDescriptorSet,
+                p_next: std::ptr::null(),
+                dst_set: set,
+                dst_binding: 0,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::UniformBuffer,
+                p_image_info: std::ptr::null(),
+                p_buffer_info: &lights_info,
+                p_texel_buffer_view: std::ptr::null(),
+            },
+            vk::VkWriteDescriptorSet {
+                s_type: vk::StructureType::WriteDescriptorSet,
+                p_next: std::ptr::null(),
+                dst_set: set,
+                dst_binding: 1,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                p_image_info: &albedo_info,
+                p_buffer_info: std::ptr::null(),
+                p_texel_buffer_view: std::ptr::null(),
+            },
+            vk::VkWriteDescriptorSet {
+                s_type: vk::StructureType::WriteDescriptorSet,
+                p_next: std::ptr::null(),
+                dst_set: set,
+                dst_binding: 2,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                p_image_info: &normal_info,
+                p_buffer_info: std::ptr::null(),
+                p_texel_buffer_view: std::ptr::null(),
+            },
+            vk::VkWriteDescriptorSet {
+                s_type: vk::StructureType::WriteDescriptorSet,
+                p_next: std::ptr::null(),
+                dst_set: set,
+                dst_binding: 3,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                p_image_info: &world_info,
+                p_buffer_info: std::ptr::null(),
+                p_texel_buffer_view: std::ptr::null(),
+            },
+        ];
+        unsafe {
+            (self.loader.vk_update_descriptor_sets.unwrap())(
+                self.device,
+                4,
+                writes.as_ptr(),
+                0,
+                std::ptr::null(),
+            );
+        }
+    }
+
     /// The mesh's descriptor set writes: the camera block at binding 0 and
     /// the texture's combined image sampler at binding 1 (the default
     /// texture's view when no texture is bound).
@@ -3190,6 +4158,275 @@ impl VulkanBackend {
         }
         Ok(())
     }
+    /// The per-target render pass and framebuffer: the attachments the
+    /// desc's colour formats and depth flag carry, the load Clear (the
+    /// clear() the frame's first step runs), the store Store. The
+    /// three-attachment MRT desc (the G-buffer) builds against the
+    /// gbuffer_render_pass the pipeline creation registered; the single
+    /// attachment desc builds its own pass (the same rule the
+    /// pipeline's render_pass check follows).
+    fn create_target_pass_and_framebuffer(
+        &mut self,
+        desc: &RenderTargetDesc,
+        views: &[VulkanTexture2D],
+        depth_view: &Option<VulkanTexture2D>,
+    ) -> Result<(vk::VkRenderPass, vk::VkFramebuffer), RenderError> {
+        // The G-buffer's MRT desc: the three colour attachments and the
+        // depth attachment build against the shared gbuffer_render_pass
+        // (the same pass the gbuffer pipeline creation registers; the
+        // pipeline's render_pass check matches the framebuffer's pass).
+        let is_gbuffer = desc.color_attachment_count == 3
+            && desc.depth_attachment;
+        let render_pass = if is_gbuffer {
+            if self.gbuffer_render_pass.is_null() {
+                self.gbuffer_render_pass = self.create_gbuffer_render_pass()?;
+            }
+            self.gbuffer_render_pass
+        } else {
+            self.create_render_pass_for_format(desc)?
+        };
+        // The framebuffer: the target's views plus the depth view.
+        let mut attachments: Vec<vk::VkImageView> = views
+            .iter()
+            .map(|v| v.view)
+            .collect();
+        if let Some(depth) = depth_view {
+            attachments.push(depth.view);
+        }
+        let framebuffer_info = vk::VkFramebufferCreateInfo {
+            s_type: vk::StructureType::FramebufferCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            render_pass,
+            attachment_count: attachments.len() as u32,
+            p_attachments: attachments.as_ptr(),
+            width: desc.width,
+            height: desc.height,
+            layers: 1,
+        };
+        let mut framebuffer = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_framebuffer.unwrap())(
+                self.device,
+                &framebuffer_info,
+                std::ptr::null(),
+                &mut framebuffer,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "create_render_target: vkCreateFramebuffer failed",
+            ));
+        }
+        Ok((render_pass, framebuffer))
+    }
+
+    /// The G-buffer's render pass: three colour attachments (the albedo
+    /// Rgba8, the normal Rgba8, the world Rgba16F) plus the depth
+    /// attachment. The final layouts stay ColorAttachmentOptimal: the
+    /// lighting pass's shader-read handoff runs through the pipeline
+    /// barrier the submit_lighting_pass records (the same rule the
+    /// readback's layout table follows).
+    fn create_gbuffer_render_pass(
+        &mut self,
+    ) -> Result<vk::VkRenderPass, RenderError> {
+        let color_formats = [
+            vk::Format::R8g8b8a8Unorm,
+            vk::Format::R8g8b8a8Unorm,
+            vk::Format::R16g16b16a16Sfloat,
+        ];
+        let mut attachments: Vec<vk::VkAttachmentDescription> = Vec::new();
+        for format in color_formats.iter() {
+            attachments.push(vk::VkAttachmentDescription {
+                flags: 0,
+                format: *format as u32,
+                samples: vk::SampleCount::One,
+                load_op: vk::AttachmentLoadOp::Clear,
+                store_op: vk::AttachmentStoreOp::Store,
+                stencil_load_op: vk::AttachmentLoadOp::DontCare,
+                stencil_store_op: vk::AttachmentStoreOp::DontCare,
+                initial_layout: vk::ImageLayout::Undefined,
+                final_layout: vk::ImageLayout::ColorAttachmentOptimal,
+            });
+        }
+        attachments.push(vk::VkAttachmentDescription {
+            flags: 0,
+            format: self.depth_format as u32,
+            samples: vk::SampleCount::One,
+            load_op: vk::AttachmentLoadOp::Clear,
+            store_op: vk::AttachmentStoreOp::Store,
+            stencil_load_op: vk::AttachmentLoadOp::Clear,
+            stencil_store_op: vk::AttachmentStoreOp::DontCare,
+            initial_layout: vk::ImageLayout::Undefined,
+            final_layout: vk::ImageLayout::DepthStencilAttachmentOptimal,
+        });
+        let color_refs = [
+            vk::VkAttachmentReference {
+                attachment: 0,
+                layout: vk::ImageLayout::ColorAttachmentOptimal,
+            },
+            vk::VkAttachmentReference {
+                attachment: 1,
+                layout: vk::ImageLayout::ColorAttachmentOptimal,
+            },
+            vk::VkAttachmentReference {
+                attachment: 2,
+                layout: vk::ImageLayout::ColorAttachmentOptimal,
+            },
+        ];
+        let depth_ref = vk::VkAttachmentReference {
+            attachment: 3,
+            layout: vk::ImageLayout::DepthStencilAttachmentOptimal,
+        };
+        let subpass = vk::VkSubpassDescription {
+            flags: 0,
+            pipeline_bind_point: vk::PipelineBindPoint::Graphics,
+            input_attachment_count: 0,
+            p_input_attachments: std::ptr::null(),
+            color_attachment_count: 3,
+            p_color_attachments: color_refs.as_ptr(),
+            p_resolve_attachments: std::ptr::null(),
+            p_depth_stencil_attachment: &depth_ref,
+            preserve_attachment_count: 0,
+            p_preserve_attachments: std::ptr::null(),
+        };
+        // The external dependency: the geometry pass's colour writes
+        // finish before the lighting pass's shader reads (the same
+        // handoff the submit_lighting_pass's barrier records; the
+        // dependency keeps the pass boundary's implicit barrier honest).
+        let dependency = vk::VkSubpassDependency {
+            // VK_SUBPASS_EXTERNAL is the spec's all-ones value (the
+            // loader's constants stay the ones the declarations carry;
+            // the value stays the same).
+            src_subpass: u32::MAX,
+            dst_subpass: 0,
+            src_stage_mask: vk::PipelineStage::ColorAttachmentOutput as u32,
+            dst_stage_mask: vk::PipelineStage::ColorAttachmentOutput as u32
+                | vk::PipelineStage::EarlyFragmentTests as u32,
+            src_access_mask: vk::Access::ColorAttachmentWrite as u32,
+            dst_access_mask: vk::Access::ColorAttachmentRead as u32
+                | vk::Access::DepthStencilAttachmentRead as u32,
+            dependency_flags: 0,
+        };
+        let pass_info = vk::VkRenderPassCreateInfo {
+            s_type: vk::StructureType::RenderPassCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            attachment_count: attachments.len() as u32,
+            p_attachments: attachments.as_ptr(),
+            subpass_count: 1,
+            p_subpasses: &subpass,
+            dependency_count: 1,
+            p_dependencies: &dependency,
+        };
+        let mut pass = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_render_pass.unwrap())(
+                self.device,
+                &pass_info,
+                std::ptr::null(),
+                &mut pass,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "create_render_target: the G-buffer's vkCreateRenderPass \
+                 failed",
+            ));
+        }
+        Ok(pass)
+    }
+
+    /// The single-attachment desc's own render pass: the same shape the
+    /// default framebuffer's pass carries (one colour attachment of the
+    /// desc's format plus the depth attachment when the desc asks for
+    /// one), the clear load, the store.
+    fn create_render_pass_for_format(
+        &mut self,
+        desc: &RenderTargetDesc,
+    ) -> Result<vk::VkRenderPass, RenderError> {
+        let color = vk::VkAttachmentDescription {
+            flags: 0,
+            format: self.to_vk_format(desc.color_formats[0]) as u32,
+            samples: vk::SampleCount::One,
+            load_op: vk::AttachmentLoadOp::Clear,
+            store_op: vk::AttachmentStoreOp::Store,
+            stencil_load_op: vk::AttachmentLoadOp::DontCare,
+            stencil_store_op: vk::AttachmentStoreOp::DontCare,
+            initial_layout: vk::ImageLayout::Undefined,
+            final_layout: vk::ImageLayout::ColorAttachmentOptimal,
+        };
+        let color_ref = vk::VkAttachmentReference {
+            attachment: 0,
+            layout: vk::ImageLayout::ColorAttachmentOptimal,
+        };
+        let mut attachments: Vec<vk::VkAttachmentDescription> = vec![color];
+        let mut depth_ref: Option<vk::VkAttachmentReference> = None;
+        if desc.depth_attachment {
+            let depth = vk::VkAttachmentDescription {
+                flags: 0,
+                format: self.depth_format as u32,
+                samples: vk::SampleCount::One,
+                load_op: vk::AttachmentLoadOp::Clear,
+                store_op: vk::AttachmentStoreOp::Store,
+                stencil_load_op: vk::AttachmentLoadOp::Clear,
+                stencil_store_op: vk::AttachmentStoreOp::DontCare,
+                initial_layout: vk::ImageLayout::Undefined,
+                final_layout: vk::ImageLayout::DepthStencilAttachmentOptimal,
+            };
+            let depth_reference = vk::VkAttachmentReference {
+                attachment: 1,
+                layout: vk::ImageLayout::DepthStencilAttachmentOptimal,
+            };
+            attachments.push(depth);
+            depth_ref = Some(depth_reference);
+        }
+        let color_count = 1;
+        let _ = color_count;
+        let subpass = vk::VkSubpassDescription {
+            flags: 0,
+            pipeline_bind_point: vk::PipelineBindPoint::Graphics,
+            input_attachment_count: 0,
+            p_input_attachments: std::ptr::null(),
+            color_attachment_count: 1,
+            p_color_attachments: &color_ref,
+            p_resolve_attachments: std::ptr::null(),
+            p_depth_stencil_attachment: depth_ref
+                .as_ref()
+                .map(|r| r as *const _)
+                .unwrap_or(std::ptr::null()),
+            preserve_attachment_count: 0,
+            p_preserve_attachments: std::ptr::null(),
+        };
+        let pass_info = vk::VkRenderPassCreateInfo {
+            s_type: vk::StructureType::RenderPassCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            attachment_count: attachments.len() as u32,
+            p_attachments: attachments.as_ptr(),
+            subpass_count: 1,
+            p_subpasses: &subpass,
+            dependency_count: 0,
+            p_dependencies: std::ptr::null(),
+        };
+        let mut pass = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_render_pass.unwrap())(
+                self.device,
+                &pass_info,
+                std::ptr::null(),
+                &mut pass,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "create_render_target: vkCreateRenderPass failed",
+            ));
+        }
+        Ok(pass)
+    }
+
+
 }
 
 impl RenderBackend for VulkanBackend {
@@ -3533,6 +4770,420 @@ impl RenderBackend for VulkanBackend {
         self.draw_mesh_by_id(mesh_id, submission.model);
     }
 
+    /// The deferred lighting pass (M6): the two internal steps the
+    /// contract's submit_lighting_pass carries. Step one (the geometry
+    /// pass) opens the G-buffer target's render pass, binds the G-buffer
+    /// pipeline, writes the camera block and the bound texture's view,
+    /// draws the mesh and closes the pass; the colour attachments hand
+    /// off to the shader reads through the pipeline barrier the handoff
+    /// records. Step two (the lighting pass) writes the lights' block,
+    /// rewrites the three G-buffer attachments' samplers, opens the
+    /// default framebuffer's render pass, binds the lighting pipeline,
+    /// draws the fullscreen triangle (the three vertices the vertex
+    /// index generates) and closes the pass. The frame stays open across
+    /// the two steps (the same rule the generic draw path follows).
+    fn submit_lighting_pass(
+        &mut self,
+        submission: &DrawSubmission,
+        gbuffer: &RenderTarget,
+    ) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        for light in &submission.lights {
+            if light.validate().is_err() {
+                self.violations += 1;
+            }
+        }
+        let target_index = match self
+            .targets
+            .iter()
+            .position(|x| Arc::ptr_eq(&x.inner, &gbuffer.inner))
+        {
+            Some(index) => index,
+            None => {
+                // A foreign target is a protocol violation (the same rule
+                // the target handles follow).
+                self.violations += 1;
+                return;
+            }
+        };
+        if self.targets[target_index].released {
+            self.violations += 1;
+            return;
+        }
+        let mesh_id = submission.mesh.inner.lock().unwrap().id;
+        if self.meshes.get(mesh_id).map(|m| m.is_none()).unwrap_or(true) {
+            self.violations += 1;
+            return;
+        }
+        if !self.ensure_deferred_pipeline() {
+            return;
+        }
+        if self.command_buffer.is_null() || self.frame_open {
+            // The deferred pass runs inside the frame's open command
+            // buffer (the clear() the frame's first step runs opened it);
+            // a missing frame is a violation, an already-open frame is
+            // the frame the pass records into.
+            if self.command_buffer.is_null() {
+                self.violations += 1;
+                return;
+            }
+        }
+        // The lights' block: the same from_lights the forward path's
+        // block carries (the sun absent means the intensity zero; the
+        // point lights' four slots).
+        let default_sun = DirectionalLight {
+            direction: Vec3::new(0.0, -1.0, 0.0),
+            color: Vec3::new(0.0, 0.0, 0.0),
+            intensity: 0.0,
+        };
+        let sun = submission.sun.as_ref().unwrap_or(&default_sun);
+        let lights_block = LightsUniform::from_lights(sun, &submission.lights);
+        if !self.lighting_lights_map.is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &lights_block as *const LightsUniform as *const u8,
+                    self.lighting_lights_map as *mut u8,
+                    LightsUniform::SIZE,
+                );
+            }
+        }
+        // The camera block: the view-projection matrix from the set_camera
+        // state and the model matrix the submission carries.
+        let aspect = self.config.width as f32 / self.config.height as f32;
+        let camera = self.camera;
+        let view = Mat4::look_at(camera.eye, camera.target, camera.up);
+        let projection =
+            Mat4::perspective(camera.fov_y_rad, aspect, camera.near, camera.far);
+        let view_projection = projection.multiply(view);
+        let uniform = MeshUniform {
+            view_projection: view_projection.m,
+            model: submission.model.m,
+        };
+        if !self.gbuffer_camera_map.is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &uniform as *const MeshUniform as *const u8,
+                    self.gbuffer_camera_map as *mut u8,
+                    std::mem::size_of::<MeshUniform>(),
+                );
+            }
+        }
+        // The bound texture's view: the bind_texture state's index (the
+        // default texture's view when the None carries).
+        let bound_view = self
+            .bound_texture
+            .and_then(|i| self.textures_2d.get(i))
+            .filter(|t| !t.released)
+            .map(|t| t.view)
+            .or_else(|| self.default_texture.as_ref().map(|t| t.view));
+        if let Some(view) = bound_view {
+            self.write_mesh_texture_descriptor(
+                self.gbuffer_descriptor_set,
+                view,
+            );
+        }
+        // The lighting pass's three G-buffer attachments' samplers: the
+        // target's views (the albedo at 0, the normal at 1, the world
+        // position at 2).
+        {
+            let target = &self.targets[target_index];
+            let views: Vec<vk::VkImageView> = target
+                .views
+                .iter()
+                .take(3)
+                .map(|v| v.view)
+                .collect();
+            if views.len() == 3 {
+                let lights_buffer = self
+                    .lighting_lights_buffer
+                    .as_ref()
+                    .map(|r| r.handle)
+                    .unwrap_or(std::ptr::null_mut());
+                self.write_lighting_descriptors(
+                    self.lighting_descriptor_set,
+                    lights_buffer,
+                    views[0],
+                    views[1],
+                    views[2],
+                );
+            }
+        }
+        let (vertex_buffer, index_buffer, index_count) = {
+            let state = self.meshes[mesh_id].as_ref().unwrap();
+            (
+                state.vertex_buffer.handle,
+                state.index_buffer.handle,
+                state.index_count,
+            )
+        };
+        let target_pass = self.targets[target_index].render_pass;
+        let target_framebuffer = self.targets[target_index].framebuffer;
+        let command_buffer = self.command_buffer;
+        // ---- Step one: the geometry pass ----
+        // The default framebuffer's render pass the begin_frame opened
+        // (the clear's first step) closes: the two deferred passes record
+        // into the same frame's command buffer, and a render pass opens
+        // only after the previous one closes (the same rule the
+        // submit_frame's end follows).
+        if self.pass_open {
+            unsafe {
+                (self.loader.vk_cmd_end_render_pass.unwrap())(
+                    command_buffer,
+                );
+            }
+            self.pass_open = false;
+        }
+        // The G-buffer target's render pass opens with the clear values
+        // (the clear colour the target carries, the depth the clear state
+        // carries). The frame's command buffer stays open.
+        let mut clear_values = [
+            vk::VkClearValue {
+                color: [0.0, 0.0, 0.0, 0.0],
+            },
+            vk::VkClearValue {
+                color: [0.0, 0.0, 0.0, 0.0],
+            },
+            vk::VkClearValue {
+                color: [0.0, 0.0, 0.0, 0.0],
+            },
+            vk::VkClearValue {
+                depth_stencil: vk::VkClearDepthStencilValue {
+                    depth: 0.0,
+                    stencil: 0,
+                },
+            },
+        ];
+        let colour = self.clear_color;
+        clear_values[0].color = [
+            colour.r as f32 / 255.0,
+            colour.g as f32 / 255.0,
+            colour.b as f32 / 255.0,
+            colour.a as f32 / 255.0,
+        ];
+        clear_values[3].depth_stencil = vk::VkClearDepthStencilValue {
+            depth: self.clear_depth,
+            stencil: self.clear_stencil as u32,
+        };
+        let area = vk::VkRect2D {
+            offset: vk::VkOffset2D { x: 0, y: 0 },
+            extent: vk::VkExtent2D {
+                width: self.config.width,
+                height: self.config.height,
+            },
+        };
+        let pass_begin = vk::VkRenderPassBeginInfo {
+            s_type: vk::StructureType::RenderPassBeginInfo,
+            p_next: std::ptr::null(),
+            render_pass: target_pass,
+            framebuffer: target_framebuffer,
+            render_area: area,
+            clear_value_count: 4,
+            p_clear_values: clear_values.as_ptr(),
+        };
+        unsafe {
+            (self.loader.vk_cmd_begin_render_pass.unwrap())(
+                command_buffer,
+                &pass_begin,
+                0,
+            );
+        }
+        self.pass_open = true;
+        // The G-buffer pipeline binds and the mesh draws (the same body
+        // the draw_mesh_inner's record carries, with the gbuffer
+        // pipeline and the gbuffer descriptor set).
+        let viewports = [vk::VkViewport {
+            x: 0.0,
+            y: 0.0,
+            width: self.config.width as f32,
+            height: self.config.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+        let scissors = [vk::VkRect2D {
+            offset: vk::VkOffset2D { x: 0, y: 0 },
+            extent: vk::VkExtent2D {
+                width: self.config.width,
+                height: self.config.height,
+            },
+        }];
+        let offsets = [0u64];
+        let descriptor_sets = [self.gbuffer_descriptor_set];
+        unsafe {
+            (self.loader.vk_cmd_bind_pipeline.unwrap())(
+                command_buffer,
+                vk::PipelineBindPoint::Graphics,
+                self.gbuffer_pipeline,
+            );
+            (self.loader.vk_cmd_set_viewport.unwrap())(
+                command_buffer,
+                0,
+                1,
+                viewports.as_ptr(),
+            );
+            (self.loader.vk_cmd_set_scissor.unwrap())(
+                command_buffer,
+                0,
+                1,
+                scissors.as_ptr(),
+            );
+            (self.loader.vk_cmd_bind_descriptor_sets.unwrap())(
+                command_buffer,
+                vk::PipelineBindPoint::Graphics,
+                self.gbuffer_pipeline_layout,
+                0,
+                1,
+                descriptor_sets.as_ptr(),
+                0,
+                std::ptr::null(),
+            );
+            (self.loader.vk_cmd_bind_vertex_buffers.unwrap())(
+                command_buffer,
+                0,
+                1,
+                &vertex_buffer,
+                offsets.as_ptr(),
+            );
+            (self.loader.vk_cmd_bind_index_buffer.unwrap())(
+                command_buffer,
+                index_buffer,
+                0,
+                vk::IndexType::Uint32,
+            );
+            (self.loader.vk_cmd_draw_indexed.unwrap())(
+                command_buffer,
+                index_count,
+                1,
+                0,
+                0,
+                0,
+            );
+        }
+        // The geometry pass closes; the colour attachments hand off to
+        // the lighting pass's shader reads through the pipeline barrier
+        // (the three colour attachments' ColorAttachmentOptimal ->
+        // ShaderReadOnlyOptimal transition; the depth attachment stays
+        // DepthStencilAttachmentOptimal — the lighting pass's triangle
+        // never writes depth and the next frame's geometry pass opens
+        // the pass with the clear load op).
+        unsafe {
+            (self.loader.vk_cmd_end_render_pass.unwrap())(command_buffer);
+        }
+        self.pass_open = false;
+        let target_images: Vec<vk::VkImage> = self.targets[target_index]
+            .views
+            .iter()
+            .take(3)
+            .map(|v| v.image)
+            .collect();
+        for image in target_images.iter() {
+            self.transition_image_layout(
+                command_buffer,
+                *image,
+                vk::ImageAspect::Color as u32,
+                vk::ImageLayout::ColorAttachmentOptimal,
+                vk::ImageLayout::ShaderReadOnlyOptimal,
+            );
+        }
+        // ---- Step two: the lighting pass ----
+        // The default framebuffer's render pass opens (the same pass the
+        // begin_frame opens; the clear values land on the swap's present
+        // path).
+        let mut default_clear_values = [
+            vk::VkClearValue {
+                color: [0.0, 0.0, 0.0, 0.0],
+            },
+            vk::VkClearValue {
+                depth_stencil: vk::VkClearDepthStencilValue {
+                    depth: 0.0,
+                    stencil: 0,
+                },
+            },
+        ];
+        default_clear_values[0].color = [
+            colour.r as f32 / 255.0,
+            colour.g as f32 / 255.0,
+            colour.b as f32 / 255.0,
+            colour.a as f32 / 255.0,
+        ];
+        default_clear_values[1].depth_stencil = vk::VkClearDepthStencilValue {
+            depth: self.clear_depth,
+            stencil: self.clear_stencil as u32,
+        };
+        let default_pass_begin = vk::VkRenderPassBeginInfo {
+            s_type: vk::StructureType::RenderPassBeginInfo,
+            p_next: std::ptr::null(),
+            render_pass: self.render_pass,
+            framebuffer: self.framebuffer,
+            render_area: area,
+            clear_value_count: 2,
+            p_clear_values: default_clear_values.as_ptr(),
+        };
+        unsafe {
+            (self.loader.vk_cmd_begin_render_pass.unwrap())(
+                command_buffer,
+                &default_pass_begin,
+                0,
+            );
+        }
+        self.pass_open = true;
+        // The lighting pipeline binds and the fullscreen triangle draws
+        // (the three vertices the vertex index generates, no vertex
+        // buffer, no index buffer).
+        let descriptor_sets = [self.lighting_descriptor_set];
+        unsafe {
+            (self.loader.vk_cmd_bind_pipeline.unwrap())(
+                command_buffer,
+                vk::PipelineBindPoint::Graphics,
+                self.lighting_pipeline,
+            );
+            (self.loader.vk_cmd_set_viewport.unwrap())(
+                command_buffer,
+                0,
+                1,
+                viewports.as_ptr(),
+            );
+            (self.loader.vk_cmd_set_scissor.unwrap())(
+                command_buffer,
+                0,
+                1,
+                scissors.as_ptr(),
+            );
+            (self.loader.vk_cmd_bind_descriptor_sets.unwrap())(
+                command_buffer,
+                vk::PipelineBindPoint::Graphics,
+                self.lighting_pipeline_layout,
+                0,
+                1,
+                descriptor_sets.as_ptr(),
+                0,
+                std::ptr::null(),
+            );
+            (self.loader.vk_cmd_draw.unwrap())(command_buffer, 3, 1, 0, 0);
+        }
+        // The lighting pass closes. The frame stays open (the swap's
+        // present path closes and submits it; the same rule the generic
+        // draw path follows).
+        unsafe {
+            (self.loader.vk_cmd_end_render_pass.unwrap())(command_buffer);
+        }
+        self.pass_open = false;
+        // The G-buffer attachments hand back to ColorAttachmentOptimal:
+        // the next frame's geometry pass opens the pass with the clear
+        // load op (the same rule the readback's layout table follows).
+        for image in target_images.iter() {
+            self.transition_image_layout(
+                command_buffer,
+                *image,
+                vk::ImageAspect::Color as u32,
+                vk::ImageLayout::ShaderReadOnlyOptimal,
+                vk::ImageLayout::ColorAttachmentOptimal,
+            );
+        }
+    }
+
     fn create_render_target(
         &mut self,
         desc: &RenderTargetDesc,
@@ -3546,11 +5197,16 @@ impl RenderBackend for VulkanBackend {
         desc.validate()?;
         let mut views = Vec::new();
         for i in 0..desc.color_attachment_count as usize {
+            // The Sampled bit joins the colour attachment bit: the
+            // deferred lighting pass's samplers read the attachments (the
+            // descriptor's CombinedImageSampler requires the view's
+            // image to carry the Sampled bit — the same rule the
+            // render_target_texture's sampling handles follow).
             let (image, memory, view) = self.create_offscreen_image(
                 desc.width,
                 desc.height,
                 self.to_vk_format(desc.color_formats[i]),
-                vk::ImageUsage::ColorAttachment as u32,
+                vk::ImageUsage::ColorAttachment | vk::ImageUsage::Sampled,
             )?;
             views.push(VulkanTexture2D {
                 inner: Arc::new(Mutex::new(TextureViewInner {
@@ -3591,6 +5247,19 @@ impl RenderBackend for VulkanBackend {
         } else {
             None
         };
+        // The per-target render pass and framebuffer: the pipeline
+        // creation reads the pass the draw-time check compares (the
+        // pipeline's render_pass must match the framebuffer's pass). The
+        // pass's shape follows the desc: one colour attachment per
+        // desc entry plus the depth attachment when the desc asks for
+        // one. The three-attachment MRT desc (the G-buffer) builds
+        // against the gbuffer_render_pass the pipeline creation
+        // registers; the single-attachment desc builds its own pass.
+        let (target_pass, framebuffer) = self.create_target_pass_and_framebuffer(
+            desc,
+            &views,
+            &depth_view,
+        )?;
         let target = VulkanRenderTarget {
             inner: Arc::new(Mutex::new(RenderTargetInner {
                 width: desc.width,
@@ -3601,8 +5270,8 @@ impl RenderBackend for VulkanBackend {
             })),
             views,
             depth_view,
-            render_pass: std::ptr::null_mut(),
-            framebuffer: std::ptr::null_mut(),
+            render_pass: target_pass,
+            framebuffer,
             released: false,
         };
         let handle = RenderTarget {

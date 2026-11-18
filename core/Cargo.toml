@@ -55,11 +55,23 @@ name = "cube_lit"
 required-features = ["vulkan"]
 
 [[example]]
+name = "cube_deferred"
+required-features = ["vulkan"]
+
+[[example]]
 name = "cube_lit_gl"
 required-features = ["opengl"]
 
 [[example]]
+name = "cube_deferred_gl"
+required-features = ["opengl"]
+
+[[example]]
 name = "cube_lit_d3d12"
+required-features = ["d3d12"]
+
+[[example]]
+name = "cube_deferred_d3d12"
 required-features = ["d3d12"]
 
 [[example]]
@@ -68,6 +80,10 @@ required-features = ["d3d12"]
 
 [[example]]
 name = "cube_lit_mtl"
+required-features = ["metal"]
+
+[[example]]
+name = "cube_deferred_mtl"
 required-features = ["metal"]
 
 [[example]]

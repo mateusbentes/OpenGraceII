@@ -130,3 +130,115 @@ void main()
     fragColor = vec4(colour, 1.0);
 }
 ";
+
+/// The deferred geometry pass's vertex shader (M6): the same transform
+/// the lit path's vertex shader carries, writing the world position and
+/// the world-space normal for the G-buffer's attachments.
+pub const GBUFFER_VERTEX_SHADER: &str = r"
+#version 330 core
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec3 normal;
+layout(location = 2) in vec2 uv;
+uniform mat4 view_projection;
+uniform mat4 model;
+out vec3 v_normal;
+out vec2 v_uv;
+out vec3 v_world;
+void main()
+{
+    vec4 world = model * vec4(position, 1.0);
+    gl_Position = view_projection * world;
+    v_normal = mat3(model) * normal;
+    v_uv = uv;
+    v_world = world.xyz;
+}
+";
+
+/// The deferred geometry pass's fragment shader (M6): the three
+/// G-buffer writes — the albedo (its alpha at 0.0 marks geometry so the
+/// lighting pass can copy the background through), the 0.5-offset
+/// normal, and the world position (the Rgba16F attachment).
+pub const GBUFFER_FRAGMENT_SHADER: &str = r"
+#version 330 core
+in vec3 v_normal;
+in vec2 v_uv;
+in vec3 v_world;
+uniform sampler2D surface_texture;
+layout(location = 0) out vec4 outAlbedo;
+layout(location = 1) out vec4 outNormal;
+layout(location = 2) out vec4 outWorld;
+void main()
+{
+    vec4 base = texture(surface_texture, v_uv);
+    outAlbedo = vec4(base.rgb, 0.0);
+    outNormal = vec4(normalize(v_normal) * 0.5 + 0.5, 1.0);
+    outWorld = vec4(v_world, 1.0);
+}
+";
+
+/// The deferred lighting pass's vertex shader (M6): the fullscreen
+/// triangle from gl_VertexID (no vertex buffer, the same shape the
+/// Vulkan lighting vertex shader carries).
+pub const LIGHTING_VERTEX_SHADER: &str = r"
+#version 330 core
+out vec2 v_uv;
+void main()
+{
+    vec2 corner = vec2(float((gl_VertexID & 1) << 2) - 1.0,
+                       float((gl_VertexID & 2) << 1) - 1.0);
+    v_uv = corner * 0.5 + 0.5;
+    gl_Position = vec4(corner, 0.0, 1.0);
+}
+";
+
+/// The deferred lighting pass's fragment shader (M6): the same
+/// Blinn-Phong shading the forward path carries, sampling the G-buffer's
+/// three attachments (the background pixels copy through the albedo's
+/// alpha-at-0 mark).
+pub const LIGHTING_FRAGMENT_SHADER: &str = r"
+#version 330 core
+in vec2 v_uv;
+uniform sampler2D gbuffer_albedo;
+uniform sampler2D gbuffer_normal;
+uniform sampler2D gbuffer_world;
+uniform vec4 sun_direction;
+uniform vec4 sun_color_intensity;
+uniform vec4 point_position_radius[4];
+uniform vec4 point_color_intensity[4];
+uniform vec4 params;
+out vec4 fragColor;
+void main()
+{
+    vec4 albedo = texture(gbuffer_albedo, v_uv);
+    if (albedo.a != 0.0) {
+        // The background: the G-buffer's clear colour passes through.
+        fragColor = albedo;
+        return;
+    }
+    vec3 normal = normalize(texture(gbuffer_normal, v_uv).rgb * 2.0 - 1.0);
+    vec3 world = texture(gbuffer_world, v_uv).rgb;
+    vec3 base = albedo.rgb;
+    vec3 sun_dir = normalize(-sun_direction.xyz);
+    float sun_diffuse = max(dot(normal, sun_dir), 0.0);
+    vec3 colour = base * sun_color_intensity.rgb
+        * sun_color_intensity.a * sun_diffuse;
+    for (int i = 0; i < 4; i++) {
+        if (float(i) >= params.x) {
+            break;
+        }
+        vec3 to_light = point_position_radius[i].xyz - world;
+        float dist = length(to_light);
+        to_light /= dist;
+        float radius = point_position_radius[i].w;
+        float window = 1.0 - (dist / radius) * (dist / radius);
+        float attenuation = window * window / (1.0 + dist * dist);
+        if (dist >= radius) {
+            attenuation = 0.0;
+        }
+        float diffuse = max(dot(normal, to_light), 0.0);
+        colour += base * point_color_intensity[i].rgb
+            * point_color_intensity[i].a * attenuation * diffuse;
+    }
+    fragColor = vec4(colour, 1.0);
+}
+";

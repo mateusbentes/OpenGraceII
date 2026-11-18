@@ -280,6 +280,16 @@ pub struct MetalBackend {
     lit_error: String,
     lit_lights_buffer: *mut c_void,
     lit_block: LightsUniform,
+    // The deferred path's state (M6): the two pipelines (the G-buffer's
+    // three-attachment pipeline and the lighting pass's single-attachment
+    // one) and the lights' shared buffer the lighting pass writes. The
+    // depth/stencil state and the sampler are the mesh path's own (the
+    // deferred pipelines share them).
+    gbuffer_pipeline: super::mtl_loader::MtlRenderPipelineStateHandle,
+    lighting_pipeline: super::mtl_loader::MtlRenderPipelineStateHandle,
+    lighting_lights_buffer: *mut c_void,
+    deferred_ready: bool,
+    deferred_error: String,
     /// The default texture's index into `textures_2d` (the 1x1 white
     /// texture the setup created; the draws fall back to it when no
     /// texture is bound) and the bound texture's index (the
@@ -375,6 +385,11 @@ impl MetalBackend {
             lit_error: String::new(),
             lit_lights_buffer: std::ptr::null_mut(),
             lit_block: LightsUniform::none(),
+            gbuffer_pipeline: std::ptr::null_mut(),
+            lighting_pipeline: std::ptr::null_mut(),
+            lighting_lights_buffer: std::ptr::null_mut(),
+            deferred_ready: false,
+            deferred_error: String::new(),
             default_texture: None,
             bound_texture: None,
             readback_queue: Vec::new(),
@@ -1239,6 +1254,323 @@ impl MetalBackend {
         self.lit_ready = true;
         true
     }
+    /// The deferred path's two pipelines (M6): the G-buffer's
+    /// three-attachment pipeline (the same PNU vertex descriptor the mesh
+    /// path carries, the depth test on) and the lighting pass's
+    /// single-attachment pipeline (no vertex descriptor, the depth test
+    /// off — the lighting pass's fullscreen triangle covers the frame).
+    /// The depth/stencil state and the sampler are the mesh path's own
+    /// (the lazy create the mesh path's first upload ran).
+    fn ensure_deferred_resources(&mut self) -> bool {
+        if self.deferred_ready {
+            return true;
+        }
+        // The G-buffer pipeline: the two MSL libraries compile (the same
+        // compile shape the lit path carries), the vertex descriptor
+        // carries the PNU attributes (the same three attributes the mesh
+        // path carries), the colour attachments are the three formats the
+        // G-buffer target carries (albedo Rgba8, normal Rgba8, world
+        // Rgba16F), the depth test on.
+        let gbuffer_vertex_library = match self.compile_stage(
+            super::shader_library::GBUFFER_VERTEX_SHADER,
+            "the gbuffer vertex stage's library",
+        ) {
+            Ok(library) => library,
+            Err(message) => {
+                self.deferred_error = message;
+                return false;
+            }
+        };
+        let gbuffer_vertex_function = match self.new_function(
+            gbuffer_vertex_library,
+            "gbufferVertexMain",
+        ) {
+            Some(function) => function,
+            None => {
+                self.deferred_error =
+                    "gbufferVertexMain lookup failed".to_string();
+                return false;
+            }
+        };
+        let gbuffer_fragment_library = match self.compile_stage(
+            super::shader_library::GBUFFER_FRAGMENT_SHADER,
+            "the gbuffer fragment stage's library",
+        ) {
+            Ok(library) => library,
+            Err(message) => {
+                self.deferred_error = message;
+                return false;
+            }
+        };
+        let gbuffer_fragment_function = match self.new_function(
+            gbuffer_fragment_library,
+            "gbufferFragmentMain",
+        ) {
+            Some(function) => function,
+            None => {
+                self.deferred_error =
+                    "gbufferFragmentMain lookup failed".to_string();
+                return false;
+            }
+        };
+        let gbuffer_descriptor = unsafe {
+            self.loader
+                .alloc_init(self.loader.cls_mtl_render_pipeline_descriptor)
+        };
+        if gbuffer_descriptor.is_null() {
+            self.deferred_error =
+                "the gbuffer pipeline descriptor alloc failed".to_string();
+            return false;
+        }
+        unsafe {
+            // The same three attributes the mesh path carries (position,
+            // normal, uv at buffer index 1).
+            let vertex_descriptor = self.loader.alloc_init(
+                self.loader.cls_mtl_vertex_descriptor,
+            );
+            let attributes = self.loader.send0(
+                vertex_descriptor,
+                self.loader.sel("attributes"),
+            );
+            let layouts = self.loader.send0(
+                vertex_descriptor,
+                self.loader.sel("layouts"),
+            );
+            for (index, (format, offset)) in [
+                (MTLVF_FLOAT3, 0usize),
+                (MTLVF_FLOAT3, 12usize),
+                (MTLVF_FLOAT2, 24usize),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let attribute = self.loader.send_ul_ret_ptr(
+                    attributes,
+                    self.loader.sel("objectAtIndexedSubscript:"),
+                    index as super::mtl_loader::NsUInteger,
+                );
+                self.loader.send_void_ul(
+                    attribute,
+                    self.loader.sel("setFormat:"),
+                    *format,
+                );
+                self.loader.send_void_ul(
+                    attribute,
+                    self.loader.sel("setBufferIndex:"),
+                    1,
+                );
+                self.loader.send_void_ul(
+                    attribute,
+                    self.loader.sel("setOffset:"),
+                    *offset as super::mtl_loader::NsUInteger,
+                );
+            }
+            let layout_1 = self.loader.send_ul_ret_ptr(
+                layouts,
+                self.loader.sel("objectAtIndexedSubscript:"),
+                1,
+            );
+            self.loader.send_void_ul(
+                layout_1,
+                self.loader.sel("setStride:"),
+                32,
+            );
+            self.loader.send_void_ul(
+                layout_1,
+                self.loader.sel("setStepFunction:"),
+                MTLSF_PER_VERTEX,
+            );
+            self.loader.send_void_ptr(
+                gbuffer_descriptor,
+                self.loader.sel("setVertexDescriptor:"),
+                vertex_descriptor,
+            );
+            // The three colour attachments: the G-buffer's albedo,
+            // normal and world position formats.
+            let colour_attachments = self.loader.send0(
+                gbuffer_descriptor,
+                self.loader.sel("colorAttachments"),
+            );
+            for (index, format) in [
+                MTLPX_RGBA8_UNORM,
+                MTLPX_RGBA8_UNORM,
+                MTLPX_RGBA16_FLOAT,
+            ]
+            .iter()
+            .enumerate()
+            {
+                let attachment = self.loader.send_ul_ret_ptr(
+                    colour_attachments,
+                    self.loader.sel("objectAtIndexedSubscript:"),
+                    index as super::mtl_loader::NsUInteger,
+                );
+                self.loader.send_void_ul(
+                    attachment,
+                    self.loader.sel("setPixelFormat:"),
+                    *format,
+                );
+            }
+            self.loader.send_void_ul(
+                gbuffer_descriptor,
+                self.loader.sel("setDepthAttachmentPixelFormat:"),
+                self.depth_format,
+            );
+            self.loader.send_void_ul(
+                gbuffer_descriptor,
+                self.loader.sel("setStencilAttachmentPixelFormat:"),
+                self.depth_format,
+            );
+            self.loader.send_void_ptr(
+                gbuffer_descriptor,
+                self.loader.sel("setVertexFunction:"),
+                gbuffer_vertex_function,
+            );
+            self.loader.send_void_ptr(
+                gbuffer_descriptor,
+                self.loader.sel("setFragmentFunction:"),
+                gbuffer_fragment_function,
+            );
+        }
+        let gbuffer_pipeline = unsafe {
+            let mut pipeline_error: *mut c_void = std::ptr::null_mut();
+            let pipeline = self.loader.send_ptr_arg2(
+                self.device,
+                self.loader
+                    .sel("newRenderPipelineStateWithDescriptor:error:"),
+                gbuffer_descriptor,
+                &mut pipeline_error as *mut *mut c_void as *mut c_void,
+            );
+            if pipeline.is_null() {
+                self.deferred_error = if pipeline_error.is_null() {
+                    "the gbuffer pipeline state creation returned nil"
+                        .to_string()
+                } else {
+                    self.ns_error_text(pipeline_error)
+                };
+                return false;
+            }
+            pipeline
+        };
+        // The lighting pipeline: the two MSL libraries compile, no vertex
+        // descriptor (the fullscreen triangle the vertex id generates),
+        // one colour attachment (the default framebuffer's Rgba8), no
+        // depth attachment (the depth test off).
+        let lighting_vertex_library = match self.compile_stage(
+            super::shader_library::LIGHTING_VERTEX_SHADER,
+            "the lighting vertex stage's library",
+        ) {
+            Ok(library) => library,
+            Err(message) => {
+                self.deferred_error = message;
+                return false;
+            }
+        };
+        let lighting_vertex_function = match self.new_function(
+            lighting_vertex_library,
+            "lightingVertexMain",
+        ) {
+            Some(function) => function,
+            None => {
+                self.deferred_error =
+                    "lightingVertexMain lookup failed".to_string();
+                return false;
+            }
+        };
+        let lighting_fragment_library = match self.compile_stage(
+            super::shader_library::LIGHTING_FRAGMENT_SHADER,
+            "the lighting fragment stage's library",
+        ) {
+            Ok(library) => library,
+            Err(message) => {
+                self.deferred_error = message;
+                return false;
+            }
+        };
+        let lighting_fragment_function = match self.new_function(
+            lighting_fragment_library,
+            "lightingFragmentMain",
+        ) {
+            Some(function) => function,
+            None => {
+                self.deferred_error =
+                    "lightingFragmentMain lookup failed".to_string();
+                return false;
+            }
+        };
+        let lighting_descriptor = unsafe {
+            self.loader
+                .alloc_init(self.loader.cls_mtl_render_pipeline_descriptor)
+        };
+        if lighting_descriptor.is_null() {
+            self.deferred_error =
+                "the lighting pipeline descriptor alloc failed".to_string();
+            return false;
+        }
+        unsafe {
+            // One colour attachment (the default framebuffer's Rgba8),
+            // no depth attachment (the depth test off — the lighting
+            // pass's triangle covers the frame and the depth attachment
+            // stays untouched).
+            let colour_attachments = self.loader.send0(
+                lighting_descriptor,
+                self.loader.sel("colorAttachments"),
+            );
+            let attachment_0 = self.loader.send_ul_ret_ptr(
+                colour_attachments,
+                self.loader.sel("objectAtIndexedSubscript:"),
+                0,
+            );
+            self.loader.send_void_ul(
+                attachment_0,
+                self.loader.sel("setPixelFormat:"),
+                MTLPX_RGBA8_UNORM,
+            );
+            self.loader.send_void_ptr(
+                lighting_descriptor,
+                self.loader.sel("setVertexFunction:"),
+                lighting_vertex_function,
+            );
+            self.loader.send_void_ptr(
+                lighting_descriptor,
+                self.loader.sel("setFragmentFunction:"),
+                lighting_fragment_function,
+            );
+        }
+        let lighting_pipeline = unsafe {
+            let mut pipeline_error: *mut c_void = std::ptr::null_mut();
+            let pipeline = self.loader.send_ptr_arg2(
+                self.device,
+                self.loader
+                    .sel("newRenderPipelineStateWithDescriptor:error:"),
+                lighting_descriptor,
+                &mut pipeline_error as *mut *mut c_void as *mut c_void,
+            );
+            if pipeline.is_null() {
+                self.deferred_error = if pipeline_error.is_null() {
+                    "the lighting pipeline state creation returned nil"
+                        .to_string()
+                } else {
+                    self.ns_error_text(pipeline_error)
+                };
+                return false;
+            }
+            pipeline
+        };
+        // The lights' shared buffer (one 256-byte block the lighting
+        // pass writes and the fragment stage's [[buffer(1)]] reads).
+        let lights_buffer = self.create_shared_buffer(&[0u8; 256]);
+        if lights_buffer.is_null() {
+            self.deferred_error =
+                "the lighting lights buffer could not be allocated"
+                    .to_string();
+            return false;
+        }
+        self.gbuffer_pipeline = gbuffer_pipeline;
+        self.lighting_pipeline = lighting_pipeline;
+        self.lighting_lights_buffer = lights_buffer;
+        self.deferred_ready = true;
+        true
+    }
 
     /// The diagnostic triangle's pipeline: the MSL library compiles, the
     /// vertex descriptor carries the Float3 attribute, the colour
@@ -2012,6 +2344,133 @@ impl MetalBackend {
             );
             self.loader.send_void(encoder, self.loader.sel("endEncoding"));
         }
+    }
+    /// The G-buffer pass's render pass descriptor: the target's three
+    /// colour attachments (the MRT order the G-buffer's shaders carry)
+    /// plus the depth/stencil attachment, each with the CLEAR load action
+    /// (the geometry pass's own clear — the same rule the Vulkan
+    /// gbuffer_render_pass's clear values carry).
+    fn gbuffer_pass_descriptor(&mut self, target_index: usize) -> *mut c_void {
+        let pass_descriptor = unsafe {
+            self.loader.alloc_init(
+                self.loader.cls_mtl_render_pass_descriptor,
+            )
+        };
+        if pass_descriptor.is_null() {
+            self.violations += 1;
+            return std::ptr::null_mut();
+        }
+        let colour_attachments = unsafe {
+            self.loader.send0(
+                pass_descriptor,
+                self.loader.sel("colorAttachments"),
+            )
+        };
+        let depth_attachment = unsafe {
+            self.loader.send0(
+                pass_descriptor,
+                self.loader.sel("depthAttachment"),
+            )
+        };
+        let stencil_attachment = unsafe {
+            self.loader.send0(
+                pass_descriptor,
+                self.loader.sel("stencilAttachment"),
+            )
+        };
+        let depth_texture = self.targets[target_index]
+            .depth_view
+            .as_ref()
+            .map(|d| d.texture)
+            .unwrap_or(std::ptr::null_mut());
+        let colour = self.clear_color;
+        let clear = MtlClearColor {
+            red: colour.r as f64 / 255.0,
+            green: colour.g as f64 / 255.0,
+            blue: colour.b as f64 / 255.0,
+            alpha: colour.a as f64 / 255.0,
+        };
+        for (index, view) in self.targets[target_index].views.iter().enumerate()
+        {
+            let attachment = unsafe {
+                self.loader.send_ul_ret_ptr(
+                    colour_attachments,
+                    self.loader.sel("objectAtIndexedSubscript:"),
+                    index as super::mtl_loader::NsUInteger,
+                )
+            };
+            if attachment.is_null() {
+                self.violations += 1;
+                return std::ptr::null_mut();
+            }
+            unsafe {
+                self.loader.send_void_ptr(
+                    attachment,
+                    self.loader.sel("setTexture:"),
+                    view.texture,
+                );
+                self.loader.send_void_clear_color(
+                    attachment,
+                    self.loader.sel("setClearColor:"),
+                    clear,
+                );
+                self.loader.send_void_ul(
+                    attachment,
+                    self.loader.sel("setLoadAction:"),
+                    MTLLA_CLEAR,
+                );
+                self.loader.send_void_ul(
+                    attachment,
+                    self.loader.sel("setStoreAction:"),
+                    MTLSA_STORE,
+                );
+            }
+        }
+        if !depth_texture.is_null() {
+            unsafe {
+                self.loader.send_void_ptr(
+                    depth_attachment,
+                    self.loader.sel("setTexture:"),
+                    depth_texture,
+                );
+                self.loader.send_void_double(
+                    depth_attachment,
+                    self.loader.sel("setClearDepth:"),
+                    self.clear_depth as f64,
+                );
+                self.loader.send_void_ul(
+                    depth_attachment,
+                    self.loader.sel("setLoadAction:"),
+                    MTLLA_CLEAR,
+                );
+                self.loader.send_void_ul(
+                    depth_attachment,
+                    self.loader.sel("setStoreAction:"),
+                    MTLSA_STORE,
+                );
+                self.loader.send_void_ptr(
+                    stencil_attachment,
+                    self.loader.sel("setTexture:"),
+                    depth_texture,
+                );
+                self.loader.send_void_ul(
+                    stencil_attachment,
+                    self.loader.sel("setClearStencil:"),
+                    self.clear_stencil as super::mtl_loader::NsUInteger,
+                );
+                self.loader.send_void_ul(
+                    stencil_attachment,
+                    self.loader.sel("setLoadAction:"),
+                    MTLLA_CLEAR,
+                );
+                self.loader.send_void_ul(
+                    stencil_attachment,
+                    self.loader.sel("setStoreAction:"),
+                    MTLSA_STORE,
+                );
+            }
+        }
+        pass_descriptor
     }
 
     /// The readback's one pixel: the blit command encoder copies the
@@ -2888,5 +3347,321 @@ impl RenderBackend for MetalBackend {
 
     fn center_stencil(&self) -> i32 {
         self.center_stencil
+    }
+
+    /// The deferred lighting pass (M6): the two internal steps the
+    /// contract's submit_lighting_pass carries. Step one (the geometry
+    /// pass) opens the G-buffer target's pass descriptor (the three
+    /// colour attachments plus the depth attachment, each with the clear
+    /// load action), binds the G-buffer pipeline and draws the mesh. Step
+    /// two (the lighting pass) opens the default framebuffer's pass
+    /// descriptor (the load action LOAD keeps the clear's pixels), binds
+    /// the lighting pipeline and draws the fullscreen triangle. The two
+    /// passes record into the same frame's command buffer (the same rule
+    /// the mesh draw path follows: each pass's load action keeps the
+    /// previous pass's output).
+    fn submit_lighting_pass(
+        &mut self,
+        submission: &DrawSubmission,
+        gbuffer: &RenderTarget,
+    ) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        for light in &submission.lights {
+            if light.validate().is_err() {
+                self.violations += 1;
+            }
+        }
+        let target_index = match self
+            .targets
+            .iter()
+            .position(|x| Arc::ptr_eq(&x.inner, &gbuffer.inner))
+        {
+            Some(index) => index,
+            None => {
+                // A foreign target is a protocol violation (the same rule
+                // the target handles follow).
+                self.violations += 1;
+                return;
+            }
+        };
+        if self.targets[target_index].released {
+            self.violations += 1;
+            return;
+        }
+        let mesh_id = submission.mesh.inner.lock().unwrap().id;
+        if mesh_id >= self.meshes.len() || self.meshes[mesh_id].is_none() {
+            self.violations += 1;
+            return;
+        }
+        if !self.mesh_ready || !self.ensure_deferred_resources() {
+            return;
+        }
+        if !self.frame_open {
+            // The deferred pass runs inside the frame's open command
+            // buffer (the clear() the frame's first step runs opened it);
+            // a missing frame is a violation.
+            self.violations += 1;
+            return;
+        }
+        // The lights' block: the same from_lights the forward path's
+        // block carries (the sun absent means the intensity zero; the
+        // point lights' four slots).
+        let default_sun = DirectionalLight {
+            direction: Vec3::new(0.0, -1.0, 0.0),
+            color: Vec3::new(0.0, 0.0, 0.0),
+            intensity: 0.0,
+        };
+        let sun = submission.sun.as_ref().unwrap_or(&default_sun);
+        let lights_block = LightsUniform::from_lights(sun, &submission.lights);
+        if !self.lighting_lights_buffer.is_null() {
+            let contents = unsafe {
+                self.loader.send0(
+                    self.lighting_lights_buffer,
+                    self.loader.sel("contents"),
+                )
+            };
+            if !contents.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &lights_block as *const LightsUniform as *const u8,
+                        contents as *mut u8,
+                        std::mem::size_of::<LightsUniform>(),
+                    );
+                }
+            }
+        }
+        // The camera block: the view-projection matrix from the
+        // set_camera state and the model matrix the submission carries
+        // (the same bytes the mesh path's uniform buffer carries).
+        let uniform = self.build_mesh_uniform(submission.model);
+        let mesh_state = self.meshes[mesh_id].as_ref().unwrap();
+        let uniform_bytes = mesh_state.uniform_buffer;
+        let contents = unsafe {
+            self.loader.send0(uniform_bytes, self.loader.sel("contents"))
+        };
+        if contents.is_null() {
+            self.violations += 1;
+            return;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                uniform.as_ptr(),
+                contents as *mut u8,
+                uniform.len(),
+            );
+        }
+        let (vertex_buffer, index_buffer, index_count) = (
+            mesh_state.vertex_buffer,
+            mesh_state.index_buffer,
+            mesh_state.index_count,
+        );
+        let depth_state = self
+            .mesh_resources
+            .as_ref()
+            .map(|r| r.depth_state)
+            .unwrap_or(std::ptr::null_mut());
+        let sampler = self
+            .mesh_resources
+            .as_ref()
+            .map(|r| r.sampler)
+            .unwrap_or(std::ptr::null_mut());
+        let texture = self
+            .bound_texture
+            .and_then(|i| self.textures_2d.get(i))
+            .filter(|t| !t.released)
+            .map(|t| t.texture)
+            .or_else(|| {
+                self.default_texture
+                    .and_then(|i| self.textures_2d.get(i))
+                    .filter(|t| !t.released)
+                    .map(|t| t.texture)
+            });
+        let texture = match texture {
+            Some(texture) => texture,
+            None => {
+                self.violations += 1;
+                return;
+            }
+        };
+        let command_buffer = self.frame_command_buffer;
+        let gbuffer_pipeline = self.gbuffer_pipeline;
+        let lighting_pipeline = self.lighting_pipeline;
+        let lights_buffer = self.lighting_lights_buffer;
+        let gbuffer_views: Vec<_> = {
+            let target = &self.targets[target_index];
+            let views: Vec<_> = target
+                .views
+                .iter()
+                .take(3)
+                .map(|v| v.texture)
+                .collect();
+            views
+        };
+        if gbuffer_views.len() != 3 {
+            self.violations += 1;
+            return;
+        }
+        // ---- Step one: the geometry pass ----
+        let pass_descriptor = self.gbuffer_pass_descriptor(target_index);
+        if pass_descriptor.is_null() {
+            return;
+        }
+        let encoder = unsafe {
+            self.loader.send_ptr_arg(
+                command_buffer,
+                self.loader.sel("renderCommandEncoderWithDescriptor:"),
+                pass_descriptor,
+            )
+        };
+        if encoder.is_null() {
+            self.violations += 1;
+            return;
+        }
+        unsafe {
+            // The G-buffer pipeline and the mesh path's depth/stencil
+            // state (the depth test on).
+            self.loader.send_void_ptr(
+                encoder,
+                self.loader.sel("setRenderPipelineState:"),
+                gbuffer_pipeline,
+            );
+            self.loader.send_void_ptr(
+                encoder,
+                self.loader.sel("setDepthStencilState:"),
+                depth_state,
+            );
+            // The camera block at the vertex stage's buffer index 0 (the
+            // gbuffer vertex shader's `buffer(0)` qualifier).
+            self.loader.send_void_ptr_ul2(
+                encoder,
+                self.loader.sel("setVertexBuffer:offset:atIndex:"),
+                uniform_bytes,
+                0,
+                0,
+            );
+            // The vertex buffer at buffer index 1 (the vertex
+            // descriptor's attributes point there).
+            self.loader.send_void_ptr_ul2(
+                encoder,
+                self.loader.sel("setVertexBuffer:offset:atIndex:"),
+                vertex_buffer,
+                0,
+                1,
+            );
+            // The bound texture and the sampler at the fragment stage's
+            // slot 0 (the gbuffer fragment shader's `texture(0)` and
+            // `sampler(0)` qualifiers).
+            self.loader.send_void_ptr_ul(
+                encoder,
+                self.loader.sel("setFragmentTexture:atIndex:"),
+                texture,
+                0,
+            );
+            self.loader.send_void_ptr_ul(
+                encoder,
+                self.loader.sel("setFragmentSamplerState:atIndex:"),
+                sampler,
+                0,
+            );
+            // The indexed draw: the same call the mesh path carries.
+            self.loader.send_void_ul3_ptr_ul(
+                encoder,
+                self.loader.sel(
+                    "drawIndexedPrimitives:indexCount:indexType:\
+                     indexBuffer:indexBufferOffset:",
+                ),
+                MTLPT_TRIANGLE,
+                index_count as super::mtl_loader::NsUInteger,
+                MTLIT_UINT32,
+                index_buffer,
+                0,
+            );
+            self.loader.send_void(encoder, self.loader.sel("endEncoding"));
+        }
+        // ---- Step two: the lighting pass ----
+        // The default framebuffer's pass descriptor: the LOAD load action
+        // keeps the clear's pixels (the same rule the mesh pass
+        // descriptor's descriptor records).
+        let lighting_pass_descriptor = self.mesh_pass_descriptor();
+        if lighting_pass_descriptor.is_null() {
+            return;
+        }
+        let lighting_encoder = unsafe {
+            self.loader.send_ptr_arg(
+                command_buffer,
+                self.loader.sel("renderCommandEncoderWithDescriptor:"),
+                lighting_pass_descriptor,
+            )
+        };
+        if lighting_encoder.is_null() {
+            self.violations += 1;
+            return;
+        }
+        unsafe {
+            // The lighting pipeline binds; no depth/stencil state (the
+            // depth test off — the lighting pass's triangle covers the
+            // frame and the depth attachment stays untouched).
+            self.loader.send_void_ptr(
+                lighting_encoder,
+                self.loader.sel("setRenderPipelineState:"),
+                lighting_pipeline,
+            );
+            // The lights' buffer at the fragment stage's buffer index 1
+            // (the lighting fragment shader's `buffer(1)` qualifier).
+            self.loader.send_void_ptr_ul2(
+                lighting_encoder,
+                self.loader.sel("setFragmentBuffer:offset:atIndex:"),
+                lights_buffer,
+                0,
+                1,
+            );
+            // The three G-buffer attachments' textures at the fragment
+            // stage's slots 0, 1 and 2 (the albedo, the normal, the world
+            // position — the lighting fragment shader's `texture(0)`,
+            // `texture(1)` and `texture(2)` qualifiers).
+            self.loader.send_void_ptr_ul(
+                lighting_encoder,
+                self.loader.sel("setFragmentTexture:atIndex:"),
+                gbuffer_views[0],
+                0,
+            );
+            self.loader.send_void_ptr_ul(
+                lighting_encoder,
+                self.loader.sel("setFragmentTexture:atIndex:"),
+                gbuffer_views[1],
+                1,
+            );
+            self.loader.send_void_ptr_ul(
+                lighting_encoder,
+                self.loader.sel("setFragmentTexture:atIndex:"),
+                gbuffer_views[2],
+                2,
+            );
+            // The sampler at the fragment stage's slot 0 (the lighting
+            // fragment shader's `sampler(0)` qualifier).
+            self.loader.send_void_ptr_ul(
+                lighting_encoder,
+                self.loader.sel("setFragmentSamplerState:atIndex:"),
+                sampler,
+                0,
+            );
+            // The fullscreen triangle: the three vertices the vertex id
+            // generates (no vertex buffer, no index buffer).
+            self.loader.send_void_ul3(
+                lighting_encoder,
+                self.loader
+                    .sel("drawPrimitives:vertexStart:vertexCount:"),
+                MTLPT_TRIANGLE,
+                0,
+                3,
+            );
+            self.loader.send_void(
+                lighting_encoder,
+                self.loader.sel("endEncoding"),
+            );
+        }
     }
 }

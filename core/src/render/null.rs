@@ -21,6 +21,7 @@ pub enum NullEvent {
     CreateRenderTarget,
     BeginRenderPass,
     EndRenderPass,
+    SubmitLightingPass,
     ReleaseRenderTarget,
     BindTexture,
     CreateTexture2D,
@@ -329,6 +330,36 @@ impl RenderBackend for NullRenderBackend {
                     self.violations += 1;
                 }
             }
+        }
+    }
+
+    fn submit_lighting_pass(
+        &mut self,
+        submission: &DrawSubmission,
+        gbuffer: &RenderTarget,
+    ) {
+        self.record(NullEvent::SubmitLightingPass);
+        if self.require_ready("submit_lighting_pass") {
+            // The G-buffer must be a target this backend owns and has not
+            // released: sampling a foreign or released target is a protocol
+            // violation (the same rule the target handles follow).
+            match self.find_target_index(gbuffer) {
+                Some(index) => {
+                    if self.targets[index].released {
+                        self.violations += 1;
+                    }
+                }
+                None => {
+                    self.violations += 1;
+                }
+            }
+            for light in &submission.lights {
+                if light.validate().is_err() {
+                    self.violations += 1;
+                }
+            }
+            let _ = &submission.sun;
+            let _ = &submission.mesh;
         }
     }
 

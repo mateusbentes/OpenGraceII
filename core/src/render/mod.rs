@@ -492,6 +492,19 @@ pub trait RenderBackend {
     /// Submits a lit draw (mesh + transform + surface + sun + dynamic lights)
     /// for drawing with the backend's forward lighting pass.
     fn submit(&mut self, submission: &DrawSubmission);
+    /// Runs the deferred lighting pass in two internal steps: the
+    /// geometry pass writes the submission's mesh into the G-buffer
+    /// target's colour attachments (the albedo with its alpha marking
+    /// geometry, the 0.5-offset normal, the world position) and the
+    /// lighting pass shades the G-buffer into the default framebuffer
+    /// with the same Blinn-Phong reference the forward path carries. The
+    /// background pixels copy the G-buffer's albedo (the clear colour the
+    /// target carries) and stay unshaded.
+    fn submit_lighting_pass(
+        &mut self,
+        submission: &DrawSubmission,
+        gbuffer: &RenderTarget,
+    );
 
     // -- Render passes and targets -------------------------------------------
     /// Creates a render target. Throws `RenderError` on an invalid or

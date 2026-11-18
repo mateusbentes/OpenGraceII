@@ -94,6 +94,7 @@ pub const D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE: u32 = 0x80;
 
 pub const D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET: u32 = 0x1;
 pub const D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL: u32 = 0x2;
+pub const D3D12_RESOURCE_FLAG_ALLOW_SHADER_RESOURCE: u32 = 0x8;
 
 pub const D3D12_HEAP_TYPE_DEFAULT: u32 = 1;
 pub const D3D12_HEAP_TYPE_UPLOAD: u32 = 2;
@@ -117,6 +118,7 @@ pub const D3D12_SRV_DIMENSION_TEXTURE2D: u32 = 4;
 pub const D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING: u32 = 0x1688;
 
 pub const D3D12_FILTER_MIN_MAG_MIP_POINT: u32 = 0x0;
+pub const D3D12_FILTER_MIN_MAG_MIP_LINEAR: u32 = 0x15;
 pub const D3D12_TEXTURE_ADDRESS_MODE_WRAP: u32 = 1;
 pub const D3D12_COMPARISON_FUNC_ALWAYS: u32 = 8;
 pub const D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE: u32 = 2;
@@ -640,6 +642,9 @@ pub struct D3d12ShaderResourceViewDesc {
     pub format: u32,
     pub view_dimension: u32,
     pub shader_4_component_mapping: u32,
+    // The ABI's alignment padding: the union's 8-byte alignment pushes
+    // the texture2D member four bytes after the three-word header.
+    pub header_padding: [u32; 1],
     pub texture_2d: D3d12Tex2DSrv,
     // The union's storage is 24 bytes (the largest member, the
     // TEX2D_ARRAY_SRV's, is 20 bytes): 2 words follow the 16-byte

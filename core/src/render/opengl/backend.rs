@@ -25,6 +25,10 @@ use super::gl_loader::{GlLoader, *};
 use super::shader_library::{TRIANGLE_FRAGMENT_SHADER, TRIANGLE_VERTEX_SHADER};
 use super::shader_library::{MESH_FRAGMENT_SHADER, MESH_VERTEX_SHADER};
 use super::shader_library::{LIT_FRAGMENT_SHADER, LIT_VERTEX_SHADER};
+use super::shader_library::{GBUFFER_FRAGMENT_SHADER, GBUFFER_VERTEX_SHADER};
+use super::shader_library::{
+    LIGHTING_FRAGMENT_SHADER, LIGHTING_VERTEX_SHADER,
+};
 use crate::math::{Mat4, Vec3};
 use std::sync::{Arc, Mutex};
 use std::os::raw::{c_char, c_void};
@@ -226,6 +230,26 @@ pub struct OpenGlBackend {
     lit_uniform_point_color_intensity: i32,
     lit_uniform_params: i32,
     lit_ready: bool,
+    // The deferred lighting path's programs (M6): the G-buffer's
+    // geometry-pass program and the fullscreen lighting-pass program.
+    gbuffer_program: u32,
+    gbuffer_uniform_view_projection: i32,
+    gbuffer_uniform_model: i32,
+    gbuffer_uniform_sampler: i32,
+    gbuffer_ready: bool,
+    lighting_program: u32,
+    lighting_uniform_sun_direction: i32,
+    lighting_uniform_sun_color_intensity: i32,
+    lighting_uniform_point_position_radius: i32,
+    lighting_uniform_point_color_intensity: i32,
+    lighting_uniform_params: i32,
+    lighting_uniform_albedo: i32,
+    lighting_uniform_normal: i32,
+    lighting_uniform_world: i32,
+    lighting_ready: bool,
+    /// The fullscreen triangle's own VAO (the core profile forbids the
+    /// VAO 0 draw; an attribute-less draw still needs a bound VAO).
+    lighting_vao: u32,
     // The submission's lights block (the draw's uniform writes read it).
     lit_block: LightsUniform,
     /// The per-mesh state: the VAO (the attribute pointers), the vertex
@@ -312,6 +336,22 @@ impl OpenGlBackend {
             lit_uniform_point_color_intensity: -1,
             lit_uniform_params: -1,
             lit_ready: false,
+            gbuffer_program: 0,
+            gbuffer_uniform_view_projection: -1,
+            gbuffer_uniform_model: -1,
+            gbuffer_uniform_sampler: -1,
+            gbuffer_ready: false,
+            lighting_program: 0,
+            lighting_uniform_sun_direction: -1,
+            lighting_uniform_sun_color_intensity: -1,
+            lighting_uniform_point_position_radius: -1,
+            lighting_uniform_point_color_intensity: -1,
+            lighting_uniform_params: -1,
+            lighting_uniform_albedo: -1,
+            lighting_uniform_normal: -1,
+            lighting_uniform_world: -1,
+            lighting_ready: false,
+            lighting_vao: 0,
             lit_block: LightsUniform::none(),
             meshes: Vec::new(),
             bound_texture: None,
@@ -1036,6 +1076,218 @@ impl OpenGlBackend {
         true
     }
 
+    /// The deferred geometry pass's program (M6): the G-buffer shader
+    /// pair (the same PNU vertex shape, the three-attachment fragment
+    /// shader), compiled at runtime (the same lazy ensure the lit path
+    /// follows).
+    pub(crate) fn ensure_gbuffer_program(&mut self) -> bool {
+        if self.gbuffer_ready {
+            return true;
+        }
+        let program = unsafe {
+            (self.loader.gl_create_program.unwrap())()
+        };
+        if program == 0 {
+            return false;
+        }
+        let vs = unsafe { (self.loader.gl_create_shader.unwrap())(GL_VERTEX_SHADER) };
+        let fs = unsafe {
+            (self.loader.gl_create_shader.unwrap())(GL_FRAGMENT_SHADER)
+        };
+        if vs == 0 || fs == 0 {
+            return false;
+        }
+        let vs_source = [GBUFFER_VERTEX_SHADER.as_ptr() as *const c_char];
+        let vs_len = [GBUFFER_VERTEX_SHADER.len() as i32];
+        let fs_source = [GBUFFER_FRAGMENT_SHADER.as_ptr() as *const c_char];
+        let fs_len = [GBUFFER_FRAGMENT_SHADER.len() as i32];
+        unsafe {
+            (self.loader.gl_shader_source.unwrap())(
+                vs,
+                1,
+                vs_source.as_ptr(),
+                vs_len.as_ptr(),
+            );
+            (self.loader.gl_compile_shader.unwrap())(vs);
+            (self.loader.gl_shader_source.unwrap())(
+                fs,
+                1,
+                fs_source.as_ptr(),
+                fs_len.as_ptr(),
+            );
+            (self.loader.gl_compile_shader.unwrap())(fs);
+            (self.loader.gl_attach_shader.unwrap())(program, vs);
+            (self.loader.gl_attach_shader.unwrap())(program, fs);
+            (self.loader.gl_link_program.unwrap())(program);
+        }
+        let mut linked: i32 = 0;
+        unsafe {
+            (self.loader.gl_get_programiv.unwrap())(
+                program,
+                GL_LINK_STATUS,
+                &mut linked,
+            );
+        }
+        if linked != GL_TRUE as i32 {
+            unsafe {
+                (self.loader.gl_delete_shader.unwrap())(vs);
+                (self.loader.gl_delete_shader.unwrap())(fs);
+                (self.loader.gl_delete_program.unwrap())(program);
+            }
+            return false;
+        }
+        unsafe {
+            (self.loader.gl_delete_shader.unwrap())(vs);
+            (self.loader.gl_delete_shader.unwrap())(fs);
+        }
+        self.gbuffer_program = program;
+        self.gbuffer_uniform_view_projection = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"view_projection\0".as_ptr() as *const c_char,
+            )
+        };
+        self.gbuffer_uniform_model = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"model\0".as_ptr() as *const c_char,
+            )
+        };
+        self.gbuffer_uniform_sampler = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"surface_texture\0".as_ptr() as *const c_char,
+            )
+        };
+        self.gbuffer_ready = true;
+        true
+    }
+
+    /// The deferred lighting pass's program (M6): the fullscreen
+    /// triangle's vertex shader and the G-buffer-sampling fragment
+    /// shader (the same Blinn-Phong the forward path carries), compiled
+    /// at runtime (the same lazy ensure).
+    pub(crate) fn ensure_lighting_program(&mut self) -> bool {
+        if self.lighting_ready {
+            return true;
+        }
+        let program = unsafe {
+            (self.loader.gl_create_program.unwrap())()
+        };
+        if program == 0 {
+            return false;
+        }
+        let vs = unsafe { (self.loader.gl_create_shader.unwrap())(GL_VERTEX_SHADER) };
+        let fs = unsafe {
+            (self.loader.gl_create_shader.unwrap())(GL_FRAGMENT_SHADER)
+        };
+        if vs == 0 || fs == 0 {
+            return false;
+        }
+        let vs_source = [LIGHTING_VERTEX_SHADER.as_ptr() as *const c_char];
+        let vs_len = [LIGHTING_VERTEX_SHADER.len() as i32];
+        let fs_source = [LIGHTING_FRAGMENT_SHADER.as_ptr() as *const c_char];
+        let fs_len = [LIGHTING_FRAGMENT_SHADER.len() as i32];
+        unsafe {
+            (self.loader.gl_shader_source.unwrap())(
+                vs,
+                1,
+                vs_source.as_ptr(),
+                vs_len.as_ptr(),
+            );
+            (self.loader.gl_compile_shader.unwrap())(vs);
+            (self.loader.gl_shader_source.unwrap())(
+                fs,
+                1,
+                fs_source.as_ptr(),
+                fs_len.as_ptr(),
+            );
+            (self.loader.gl_compile_shader.unwrap())(fs);
+            (self.loader.gl_attach_shader.unwrap())(program, vs);
+            (self.loader.gl_attach_shader.unwrap())(program, fs);
+            (self.loader.gl_link_program.unwrap())(program);
+        }
+        let mut linked: i32 = 0;
+        unsafe {
+            (self.loader.gl_get_programiv.unwrap())(
+                program,
+                GL_LINK_STATUS,
+                &mut linked,
+            );
+        }
+        if linked != GL_TRUE as i32 {
+            unsafe {
+                (self.loader.gl_delete_shader.unwrap())(vs);
+                (self.loader.gl_delete_shader.unwrap())(fs);
+                (self.loader.gl_delete_program.unwrap())(program);
+            }
+            return false;
+        }
+        unsafe {
+            (self.loader.gl_delete_shader.unwrap())(vs);
+            (self.loader.gl_delete_shader.unwrap())(fs);
+        }
+        self.lighting_program = program;
+        self.lighting_uniform_sun_direction = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"sun_direction\0".as_ptr() as *const c_char,
+            )
+        };
+        self.lighting_uniform_sun_color_intensity = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"sun_color_intensity\0".as_ptr() as *const c_char,
+            )
+        };
+        self.lighting_uniform_point_position_radius = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"point_position_radius\0".as_ptr() as *const c_char,
+            )
+        };
+        self.lighting_uniform_point_color_intensity = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"point_color_intensity\0".as_ptr() as *const c_char,
+            )
+        };
+        self.lighting_uniform_params = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"params\0".as_ptr() as *const c_char,
+            )
+        };
+        self.lighting_uniform_albedo = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"gbuffer_albedo\0".as_ptr() as *const c_char,
+            )
+        };
+        self.lighting_uniform_normal = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"gbuffer_normal\0".as_ptr() as *const c_char,
+            )
+        };
+        self.lighting_uniform_world = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"gbuffer_world\0".as_ptr() as *const c_char,
+            )
+        };
+        // The fullscreen triangle's own VAO: the core profile forbids
+        // the VAO 0 draw (the attribute-less draw still needs a bound
+        // VAO — the same rule the mesh path's VAO follows).
+        let mut vao: u32 = 0;
+        unsafe {
+            (self.loader.gl_gen_vertex_arrays.unwrap())(1, &mut vao);
+        }
+        self.lighting_vao = vao;
+        self.lighting_ready = true;
+        true
+    }
+
     /// The generic draw path: the mesh's VAO, the camera uniforms (the
     /// set_camera state's view-projection and the submission's model) and
     /// the indexed draw. A draw with no open frame counts one violation
@@ -1470,6 +1722,245 @@ impl RenderBackend for OpenGlBackend {
         self.draw_mesh_by_id(mesh_id, submission.model);
     }
 
+    /// The deferred lighting pass (M6): the two internal steps the
+    /// contract's submit_lighting_pass carries. Step one (the geometry
+    /// pass) binds the G-buffer's framebuffer, uploads the camera
+    /// uniforms and draws the mesh into the three colour attachments.
+    /// Step two (the lighting pass) binds the default framebuffer,
+    /// uploads the lights' uniforms and the three G-buffer textures, and
+    /// draws the fullscreen triangle (the three vertices the vertex ID
+    /// generates, no VAO). The G-buffer's textures read through the
+    /// sampler units 0-2.
+    fn submit_lighting_pass(
+        &mut self,
+        submission: &crate::render::DrawSubmission,
+        gbuffer: &RenderTarget,
+    ) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        for light in &submission.lights {
+            if light.validate().is_err() {
+                self.violations += 1;
+            }
+        }
+        let target_index = match self
+            .targets
+            .iter()
+            .position(|x| Arc::ptr_eq(&x.inner, &gbuffer.inner))
+        {
+            Some(index) => index,
+            None => {
+                self.violations += 1;
+                return;
+            }
+        };
+        if self.targets[target_index].released {
+            self.violations += 1;
+            return;
+        }
+        let mesh_id = submission.mesh.inner.lock().unwrap().id;
+        if self.meshes.get(mesh_id).map(|m| m.is_none()).unwrap_or(true) {
+            self.violations += 1;
+            return;
+        }
+        if !self.ensure_gbuffer_program() || !self.ensure_lighting_program() {
+            return;
+        }
+        if !self.frame_open {
+            self.violations += 1;
+            return;
+        }
+        let default_sun = DirectionalLight {
+            direction: Vec3::new(0.0, -1.0, 0.0),
+            color: Vec3::new(0.0, 0.0, 0.0),
+            intensity: 0.0,
+        };
+        let sun = submission.sun.as_ref().unwrap_or(&default_sun);
+        let block = LightsUniform::from_lights(sun, &submission.lights);
+        let camera = self.camera;
+        let aspect = self.config.width as f32 / self.config.height as f32;
+        let view = Mat4::look_at(camera.eye, camera.target, camera.up);
+        let projection =
+            Mat4::perspective(camera.fov_y_rad, aspect, camera.near, camera.far);
+        let view_projection = projection.multiply(view);
+        let model = submission.model;
+        let texture = self
+            .bound_texture
+            .and_then(|i| self.textures_2d.get(i))
+            .filter(|t| !t.released)
+            .map(|t| t.texture)
+            .unwrap_or(
+                self.default_texture
+                    .and_then(|i| self.textures_2d.get(i))
+                    .filter(|t| !t.released)
+                    .map(|t| t.texture)
+                    .unwrap_or(0),
+            );
+        let gbuffer_framebuffer = self.targets[target_index].framebuffer;
+        let gbuffer_textures: Vec<u32> = self.targets[target_index]
+            .views
+            .iter()
+            .take(3)
+            .map(|v| v.texture)
+            .collect();
+        if gbuffer_textures.len() != 3 {
+            self.violations += 1;
+            return;
+        }
+        let depth_test_enabled = self.depth_test_enabled;
+        let clear_color = self.clear_color;
+        let clear_depth = self.clear_depth;
+        let clear_stencil = self.clear_stencil;
+        let mut mask = 0;
+        if self.config.clear_buffers.color {
+            mask |= GL_COLOR_BUFFER_BIT;
+        }
+        if self.config.clear_buffers.depth {
+            mask |= GL_DEPTH_BUFFER_BIT;
+        }
+        if self.config.clear_buffers.stencil {
+            mask |= GL_STENCIL_BUFFER_BIT;
+        }
+        // ---- Step one: the geometry pass ----
+        unsafe {
+            (self.loader.gl_bind_framebuffer.unwrap())(
+                GL_FRAMEBUFFER,
+                gbuffer_framebuffer,
+            );
+            let colour_attachments = [
+                GL_COLOR_ATTACHMENT0,
+                GL_COLOR_ATTACHMENT1,
+                GL_COLOR_ATTACHMENT2,
+            ];
+            (self.loader.gl_draw_buffers.unwrap())(
+                3,
+                colour_attachments.as_ptr(),
+            );
+            (self.loader.gl_clear_color.unwrap())(
+                clear_color.r as f32 / 255.0,
+                clear_color.g as f32 / 255.0,
+                clear_color.b as f32 / 255.0,
+                clear_color.a as f32 / 255.0,
+            );
+            (self.loader.gl_clear_depth.unwrap())(clear_depth as f64);
+            (self.loader.gl_clear_stencil.unwrap())(clear_stencil);
+            (self.loader.gl_clear.unwrap())(mask);
+            if depth_test_enabled {
+                (self.loader.gl_enable.unwrap())(GL_DEPTH_TEST);
+                (self.loader.gl_depth_func.unwrap())(GL_LESS);
+                (self.loader.gl_depth_mask.unwrap())(GL_TRUE);
+            } else {
+                (self.loader.gl_disable.unwrap())(GL_DEPTH_TEST);
+                (self.loader.gl_depth_mask.unwrap())(GL_FALSE);
+            }
+        }
+        {
+            let (vao, index_count) = match self.meshes.get(mesh_id) {
+                Some(Some(state)) => (state.vao, state.index_count),
+                _ => {
+                    self.violations += 1;
+                    return;
+                }
+            };
+            unsafe {
+                (self.loader.gl_use_program.unwrap())(self.gbuffer_program);
+                (self.loader.gl_uniform_matrix_4fv.unwrap())(
+                    self.gbuffer_uniform_view_projection,
+                    1,
+                    GL_FALSE,
+                    view_projection.m.as_ptr() as *const f32,
+                );
+                (self.loader.gl_uniform_matrix_4fv.unwrap())(
+                    self.gbuffer_uniform_model,
+                    1,
+                    GL_FALSE,
+                    model.m.as_ptr() as *const f32,
+                );
+                (self.loader.gl_active_texture.unwrap())(GL_TEXTURE0);
+                (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_2D, texture);
+                (self.loader.gl_uniform_1i.unwrap())(
+                    self.gbuffer_uniform_sampler,
+                    0,
+                );
+                (self.loader.gl_bind_vertex_array.unwrap())(vao);
+                (self.loader.gl_draw_elements.unwrap())(
+                    GL_TRIANGLES,
+                    index_count as i32,
+                    GL_UNSIGNED_INT,
+                    std::ptr::null(),
+                );
+                (self.loader.gl_bind_vertex_array.unwrap())(0);
+            }
+        }
+        // ---- Step two: the lighting pass ----
+        unsafe {
+            (self.loader.gl_bind_framebuffer.unwrap())(GL_FRAMEBUFFER, 0);
+            (self.loader.gl_draw_buffer.unwrap())(GL_COLOR_ATTACHMENT0);
+            (self.loader.gl_clear_color.unwrap())(
+                clear_color.r as f32 / 255.0,
+                clear_color.g as f32 / 255.0,
+                clear_color.b as f32 / 255.0,
+                clear_color.a as f32 / 255.0,
+            );
+            (self.loader.gl_clear_depth.unwrap())(clear_depth as f64);
+            (self.loader.gl_clear_stencil.unwrap())(clear_stencil);
+            (self.loader.gl_clear.unwrap())(mask);
+            // The depth test off: the fullscreen triangle covers the
+            // frame and the default framebuffer's depth stays at the
+            // clear value (the depth lives in the G-buffer's depth
+            // attachment during the geometry pass).
+            (self.loader.gl_disable.unwrap())(GL_DEPTH_TEST);
+            (self.loader.gl_depth_mask.unwrap())(GL_FALSE);
+            (self.loader.gl_use_program.unwrap())(self.lighting_program);
+            (self.loader.gl_uniform_4fv.unwrap())(
+                self.lighting_uniform_sun_direction,
+                1,
+                block.sun_direction.as_ptr(),
+            );
+            (self.loader.gl_uniform_4fv.unwrap())(
+                self.lighting_uniform_sun_color_intensity,
+                1,
+                block.sun_color_intensity.as_ptr(),
+            );
+            (self.loader.gl_uniform_4fv.unwrap())(
+                self.lighting_uniform_point_position_radius,
+                4,
+                block.point_position_radius.as_ptr() as *const f32,
+            );
+            (self.loader.gl_uniform_4fv.unwrap())(
+                self.lighting_uniform_point_color_intensity,
+                4,
+                block.point_color_intensity.as_ptr() as *const f32,
+            );
+            (self.loader.gl_uniform_4fv.unwrap())(
+                self.lighting_uniform_params,
+                1,
+                block.params.as_ptr(),
+            );
+            (self.loader.gl_active_texture.unwrap())(GL_TEXTURE0);
+            (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_2D, gbuffer_textures[0]);
+            (self.loader.gl_uniform_1i.unwrap())(self.lighting_uniform_albedo, 0);
+            (self.loader.gl_active_texture.unwrap())(GL_TEXTURE0 + 1);
+            (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_2D, gbuffer_textures[1]);
+            (self.loader.gl_uniform_1i.unwrap())(self.lighting_uniform_normal, 1);
+            (self.loader.gl_active_texture.unwrap())(GL_TEXTURE0 + 2);
+            (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_2D, gbuffer_textures[2]);
+            (self.loader.gl_uniform_1i.unwrap())(self.lighting_uniform_world, 2);
+            (self.loader.gl_bind_vertex_array.unwrap())(self.lighting_vao);
+            (self.loader.gl_draw_arrays.unwrap())(GL_TRIANGLES, 0, 3);
+            (self.loader.gl_bind_vertex_array.unwrap())(0);
+            (self.loader.gl_active_texture.unwrap())(GL_TEXTURE0);
+            (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_2D, texture);
+            if depth_test_enabled {
+                (self.loader.gl_enable.unwrap())(GL_DEPTH_TEST);
+                (self.loader.gl_depth_func.unwrap())(GL_LESS);
+                (self.loader.gl_depth_mask.unwrap())(GL_TRUE);
+            }
+        }
+    }
+
     fn create_render_target(
         &mut self,
         desc: &RenderTargetDesc,
@@ -1562,10 +2053,21 @@ impl RenderBackend for OpenGlBackend {
         unsafe {
             (self.loader.gl_gen_framebuffers.unwrap())(1, &mut framebuffer);
             (self.loader.gl_bind_framebuffer.unwrap())(GL_FRAMEBUFFER, framebuffer);
-            for view in &views {
+            // The MRT attachments: each view lands on its own
+            // GL_COLOR_ATTACHMENTn (the bug the first deferred run
+            // caught: every view landing on GL_COLOR_ATTACHMENT0 left
+            // the geometry pass writing all three outputs into one
+            // attachment).
+            let colour_attachments = [
+                GL_COLOR_ATTACHMENT0,
+                GL_COLOR_ATTACHMENT1,
+                GL_COLOR_ATTACHMENT2,
+                GL_COLOR_ATTACHMENT3,
+            ];
+            for (i, view) in views.iter().enumerate() {
                 (self.loader.gl_framebuffer_texture_2d.unwrap())(
                     GL_FRAMEBUFFER,
-                    GL_COLOR_ATTACHMENT0,
+                    colour_attachments[i],
                     GL_TEXTURE_2D,
                     view.texture,
                     0,
@@ -1588,6 +2090,16 @@ impl RenderBackend for OpenGlBackend {
                     "create_render_target: the framebuffer is incomplete",
                 ));
             }
+            // The draw-buffer list: the fragment shader's three outputs
+            // (the draw call writes into the bound attachment list; the
+            // default framebuffer's list restores at the end).
+            if desc.color_attachment_count > 1 {
+                (self.loader.gl_draw_buffers.unwrap())(
+                    desc.color_attachment_count as i32,
+                    colour_attachments.as_ptr(),
+                );
+            }
+            (self.loader.gl_draw_buffer.unwrap())(GL_COLOR_ATTACHMENT0);
         }
         let target = OpenGlRenderTarget {
             inner: Arc::new(Mutex::new(RenderTargetInner {

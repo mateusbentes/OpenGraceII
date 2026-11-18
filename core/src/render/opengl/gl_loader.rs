@@ -36,6 +36,9 @@ pub const GL_DEPTH24_STENCIL8: u32 = 0x88F0;
 pub const GL_DEPTH_STENCIL: u32 = 0x84F9;
 pub const GL_UNSIGNED_INT_24_8: u32 = 0x84FA;
 pub const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+pub const GL_COLOR_ATTACHMENT1: u32 = 0x8CE1;
+pub const GL_COLOR_ATTACHMENT2: u32 = 0x8CE2;
+pub const GL_COLOR_ATTACHMENT3: u32 = 0x8CE3;
 pub const GL_DEPTH_ATTACHMENT: u32 = 0x8D00;
 pub const GL_STENCIL_ATTACHMENT: u32 = 0x8D20;
 pub const GL_FRAMEBUFFER: u32 = 0x8D40;
@@ -246,6 +249,8 @@ pub type PfnGlActiveTexture = unsafe extern "C" fn(unit: u32);
 pub type PfnGlUseProgram = unsafe extern "C" fn(program: u32);
 pub type PfnGlDrawBuffer = unsafe extern "C" fn(mode: u32);
 pub type PfnGlReadBuffer = unsafe extern "C" fn(mode: u32);
+pub type PfnGlDrawBuffers =
+    unsafe extern "C" fn(n: i32, bufs: *const u32);
 
 // -- EGL function pointer types (the published C signatures) ---------------
 pub type PfnEglGetError = unsafe extern "C" fn() -> u32;
@@ -369,6 +374,7 @@ pub struct GlLoader {
     pub gl_use_program: Option<PfnGlUseProgram>,
     pub gl_draw_buffer: Option<PfnGlDrawBuffer>,
     pub gl_read_buffer: Option<PfnGlReadBuffer>,
+    pub gl_draw_buffers: Option<PfnGlDrawBuffers>,
 }
 
 impl GlLoader {
@@ -445,6 +451,7 @@ impl GlLoader {
             gl_use_program: None,
             gl_draw_buffer: None,
             gl_read_buffer: None,
+            gl_draw_buffers: None,
         }
     }
 }
@@ -662,6 +669,7 @@ impl GlLoader {
         load_gl!(gl_use_program, "glUseProgram");
         load_gl!(gl_draw_buffer, "glDrawBuffer");
         load_gl!(gl_read_buffer, "glReadBuffer");
+        load_gl!(gl_draw_buffers, "glDrawBuffers");
         true
     }
 }

@@ -42,81 +42,53 @@
 //! exercise: `new()` reports the missing dll in the `RenderError`
 //! message.
 
-use super::d3d12_loader::{
-    self as d3d,  call_slot_i32_0, call_slot_i32_2,
-    call_slot_i32_3, call_slot_i32_4, call_slot_i32_5, call_slot_i32_6,
-    call_slot_i32_f32, call_slot_i32_8, call_slot_i32_u32,
-    call_slot_void_ptr_u64,
-     call_slot_ptr_0,  call_slot_u64_0,
-     vtable_of,
-    D3d12ClearValue, D3d12CommandQueueDesc, D3d12CpuDescriptorHandle,
-    D3d12CachedPipelineState, D3d12Rect, D3d12ResourceBarrier,
-    D3d12DepthStencilViewDesc, D3d12DescriptorHeapDesc, D3d12DeviceHandle,
-    D3d12GraphicsCommandListHandle, D3d12HeapProperties, D3d12InputLayoutDesc,
-    D3d12FeatureDataFeatureLevels, DxgiAdapterDesc1,
-
-    D3d12InputElementDesc, D3d12PlacedFootprint, D3d12RasterizerDesc,
-    D3d12RenderTargetBlendDesc, D3d12ResourceDesc, D3d12ResourceTransitionBarrier,
-    D3d12RootConstants, D3d12RootParameter, D3d12RootSignatureDesc,
-    D3d12SampleDesc, D3d12ShaderBytecode, D3d12SubresourceFootprint,
-    D3d12StreamOutputDesc,
-    D3d12Tex2DDsv, D3d12TextureCopyLocation, D3d12Viewport,
-    D3d12GraphicsPipelineStateDesc, D3d12DepthStencilDesc,
-    D3d12DepthStencilopDesc, D3d12BlendDesc, D3d12VertexBufferView,
-    D3d12Range, D3d12Loader, D3dBlobHandle, ComObject,
-    DxgiFactoryHandle, DxgiAdapterHandle,
-    D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
-    D3D12_CULL_MODE_NONE, D3D12_COLOR_WRITE_ENABLE_ALL,
-    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_FLAG_NONE,
-    D3D12_COMMAND_QUEUE_PRIORITY_NORMAL, D3D12_CLEAR_FLAG_DEPTH,
-    D3D12_CLEAR_FLAG_STENCIL,
-    D3D12_COMPARISON_FUNC_LESS, D3D12_DEPTH_WRITE_MASK_ALL,
-    D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
-    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-    D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-    D3D12_DSV_DIMENSION_TEXTURE2D, D3D12_FILL_MODE_SOLID,
-    D3D12_FENCE_FLAG_NONE, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_TYPE_DEFAULT,
-    D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD,
-    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
-
-    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-    D3D12_RESOURCE_BARRIER_FLAG_NONE,
-    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_DIMENSION_BUFFER,
-    D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
-    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON,
-    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
-    D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_GENERIC_READ,
-    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-    D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
-    D3D12_SHADER_VISIBILITY_ALL, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-    D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-    D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-    D3D12_FEATURE_FEATURE_LEVELS, D3D_FEATURE_LEVEL_11_0,
-    DXGI_FORMAT_D24_UNORM_S8_UINT,
-     DXGI_FORMAT_R32_FLOAT,
-    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT,
-    DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
-    DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
-    DXGI_FORMAT_R32_UINT, DXGI_FORMAT_UNKNOWN,
-     IID_ID3D12_COMMAND_ALLOCATOR_WORDS,
-    IID_ID3D12_COMMAND_QUEUE_WORDS, IID_ID3D12_DESCRIPTOR_HEAP_WORDS,
-    IID_ID3D12_DEVICE_WORDS, IID_ID3D12_FENCE_WORDS,
-    IID_ID3D12_GRAPHICS_COMMAND_LIST_WORDS, IID_ID3D12_PIPELINE_STATE_WORDS,
-    IID_ID3D12_RESOURCE_WORDS, IID_ID3D12_ROOT_SIGNATURE_WORDS,
-    IID_IDXGI_FACTORY1_WORDS,
-
-};
 use super::super::{
-    bytes_per_pixel, CameraParams, ClearBuffer, ClearColor,
-    DirectionalLight, DrawSubmission, DynamicLight, GpuMesh, GpuMeshInner,
-    PixelFormat, ReadbackSample, RenderBackend, RenderError, RenderTarget,
-    RenderTargetDesc, RenderTargetInner, ShaderProgram, ShaderProgramInner,
-    Texture2DDesc, TextureView, TextureViewInner, VertexLayout,
-    DEPTH_ATTACHMENT,
+    bytes_per_pixel, CameraParams, ClearBuffer, ClearColor, DirectionalLight, DrawSubmission,
+    DynamicLight, GpuMesh, GpuMeshInner, PixelFormat, ReadbackSample, RenderBackend, RenderError,
+    RenderTarget, RenderTargetDesc, RenderTargetInner, ShaderProgram, ShaderProgramInner,
+    Texture2DDesc, TextureView, TextureViewInner, VertexLayout, DEPTH_ATTACHMENT,
+};
+use super::d3d12_loader::{
+    self as d3d, call_slot_i32_0, call_slot_i32_2, call_slot_i32_3, call_slot_i32_4,
+    call_slot_i32_5, call_slot_i32_6, call_slot_i32_8, call_slot_i32_f32, call_slot_i32_u32,
+    call_slot_ptr_0, call_slot_u64_0, call_slot_void_ptr_u64, vtable_of, ComObject, D3d12BlendDesc,
+    D3d12CachedPipelineState, D3d12ClearValue, D3d12CommandQueueDesc, D3d12CpuDescriptorHandle,
+    D3d12DepthStencilDesc, D3d12DepthStencilViewDesc, D3d12DepthStencilopDesc,
+    D3d12DescriptorHeapDesc, D3d12DeviceHandle, D3d12FeatureDataFeatureLevels,
+    D3d12GraphicsCommandListHandle, D3d12GraphicsPipelineStateDesc, D3d12HeapProperties,
+    D3d12InputElementDesc, D3d12InputLayoutDesc, D3d12Loader, D3d12PlacedFootprint, D3d12Range,
+    D3d12RasterizerDesc, D3d12Rect, D3d12RenderTargetBlendDesc, D3d12ResourceBarrier,
+    D3d12ResourceDesc, D3d12ResourceTransitionBarrier, D3d12RootConstants, D3d12RootParameter,
+    D3d12RootSignatureDesc, D3d12SampleDesc, D3d12ShaderBytecode, D3d12StreamOutputDesc,
+    D3d12SubresourceFootprint, D3d12Tex2DDsv, D3d12TextureCopyLocation, D3d12VertexBufferView,
+    D3d12Viewport, D3dBlobHandle, DxgiAdapterDesc1, DxgiAdapterHandle, DxgiFactoryHandle,
+    D3D12_BLEND_ONE, D3D12_BLEND_OP_ADD, D3D12_BLEND_ZERO, D3D12_CLEAR_FLAG_DEPTH,
+    D3D12_CLEAR_FLAG_STENCIL, D3D12_COLOR_WRITE_ENABLE_ALL, D3D12_COMMAND_LIST_TYPE_DIRECT,
+    D3D12_COMMAND_QUEUE_FLAG_NONE, D3D12_COMMAND_QUEUE_PRIORITY_NORMAL, D3D12_COMPARISON_FUNC_LESS,
+    D3D12_CULL_MODE_NONE, D3D12_DEPTH_WRITE_MASK_ALL, D3D12_DEPTH_WRITE_MASK_ZERO,
+    D3D12_DESCRIPTOR_HEAP_FLAG_NONE, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+    D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_DSV_DIMENSION_TEXTURE2D, D3D12_FEATURE_FEATURE_LEVELS,
+    D3D12_FENCE_FLAG_NONE, D3D12_FILL_MODE_SOLID, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_TYPE_DEFAULT,
+    D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+    D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+    D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+    D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_GENERIC_READ,
+    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET,
+    D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+    D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, D3D12_SHADER_VISIBILITY_ALL,
+    D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+    D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D_FEATURE_LEVEL_11_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+    DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT,
+    DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT,
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_UNKNOWN,
+    IID_ID3D12_COMMAND_ALLOCATOR_WORDS, IID_ID3D12_COMMAND_QUEUE_WORDS,
+    IID_ID3D12_DESCRIPTOR_HEAP_WORDS, IID_ID3D12_DEVICE_WORDS, IID_ID3D12_FENCE_WORDS,
+    IID_ID3D12_GRAPHICS_COMMAND_LIST_WORDS, IID_ID3D12_PIPELINE_STATE_WORDS,
+    IID_ID3D12_RESOURCE_WORDS, IID_ID3D12_ROOT_SIGNATURE_WORDS, IID_IDXGI_FACTORY1_WORDS,
 };
 use crate::math::{Mat4, Vec3};
 use std::os::raw::{c_char, c_void};
@@ -200,13 +172,11 @@ const STAGING_STENCIL_PITCH: usize = 256 * ((320 + 255) / 256);
 /// The stencil plane's bytes (240 rows of the 256-byte pitch).
 const STAGING_STENCIL_BYTES: usize = 240 * STAGING_STENCIL_PITCH;
 /// The staging buffer's total size (the three planes).
-const STAGING_SIZE: usize =
-    STAGING_COLOUR_BYTES + STAGING_DEPTH_BYTES + STAGING_STENCIL_BYTES;
+const STAGING_SIZE: usize = STAGING_COLOUR_BYTES + STAGING_DEPTH_BYTES + STAGING_STENCIL_BYTES;
 /// The depth plane's offset inside the staging buffer.
 const STAGING_DEPTH_OFFSET: usize = STAGING_COLOUR_BYTES;
 /// The stencil plane's offset inside the staging buffer.
-const STAGING_STENCIL_OFFSET: usize =
-    STAGING_COLOUR_BYTES + STAGING_DEPTH_BYTES;
+const STAGING_STENCIL_OFFSET: usize = STAGING_COLOUR_BYTES + STAGING_DEPTH_BYTES;
 
 /// The diagnostic triangle's uniform block (the same bytes the Vulkan,
 /// the OpenGL and the Metal blocks carry: the MVP column-major followed
@@ -258,9 +228,7 @@ impl LightsUniform {
         let direction = sun.direction.normalised();
         let mut block = LightsUniform {
             sun_direction: [direction.x, direction.y, direction.z, 0.0],
-            sun_color_intensity: [
-                sun.color.x, sun.color.y, sun.color.z, sun.intensity,
-            ],
+            sun_color_intensity: [sun.color.x, sun.color.y, sun.color.z, sun.intensity],
             point_position_radius: [[0.0; 4]; 4],
             point_color_intensity: [[0.0; 4]; 4],
             params: [0.0, 0.0, 0.0, 0.0],
@@ -276,12 +244,8 @@ impl LightsUniform {
                     light.position.z,
                     light.radius,
                 ];
-                block.point_color_intensity[index] = [
-                    light.color.x,
-                    light.color.y,
-                    light.color.z,
-                    light.intensity,
-                ];
+                block.point_color_intensity[index] =
+                    [light.color.x, light.color.y, light.color.z, light.intensity];
             }
         }
         block.params[0] = lights.len().min(4) as f32;
@@ -363,6 +327,15 @@ struct D3d12RenderTarget {
     inner: Arc<Mutex<RenderTargetInner>>,
     views: Vec<D3d12Texture2D>,
     depth_view: Option<D3d12Texture2D>,
+    /// The deferred path's own RTV/DSV heaps (the three colour
+    /// attachments' render-target views, the depth's DSV; the creation
+    /// happens once at the first deferred pass).
+    rtv_heap: d3d::D3d12DescriptorHeapHandle,
+    dsv_heap: d3d::D3d12DescriptorHeapHandle,
+    /// Whether the colour attachments sit in the
+    /// PIXEL_SHADER_RESOURCE state (the last lighting pass's hand-off;
+    /// the next geometry pass's barriers read it).
+    views_state_read: bool,
     released: bool,
 }
 
@@ -429,6 +402,22 @@ pub struct D3d12Backend {
     lit_pipeline: d3d::D3d12PipelineStateHandle,
     lit_lights_buffer: d3d::D3d12ResourceHandle,
     lit_block: LightsUniform,
+    // The deferred lighting path's state (M6): the G-buffer's geometry
+    // PSO (the three-attachment pixel shader) and the fullscreen
+    // lighting PSO, each with its own root signature, plus the shared
+    // 256-byte lights' buffer the lighting draw's CBV at b1 reads.
+    gbuffer_ready: bool,
+    gbuffer_root_signature: d3d::D3d12RootSignatureHandle,
+    gbuffer_pipeline: d3d::D3d12PipelineStateHandle,
+    lighting_ready: bool,
+    lighting_root_signature: d3d::D3d12RootSignatureHandle,
+    lighting_pipeline: d3d::D3d12PipelineStateHandle,
+    lighting_lights_buffer: d3d::D3d12ResourceHandle,
+    /// The lighting pass's own shader-visible heap (four descriptors:
+    /// the three G-buffer SRVs and the lights' CBV; the mesh state's
+    /// heap carries three descriptors and the lighting pass's fourth
+    /// would overrun it).
+    lighting_srv_heap: d3d::D3d12DescriptorHeapHandle,
     bound_texture: Option<usize>,
     default_texture: Option<usize>,
     readback_queue: Vec<(u32, u32)>,
@@ -449,9 +438,7 @@ const S_OK: i32 = 0;
 
 /// Calls the published CreateDXGIFactory1 entry point: the factory the
 /// adapter enumeration walks (the probe C's first step).
-unsafe fn self_create_factory(
-    loader: &D3d12Loader,
-) -> Result<DxgiFactoryHandle, RenderError> {
+unsafe fn self_create_factory(loader: &D3d12Loader) -> Result<DxgiFactoryHandle, RenderError> {
     let mut factory: *mut c_void = std::ptr::null_mut();
     let hr = loader
         .create_dxgi_factory1
@@ -505,12 +492,8 @@ unsafe fn self_read_adapter(
         adapter_luid_high: 0,
         flags: 0,
     };
-    let f: unsafe extern "system" fn(
-        ComObject,
-        *mut DxgiAdapterDesc1,
-    ) -> i32 = std::mem::transmute(
-        *vtable_of(adapter as ComObject)
-        .add(ADAPTER_GET_DESC1));
+    let f: unsafe extern "system" fn(ComObject, *mut DxgiAdapterDesc1) -> i32 =
+        std::mem::transmute(*vtable_of(adapter as ComObject).add(ADAPTER_GET_DESC1));
     let hr = f(adapter as ComObject, &mut desc);
     if hr != S_OK {
         return Err(RenderError::from(format!(
@@ -731,7 +714,10 @@ unsafe fn self_create_texture(
         depth_or_array_size: 1,
         mip_levels: 1,
         format,
-        sample_desc: D3d12SampleDesc { count: 1, quality: 0 },
+        sample_desc: D3d12SampleDesc {
+            count: 1,
+            quality: 0,
+        },
         layout: 0,
         flags,
     };
@@ -785,7 +771,10 @@ unsafe fn self_create_buffer(
         depth_or_array_size: 1,
         mip_levels: 1,
         format: DXGI_FORMAT_UNKNOWN,
-        sample_desc: D3d12SampleDesc { count: 1, quality: 0 },
+        sample_desc: D3d12SampleDesc {
+            count: 1,
+            quality: 0,
+        },
         layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         flags: 0,
     };
@@ -847,26 +836,17 @@ unsafe fn self_create_descriptor_heap(
 
 /// Reads the heap's CPU descriptor handle (slot 9): the hidden
 /// aggregate-return pointer the C vtable's ABI carries.
-unsafe fn self_heap_cpu_handle(
-    heap: d3d::D3d12DescriptorHeapHandle,
-) -> D3d12CpuDescriptorHandle {
+unsafe fn self_heap_cpu_handle(heap: d3d::D3d12DescriptorHeapHandle) -> D3d12CpuDescriptorHandle {
     let mut handle = D3d12CpuDescriptorHandle { ptr: 0 };
-    let f: unsafe extern "system" fn(
-        ComObject,
-        *mut D3d12CpuDescriptorHandle,
-    ) = std::mem::transmute(
-        *vtable_of(heap as ComObject).add(HEAP_GET_CPU_DESCRIPTOR_HANDLE),
-    );
+    let f: unsafe extern "system" fn(ComObject, *mut D3d12CpuDescriptorHandle) =
+        std::mem::transmute(*vtable_of(heap as ComObject).add(HEAP_GET_CPU_DESCRIPTOR_HANDLE));
     f(heap as ComObject, &mut handle);
     handle
 }
 
 /// Reads the descriptor heap's increment size (slot 15): the device's
 /// one word per descriptor the handle offsets carry.
-unsafe fn self_descriptor_increment_size(
-    device: D3d12DeviceHandle,
-    heap_type: u32,
-) -> u32 {
+unsafe fn self_descriptor_increment_size(device: D3d12DeviceHandle, heap_type: u32) -> u32 {
     call_slot_i32_u32(
         device as ComObject,
         DEVICE_GET_DESCRIPTOR_HANDLE_INCREMENT_SIZE,
@@ -890,16 +870,10 @@ unsafe fn self_heap_cpu_handle_offset(
 
 /// Reads the heap's GPU descriptor handle (slot 10): the hidden
 /// aggregate-return pointer the C vtable's ABI carries.
-unsafe fn self_heap_gpu_handle(
-    heap: d3d::D3d12DescriptorHeapHandle,
-) -> D3d12CpuDescriptorHandle {
+unsafe fn self_heap_gpu_handle(heap: d3d::D3d12DescriptorHeapHandle) -> D3d12CpuDescriptorHandle {
     let mut handle = D3d12CpuDescriptorHandle { ptr: 0 };
-    let f: unsafe extern "system" fn(
-        ComObject,
-        *mut D3d12CpuDescriptorHandle,
-    ) = std::mem::transmute(
-        *vtable_of(heap as ComObject).add(HEAP_GET_GPU_DESCRIPTOR_HANDLE),
-    );
+    let f: unsafe extern "system" fn(ComObject, *mut D3d12CpuDescriptorHandle) =
+        std::mem::transmute(*vtable_of(heap as ComObject).add(HEAP_GET_GPU_DESCRIPTOR_HANDLE));
     f(heap as ComObject, &mut handle);
     handle
 }
@@ -943,16 +917,11 @@ unsafe fn self_create_fence(
 
 /// Creates the fence's event (kernel32's CreateEventW): the manual-reset
 /// event the flush waits on.
-unsafe fn self_create_fence_event(
-    loader: &D3d12Loader,
-) -> Result<*mut c_void, RenderError> {
+unsafe fn self_create_fence_event(loader: &D3d12Loader) -> Result<*mut c_void, RenderError> {
     let event = loader
         .create_event_w
         .expect("the loader resolved CreateEventW")(
-        std::ptr::null_mut(),
-        0,
-        0,
-        std::ptr::null(),
+        std::ptr::null_mut(), 0, 0, std::ptr::null()
     );
     if event.is_null() {
         return Err(RenderError::from(
@@ -992,16 +961,12 @@ impl D3d12Backend {
         // probes' minimum), and the adapter's description is the
         // describe() report.
         let factory = unsafe { self_create_factory(&loader)? };
-        let (adapter, adapter_desc, adapter_vendor) =
-            unsafe { self_read_adapter(factory)? };
+        let (adapter, adapter_desc, adapter_vendor) = unsafe { self_read_adapter(factory)? };
         let device = unsafe { self_create_device(&loader, adapter)? };
-        let feature_level = unsafe {
-            self_check_feature_level(device)
-        };
+        let feature_level = unsafe { self_check_feature_level(device) };
         let queue = unsafe { self_create_queue(device)? };
         let allocator = unsafe { self_create_allocator(device)? };
-        let command_list =
-            unsafe { self_create_command_list(device, allocator)? };
+        let command_list = unsafe { self_create_command_list(device, allocator)? };
         let fence = unsafe { self_create_fence(device)? };
         let fence_event = unsafe { self_create_fence_event(&loader)? };
         let mut backend = D3d12Backend {
@@ -1056,6 +1021,14 @@ impl D3d12Backend {
             lit_pipeline: std::ptr::null_mut(),
             lit_lights_buffer: std::ptr::null_mut(),
             lit_block: LightsUniform::none(),
+            gbuffer_ready: false,
+            gbuffer_root_signature: std::ptr::null_mut(),
+            gbuffer_pipeline: std::ptr::null_mut(),
+            lighting_ready: false,
+            lighting_root_signature: std::ptr::null_mut(),
+            lighting_pipeline: std::ptr::null_mut(),
+            lighting_lights_buffer: std::ptr::null_mut(),
+            lighting_srv_heap: std::ptr::null_mut(),
             bound_texture: None,
             default_texture: None,
             readback_queue: Vec::new(),
@@ -1230,12 +1203,8 @@ impl D3d12Backend {
         }
         // The blob sizes: the shader bytecodes' lengths (the PSO desc's
         // bytecode carries).
-        let vs_blob_size = unsafe {
-            call_slot_u64_0(vs_blob as ComObject, BLOB_GET_BUFFER_SIZE)
-        };
-        let ps_blob_size = unsafe {
-            call_slot_u64_0(ps_blob as ComObject, BLOB_GET_BUFFER_SIZE)
-        };
+        let vs_blob_size = unsafe { call_slot_u64_0(vs_blob as ComObject, BLOB_GET_BUFFER_SIZE) };
+        let ps_blob_size = unsafe { call_slot_u64_0(ps_blob as ComObject, BLOB_GET_BUFFER_SIZE) };
         // The root signature: one 32-bit constants root parameter (the
         // 20-word block the draw writes), SHADER_VISIBILITY_ALL.
         let constants = D3d12RootConstants {
@@ -1272,14 +1241,8 @@ impl D3d12Backend {
                 return false;
             }
             let rs_bytes = std::slice::from_raw_parts(
-                call_slot_ptr_0(
-                    rs_blob as ComObject,
-                    BLOB_GET_BUFFER_POINTER,
-                ) as *const u8,
-                call_slot_u64_0(
-                    rs_blob as ComObject,
-                    BLOB_GET_BUFFER_SIZE,
-                ) as usize,
+                call_slot_ptr_0(rs_blob as ComObject, BLOB_GET_BUFFER_POINTER) as *const u8,
+                call_slot_u64_0(rs_blob as ComObject, BLOB_GET_BUFFER_SIZE) as usize,
             );
             let mut root_signature: *mut c_void = std::ptr::null_mut();
             let hr = call_slot_i32_5(
@@ -1409,12 +1372,12 @@ impl D3d12Backend {
             ib_strip_cut_value: 0,
             primitive_topology_type: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             num_render_targets: 1,
-            rtv_formats: [
-                DXGI_FORMAT_R8G8B8A8_UNORM,
-                0, 0, 0, 0, 0, 0, 0,
-            ],
+            rtv_formats: [DXGI_FORMAT_R8G8B8A8_UNORM, 0, 0, 0, 0, 0, 0, 0],
             dsv_format: DXGI_FORMAT_D24_UNORM_S8_UINT,
-            sample_desc: D3d12SampleDesc { count: 1, quality: 0 },
+            sample_desc: D3d12SampleDesc {
+                count: 1,
+                quality: 0,
+            },
             node_mask: 0,
             cached_pso: D3d12CachedPipelineState {
                 cached_blob: std::ptr::null_mut(),
@@ -1427,8 +1390,7 @@ impl D3d12Backend {
             let hr = call_slot_i32_4(
                 self.device as ComObject,
                 DEVICE_CREATE_GRAPHICS_PIPELINE_STATE,
-                &pso_desc as *const D3d12GraphicsPipelineStateDesc
-                    as *mut c_void,
+                &pso_desc as *const D3d12GraphicsPipelineStateDesc as *mut c_void,
                 IID_ID3D12_PIPELINE_STATE_WORDS.as_ptr() as *mut c_void,
                 &mut pipeline as *mut _ as *mut c_void,
                 std::ptr::null_mut(),
@@ -1462,8 +1424,7 @@ impl D3d12Backend {
                 vertex_buffer as ComObject,
                 RESOURCE_MAP,
                 0 as *mut c_void,
-                &D3d12Range { begin: 0, end: 0 } as *const D3d12Range
-                    as *mut c_void,
+                &D3d12Range { begin: 0, end: 0 } as *const D3d12Range as *mut c_void,
                 &mut map as *mut _ as *mut c_void,
                 std::ptr::null_mut(),
             )
@@ -1544,12 +1505,8 @@ impl D3d12Backend {
                 return false;
             }
         }
-        let vs_blob_size = unsafe {
-            call_slot_u64_0(vs_blob as ComObject, BLOB_GET_BUFFER_SIZE)
-        };
-        let ps_blob_size = unsafe {
-            call_slot_u64_0(ps_blob as ComObject, BLOB_GET_BUFFER_SIZE)
-        };
+        let vs_blob_size = unsafe { call_slot_u64_0(vs_blob as ComObject, BLOB_GET_BUFFER_SIZE) };
+        let ps_blob_size = unsafe { call_slot_u64_0(ps_blob as ComObject, BLOB_GET_BUFFER_SIZE) };
         // The root signature: one descriptor table (the CBV at b0 and the
         // SRV at t0) and one static sampler at s0 (the POINT filter the
         // smoke's NEAREST read carries).
@@ -1617,14 +1574,8 @@ impl D3d12Backend {
                 return false;
             }
             let rs_bytes = std::slice::from_raw_parts(
-                call_slot_ptr_0(
-                    rs_blob as ComObject,
-                    BLOB_GET_BUFFER_POINTER,
-                ) as *const u8,
-                call_slot_u64_0(
-                    rs_blob as ComObject,
-                    BLOB_GET_BUFFER_SIZE,
-                ) as usize,
+                call_slot_ptr_0(rs_blob as ComObject, BLOB_GET_BUFFER_POINTER) as *const u8,
+                call_slot_u64_0(rs_blob as ComObject, BLOB_GET_BUFFER_SIZE) as usize,
             );
             let mut root_signature: *mut c_void = std::ptr::null_mut();
             let hr = call_slot_i32_5(
@@ -1774,12 +1725,12 @@ impl D3d12Backend {
             ib_strip_cut_value: 0,
             primitive_topology_type: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             num_render_targets: 1,
-            rtv_formats: [
-                DXGI_FORMAT_R8G8B8A8_UNORM,
-                0, 0, 0, 0, 0, 0, 0,
-            ],
+            rtv_formats: [DXGI_FORMAT_R8G8B8A8_UNORM, 0, 0, 0, 0, 0, 0, 0],
             dsv_format: DXGI_FORMAT_D24_UNORM_S8_UINT,
-            sample_desc: D3d12SampleDesc { count: 1, quality: 0 },
+            sample_desc: D3d12SampleDesc {
+                count: 1,
+                quality: 0,
+            },
             node_mask: 0,
             cached_pso: D3d12CachedPipelineState {
                 cached_blob: std::ptr::null_mut(),
@@ -1792,8 +1743,7 @@ impl D3d12Backend {
             let hr = call_slot_i32_4(
                 self.device as ComObject,
                 DEVICE_CREATE_GRAPHICS_PIPELINE_STATE,
-                &pso_desc as *const D3d12GraphicsPipelineStateDesc
-                    as *mut c_void,
+                &pso_desc as *const D3d12GraphicsPipelineStateDesc as *mut c_void,
                 IID_ID3D12_PIPELINE_STATE_WORDS.as_ptr() as *mut c_void,
                 &mut pipeline as *mut _ as *mut c_void,
                 std::ptr::null_mut(),
@@ -1862,12 +1812,8 @@ impl D3d12Backend {
                 return false;
             }
         }
-        let vs_blob_size = unsafe {
-            call_slot_u64_0(vs_blob as ComObject, BLOB_GET_BUFFER_SIZE)
-        };
-        let ps_blob_size = unsafe {
-            call_slot_u64_0(ps_blob as ComObject, BLOB_GET_BUFFER_SIZE)
-        };
+        let vs_blob_size = unsafe { call_slot_u64_0(vs_blob as ComObject, BLOB_GET_BUFFER_SIZE) };
+        let ps_blob_size = unsafe { call_slot_u64_0(ps_blob as ComObject, BLOB_GET_BUFFER_SIZE) };
         // The root signature: one descriptor table (the frame's CBV at
         // b0, the SRV at t0, the lights' CBV at b1 — the heap's slots 0,
         // 1 and 2) and one static sampler at s0.
@@ -1942,14 +1888,8 @@ impl D3d12Backend {
                 return false;
             }
             let rs_bytes = std::slice::from_raw_parts(
-                call_slot_ptr_0(
-                    rs_blob as ComObject,
-                    BLOB_GET_BUFFER_POINTER,
-                ) as *const u8,
-                call_slot_u64_0(
-                    rs_blob as ComObject,
-                    BLOB_GET_BUFFER_SIZE,
-                ) as usize,
+                call_slot_ptr_0(rs_blob as ComObject, BLOB_GET_BUFFER_POINTER) as *const u8,
+                call_slot_u64_0(rs_blob as ComObject, BLOB_GET_BUFFER_SIZE) as usize,
             );
             let mut root_signature: *mut c_void = std::ptr::null_mut();
             let hr = call_slot_i32_5(
@@ -2098,12 +2038,12 @@ impl D3d12Backend {
             ib_strip_cut_value: 0,
             primitive_topology_type: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             num_render_targets: 1,
-            rtv_formats: [
-                DXGI_FORMAT_R8G8B8A8_UNORM,
-                0, 0, 0, 0, 0, 0, 0,
-            ],
+            rtv_formats: [DXGI_FORMAT_R8G8B8A8_UNORM, 0, 0, 0, 0, 0, 0, 0],
             dsv_format: DXGI_FORMAT_D24_UNORM_S8_UINT,
-            sample_desc: D3d12SampleDesc { count: 1, quality: 0 },
+            sample_desc: D3d12SampleDesc {
+                count: 1,
+                quality: 0,
+            },
             node_mask: 0,
             cached_pso: D3d12CachedPipelineState {
                 cached_blob: std::ptr::null_mut(),
@@ -2116,8 +2056,7 @@ impl D3d12Backend {
             let hr = call_slot_i32_4(
                 self.device as ComObject,
                 DEVICE_CREATE_GRAPHICS_PIPELINE_STATE,
-                &pso_desc as *const D3d12GraphicsPipelineStateDesc
-                    as *mut c_void,
+                &pso_desc as *const D3d12GraphicsPipelineStateDesc as *mut c_void,
                 IID_ID3D12_PIPELINE_STATE_WORDS.as_ptr() as *mut c_void,
                 &mut pipeline as *mut _ as *mut c_void,
                 std::ptr::null_mut(),
@@ -2131,16 +2070,638 @@ impl D3d12Backend {
         true
     }
 
+    /// The deferred lighting path's resources (M6): the two PSOs (the
+    /// G-buffer's geometry PSO with the three-attachment pixel shader,
+    /// the fullscreen lighting PSO) and their root signatures, plus the
+    /// shared 256-byte lights' buffer the lighting draw's CBV at b1
+    /// reads. The same outside-the-frame rule the lit path's ensure
+    /// follows (the PSO creation inside an open frame's recording is
+    /// the crash the debug run caught).
+    fn ensure_deferred_resources(&mut self) -> bool {
+        if self.gbuffer_ready && self.lighting_ready {
+            return true;
+        }
+        // ---- The G-buffer's root signature + PSO ----
+        // The same table the lit path carries: the frame's CBV at b0,
+        // the SRV at t0, the lights' CBV at b1 (the lighting pixel
+        // shader's own copy waits for its signature below); one static
+        // sampler at s0.
+        if !self.gbuffer_ready {
+            let mut rs_blob: D3dBlobHandle = std::ptr::null_mut();
+            let mut error_blob: D3dBlobHandle = std::ptr::null_mut();
+            let vs_source = super::shader_library::GBUFFER_VERTEX_SHADER;
+            let ps_source = super::shader_library::GBUFFER_PIXEL_SHADER;
+            let mut vs_blob: D3dBlobHandle = std::ptr::null_mut();
+            let mut ps_blob: D3dBlobHandle = std::ptr::null_mut();
+            unsafe {
+                let compile = self
+                    .loader
+                    .d3d_compile
+                    .expect("the loader resolved D3DCompile");
+                let hr = compile(
+                    vs_source.as_ptr() as *const c_void,
+                    vs_source.len() as u64,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    b"vsMain\0".as_ptr() as *const c_char,
+                    b"vs_5_0\0".as_ptr() as *const c_char,
+                    0,
+                    0,
+                    &mut vs_blob,
+                    &mut error_blob,
+                );
+                if hr != S_OK || vs_blob.is_null() {
+                    return false;
+                }
+                let hr = compile(
+                    ps_source.as_ptr() as *const c_void,
+                    ps_source.len() as u64,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    b"psMain\0".as_ptr() as *const c_char,
+                    b"ps_5_0\0".as_ptr() as *const c_char,
+                    0,
+                    0,
+                    &mut ps_blob,
+                    &mut error_blob,
+                );
+                if hr != S_OK || ps_blob.is_null() {
+                    return false;
+                }
+            }
+            let vs_blob_size =
+                unsafe { call_slot_u64_0(vs_blob as ComObject, BLOB_GET_BUFFER_SIZE) };
+            let ps_blob_size =
+                unsafe { call_slot_u64_0(ps_blob as ComObject, BLOB_GET_BUFFER_SIZE) };
+            let ranges = [
+                d3d::D3d12DescriptorRange {
+                    range_type: d3d::D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+                    num_descriptors: 1,
+                    base_shader_register: 0,
+                    register_space: 0,
+                    offset_in_descriptors_from_table_start: 0,
+                },
+                d3d::D3d12DescriptorRange {
+                    range_type: d3d::D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                    num_descriptors: 1,
+                    base_shader_register: 0,
+                    register_space: 0,
+                    offset_in_descriptors_from_table_start: 1,
+                },
+                d3d::D3d12DescriptorRange {
+                    range_type: d3d::D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+                    num_descriptors: 1,
+                    base_shader_register: 1,
+                    register_space: 0,
+                    offset_in_descriptors_from_table_start: 2,
+                },
+            ];
+            let table = d3d::D3d12RootDescriptorTable {
+                num_descriptor_ranges: 3,
+                descriptor_ranges: ranges.as_ptr(),
+            };
+            let parameter = D3d12RootParameter {
+                parameter_type: d3d::D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                union_head_padding: [0],
+                constants_or_table: d3d::D3d12RootParameterUnion { table },
+                union_tail_padding: [0],
+                visibility: D3D12_SHADER_VISIBILITY_ALL,
+            };
+            let static_sampler = d3d::D3d12StaticSamplerDesc {
+                filter: d3d::D3D12_FILTER_MIN_MAG_MIP_POINT,
+                address_u: d3d::D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                address_v: d3d::D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                address_w: d3d::D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                mip_lod_bias: 0.0,
+                max_anisotropy: 0,
+                comparison_func: d3d::D3D12_COMPARISON_FUNC_ALWAYS,
+                border_color: d3d::D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+                min_lod: 0.0,
+                max_lod: 3.402823466e38,
+                shader_register: 0,
+                register_space: 0,
+                shader_visibility: D3D12_SHADER_VISIBILITY_ALL,
+            };
+            let root_signature_desc = D3d12RootSignatureDesc {
+                num_parameters: 1,
+                parameters: &parameter,
+                num_static_samplers: 1,
+                static_samplers: &static_sampler as *const _ as *const c_void,
+                flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+            };
+            unsafe {
+                let serialize = self
+                    .loader
+                    .d3d12_serialize_root_signature
+                    .expect("the loader resolved D3D12SerializeRootSignature");
+                let hr = serialize(
+                    &root_signature_desc,
+                    d3d::D3D_ROOT_SIGNATURE_VERSION_1_0,
+                    &mut rs_blob,
+                    &mut error_blob,
+                );
+                if hr != S_OK || rs_blob.is_null() {
+                    return false;
+                }
+                let rs_bytes = std::slice::from_raw_parts(
+                    call_slot_ptr_0(rs_blob as ComObject, BLOB_GET_BUFFER_POINTER) as *const u8,
+                    call_slot_u64_0(rs_blob as ComObject, BLOB_GET_BUFFER_SIZE) as usize,
+                );
+                let mut root_signature: *mut c_void = std::ptr::null_mut();
+                let hr = call_slot_i32_5(
+                    self.device as ComObject,
+                    DEVICE_CREATE_ROOT_SIGNATURE,
+                    0 as *mut c_void,
+                    rs_bytes.as_ptr() as *const c_void as *mut c_void,
+                    rs_bytes.len() as *mut c_void,
+                    IID_ID3D12_ROOT_SIGNATURE_WORDS.as_ptr() as *mut c_void,
+                    &mut root_signature as *mut _ as *mut c_void,
+                );
+                if hr != S_OK || root_signature.is_null() {
+                    return false;
+                }
+                self.gbuffer_root_signature = root_signature;
+            }
+            // The PSO: the same states the lit PSO carries, the
+            // three-attachment pixel shader's bytecode, NumRenderTargets
+            // 3 with the G-buffer's formats.
+            let position = b"POSITION\0";
+            let normal = b"NORMAL\0";
+            let texcoord = b"TEXCOORD\0";
+            let input_elements = [
+                D3d12InputElementDesc {
+                    semantic_name: position.as_ptr() as *const c_char,
+                    semantic_index: 0,
+                    format: DXGI_FORMAT_R32G32B32_FLOAT,
+                    input_slot: 0,
+                    aligned_byte_offset: 0,
+                    input_slot_class: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                    instance_data_step_rate: 0,
+                },
+                D3d12InputElementDesc {
+                    semantic_name: normal.as_ptr() as *const c_char,
+                    semantic_index: 0,
+                    format: DXGI_FORMAT_R32G32B32_FLOAT,
+                    input_slot: 0,
+                    aligned_byte_offset: 12,
+                    input_slot_class: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                    instance_data_step_rate: 0,
+                },
+                D3d12InputElementDesc {
+                    semantic_name: texcoord.as_ptr() as *const c_char,
+                    semantic_index: 0,
+                    format: DXGI_FORMAT_R32G32_FLOAT,
+                    input_slot: 0,
+                    aligned_byte_offset: 24,
+                    input_slot_class: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                    instance_data_step_rate: 0,
+                },
+            ];
+            let blend_target = D3d12RenderTargetBlendDesc {
+                blend_enable: 0,
+                logic_op_enable: 0,
+                src_blend: D3D12_BLEND_ONE,
+                dest_blend: D3D12_BLEND_ZERO,
+                blend_op: D3D12_BLEND_OP_ADD,
+                src_blend_alpha: D3D12_BLEND_ONE,
+                dest_blend_alpha: D3D12_BLEND_ZERO,
+                blend_op_alpha: D3D12_BLEND_OP_ADD,
+                logic_op: 0,
+                render_target_write_mask: D3D12_COLOR_WRITE_ENABLE_ALL,
+            };
+            let blend_state = D3d12BlendDesc {
+                alpha_to_coverage_enable: 0,
+                independent_blend_enable: 0,
+                render_target: [blend_target; 8],
+            };
+            let rasterizer = D3d12RasterizerDesc {
+                fill_mode: D3D12_FILL_MODE_SOLID,
+                cull_mode: D3D12_CULL_MODE_NONE,
+                front_counter_clockwise: 0,
+                depth_bias: 0,
+                depth_bias_clamp: 0.0,
+                slope_scaled_depth_bias: 0.0,
+                depth_clip_enable: 1,
+                multisample_enable: 0,
+                antialiased_line_enable: 0,
+                forced_sample_count: 0,
+                conservative_raster: 0,
+            };
+            let depth_stencil = D3d12DepthStencilDesc {
+                depth_enable: 1,
+                depth_write_mask: D3D12_DEPTH_WRITE_MASK_ALL,
+                depth_func: D3D12_COMPARISON_FUNC_LESS,
+                stencil_enable: 0,
+                stencil_read_mask: 0,
+                stencil_write_mask: 0,
+                front_face: D3d12DepthStencilopDesc {
+                    stencil_fail_op: 0,
+                    stencil_depth_fail_op: 0,
+                    stencil_pass_op: 0,
+                    stencil_func: 0,
+                },
+                back_face: D3d12DepthStencilopDesc {
+                    stencil_fail_op: 0,
+                    stencil_depth_fail_op: 0,
+                    stencil_pass_op: 0,
+                    stencil_func: 0,
+                },
+            };
+            let input_layout = D3d12InputLayoutDesc {
+                num_elements: 3,
+                elements: input_elements.as_ptr(),
+            };
+            let (vs_bytecode, ps_bytecode) = unsafe {
+                (
+                    call_slot_ptr_0(vs_blob as ComObject, BLOB_GET_BUFFER_POINTER),
+                    call_slot_ptr_0(ps_blob as ComObject, BLOB_GET_BUFFER_POINTER),
+                )
+            };
+            let pso_desc = D3d12GraphicsPipelineStateDesc {
+                root_signature: self.gbuffer_root_signature,
+                vs: D3d12ShaderBytecode {
+                    bytecode: vs_bytecode,
+                    length: vs_blob_size,
+                },
+                ps: D3d12ShaderBytecode {
+                    bytecode: ps_bytecode,
+                    length: ps_blob_size,
+                },
+                ds: D3d12ShaderBytecode {
+                    bytecode: std::ptr::null(),
+                    length: 0,
+                },
+                hs: D3d12ShaderBytecode {
+                    bytecode: std::ptr::null(),
+                    length: 0,
+                },
+                gs: D3d12ShaderBytecode {
+                    bytecode: std::ptr::null(),
+                    length: 0,
+                },
+                stream_output: D3d12StreamOutputDesc {
+                    so_declaration: std::ptr::null(),
+                    num_entries: 0,
+                    head_padding: [0],
+                    buffer_strides: std::ptr::null(),
+                    num_strides: 0,
+                    rasterized_stream: 0,
+                },
+                blend_state,
+                sample_mask: 0xffffffff,
+                rasterizer_state: rasterizer,
+                depth_stencil_state: depth_stencil,
+                input_layout,
+                ib_strip_cut_value: 0,
+                primitive_topology_type: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                num_render_targets: 3,
+                rtv_formats: [
+                    DXGI_FORMAT_R8G8B8A8_UNORM,
+                    DXGI_FORMAT_R8G8B8A8_UNORM,
+                    DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                dsv_format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+                sample_desc: D3d12SampleDesc {
+                    count: 1,
+                    quality: 0,
+                },
+                node_mask: 0,
+                cached_pso: D3d12CachedPipelineState {
+                    cached_blob: std::ptr::null_mut(),
+                    cached_blob_size: 0,
+                },
+                flags: 0,
+            };
+            let mut pipeline: *mut c_void = std::ptr::null_mut();
+            unsafe {
+                let hr = call_slot_i32_4(
+                    self.device as ComObject,
+                    DEVICE_CREATE_GRAPHICS_PIPELINE_STATE,
+                    &pso_desc as *const D3d12GraphicsPipelineStateDesc as *mut c_void,
+                    IID_ID3D12_PIPELINE_STATE_WORDS.as_ptr() as *mut c_void,
+                    &mut pipeline as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                );
+                if hr != S_OK || pipeline.is_null() {
+                    return false;
+                }
+            }
+            self.gbuffer_pipeline = pipeline;
+            self.gbuffer_ready = true;
+        }
+        // ---- The lighting pass's root signature + PSO ----
+        if !self.lighting_ready {
+            let mut vs_blob: D3dBlobHandle = std::ptr::null_mut();
+            let mut ps_blob: D3dBlobHandle = std::ptr::null_mut();
+            let mut rs_blob: D3dBlobHandle = std::ptr::null_mut();
+            let mut error_blob: D3dBlobHandle = std::ptr::null_mut();
+            let vs_source = super::shader_library::LIGHTING_VERTEX_SHADER;
+            let ps_source = super::shader_library::LIGHTING_PIXEL_SHADER;
+            unsafe {
+                let compile = self
+                    .loader
+                    .d3d_compile
+                    .expect("the loader resolved D3DCompile");
+                let hr = compile(
+                    vs_source.as_ptr() as *const c_void,
+                    vs_source.len() as u64,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    b"vsMain\0".as_ptr() as *const c_char,
+                    b"vs_5_0\0".as_ptr() as *const c_char,
+                    0,
+                    0,
+                    &mut vs_blob,
+                    &mut error_blob,
+                );
+                if hr != S_OK || vs_blob.is_null() {
+                    return false;
+                }
+                let hr = compile(
+                    ps_source.as_ptr() as *const c_void,
+                    ps_source.len() as u64,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    b"psMain\0".as_ptr() as *const c_char,
+                    b"ps_5_0\0".as_ptr() as *const c_char,
+                    0,
+                    0,
+                    &mut ps_blob,
+                    &mut error_blob,
+                );
+                if hr != S_OK || ps_blob.is_null() {
+                    return false;
+                }
+            }
+            let vs_blob_size =
+                unsafe { call_slot_u64_0(vs_blob as ComObject, BLOB_GET_BUFFER_SIZE) };
+            let ps_blob_size =
+                unsafe { call_slot_u64_0(ps_blob as ComObject, BLOB_GET_BUFFER_SIZE) };
+            // The root signature: the lights' CBV at b1 and the three
+            // SRVs at t0-t2 (the descriptor table's slots), one static
+            // sampler at s0. No input assembler (the fullscreen
+            // triangle's vertex ID generates the corners).
+            let ranges = [
+                d3d::D3d12DescriptorRange {
+                    range_type: d3d::D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                    num_descriptors: 3,
+                    base_shader_register: 0,
+                    register_space: 0,
+                    offset_in_descriptors_from_table_start: 0,
+                },
+                d3d::D3d12DescriptorRange {
+                    range_type: d3d::D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+                    num_descriptors: 1,
+                    base_shader_register: 1,
+                    register_space: 0,
+                    offset_in_descriptors_from_table_start: 3,
+                },
+            ];
+            let table = d3d::D3d12RootDescriptorTable {
+                num_descriptor_ranges: 2,
+                descriptor_ranges: ranges.as_ptr(),
+            };
+            let parameter = D3d12RootParameter {
+                parameter_type: d3d::D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                union_head_padding: [0],
+                constants_or_table: d3d::D3d12RootParameterUnion { table },
+                union_tail_padding: [0],
+                visibility: D3D12_SHADER_VISIBILITY_ALL,
+            };
+            let static_sampler = d3d::D3d12StaticSamplerDesc {
+                filter: d3d::D3D12_FILTER_MIN_MAG_MIP_POINT,
+                address_u: d3d::D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                address_v: d3d::D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                address_w: d3d::D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                mip_lod_bias: 0.0,
+                max_anisotropy: 0,
+                comparison_func: d3d::D3D12_COMPARISON_FUNC_ALWAYS,
+                border_color: d3d::D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+                min_lod: 0.0,
+                max_lod: 3.402823466e38,
+                shader_register: 0,
+                register_space: 0,
+                shader_visibility: D3D12_SHADER_VISIBILITY_ALL,
+            };
+            let root_signature_desc = D3d12RootSignatureDesc {
+                num_parameters: 1,
+                parameters: &parameter,
+                num_static_samplers: 1,
+                static_samplers: &static_sampler as *const _ as *const c_void,
+                flags: 0,
+            };
+            unsafe {
+                let serialize = self
+                    .loader
+                    .d3d12_serialize_root_signature
+                    .expect("the loader resolved D3D12SerializeRootSignature");
+                let hr = serialize(
+                    &root_signature_desc,
+                    d3d::D3D_ROOT_SIGNATURE_VERSION_1_0,
+                    &mut rs_blob,
+                    &mut error_blob,
+                );
+                if hr != S_OK || rs_blob.is_null() {
+                    return false;
+                }
+                let rs_bytes = std::slice::from_raw_parts(
+                    call_slot_ptr_0(rs_blob as ComObject, BLOB_GET_BUFFER_POINTER) as *const u8,
+                    call_slot_u64_0(rs_blob as ComObject, BLOB_GET_BUFFER_SIZE) as usize,
+                );
+                let mut root_signature: *mut c_void = std::ptr::null_mut();
+                let hr = call_slot_i32_5(
+                    self.device as ComObject,
+                    DEVICE_CREATE_ROOT_SIGNATURE,
+                    0 as *mut c_void,
+                    rs_bytes.as_ptr() as *const c_void as *mut c_void,
+                    rs_bytes.len() as *mut c_void,
+                    IID_ID3D12_ROOT_SIGNATURE_WORDS.as_ptr() as *mut c_void,
+                    &mut root_signature as *mut _ as *mut c_void,
+                );
+                if hr != S_OK || root_signature.is_null() {
+                    return false;
+                }
+                self.lighting_root_signature = root_signature;
+            }
+            // The PSO: no input layout, the depth test off (the
+            // fullscreen triangle covers the frame without the depth
+            // test), one render target.
+            let blend_target = D3d12RenderTargetBlendDesc {
+                blend_enable: 0,
+                logic_op_enable: 0,
+                src_blend: D3D12_BLEND_ONE,
+                dest_blend: D3D12_BLEND_ZERO,
+                blend_op: D3D12_BLEND_OP_ADD,
+                src_blend_alpha: D3D12_BLEND_ONE,
+                dest_blend_alpha: D3D12_BLEND_ZERO,
+                blend_op_alpha: D3D12_BLEND_OP_ADD,
+                logic_op: 0,
+                render_target_write_mask: D3D12_COLOR_WRITE_ENABLE_ALL,
+            };
+            let blend_state = D3d12BlendDesc {
+                alpha_to_coverage_enable: 0,
+                independent_blend_enable: 0,
+                render_target: [blend_target; 8],
+            };
+            let rasterizer = D3d12RasterizerDesc {
+                fill_mode: D3D12_FILL_MODE_SOLID,
+                cull_mode: D3D12_CULL_MODE_NONE,
+                front_counter_clockwise: 0,
+                depth_bias: 0,
+                depth_bias_clamp: 0.0,
+                slope_scaled_depth_bias: 0.0,
+                depth_clip_enable: 1,
+                multisample_enable: 0,
+                antialiased_line_enable: 0,
+                forced_sample_count: 0,
+                conservative_raster: 0,
+            };
+            let depth_stencil = D3d12DepthStencilDesc {
+                depth_enable: 0,
+                depth_write_mask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                depth_func: D3D12_COMPARISON_FUNC_LESS,
+                stencil_enable: 0,
+                stencil_read_mask: 0,
+                stencil_write_mask: 0,
+                front_face: D3d12DepthStencilopDesc {
+                    stencil_fail_op: 0,
+                    stencil_depth_fail_op: 0,
+                    stencil_pass_op: 0,
+                    stencil_func: 0,
+                },
+                back_face: D3d12DepthStencilopDesc {
+                    stencil_fail_op: 0,
+                    stencil_depth_fail_op: 0,
+                    stencil_pass_op: 0,
+                    stencil_func: 0,
+                },
+            };
+            let input_layout = D3d12InputLayoutDesc {
+                num_elements: 0,
+                elements: std::ptr::null(),
+            };
+            let (vs_bytecode, ps_bytecode) = unsafe {
+                (
+                    call_slot_ptr_0(vs_blob as ComObject, BLOB_GET_BUFFER_POINTER),
+                    call_slot_ptr_0(ps_blob as ComObject, BLOB_GET_BUFFER_POINTER),
+                )
+            };
+            let pso_desc = D3d12GraphicsPipelineStateDesc {
+                root_signature: self.lighting_root_signature,
+                vs: D3d12ShaderBytecode {
+                    bytecode: vs_bytecode,
+                    length: vs_blob_size,
+                },
+                ps: D3d12ShaderBytecode {
+                    bytecode: ps_bytecode,
+                    length: ps_blob_size,
+                },
+                ds: D3d12ShaderBytecode {
+                    bytecode: std::ptr::null(),
+                    length: 0,
+                },
+                hs: D3d12ShaderBytecode {
+                    bytecode: std::ptr::null(),
+                    length: 0,
+                },
+                gs: D3d12ShaderBytecode {
+                    bytecode: std::ptr::null(),
+                    length: 0,
+                },
+                stream_output: D3d12StreamOutputDesc {
+                    so_declaration: std::ptr::null(),
+                    num_entries: 0,
+                    head_padding: [0],
+                    buffer_strides: std::ptr::null(),
+                    num_strides: 0,
+                    rasterized_stream: 0,
+                },
+                blend_state,
+                sample_mask: 0xffffffff,
+                rasterizer_state: rasterizer,
+                depth_stencil_state: depth_stencil,
+                input_layout,
+                ib_strip_cut_value: 0,
+                primitive_topology_type: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                num_render_targets: 1,
+                rtv_formats: [DXGI_FORMAT_R8G8B8A8_UNORM, 0, 0, 0, 0, 0, 0, 0],
+                dsv_format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+                sample_desc: D3d12SampleDesc {
+                    count: 1,
+                    quality: 0,
+                },
+                node_mask: 0,
+                cached_pso: D3d12CachedPipelineState {
+                    cached_blob: std::ptr::null_mut(),
+                    cached_blob_size: 0,
+                },
+                flags: 0,
+            };
+            let mut pipeline: *mut c_void = std::ptr::null_mut();
+            unsafe {
+                let hr = call_slot_i32_4(
+                    self.device as ComObject,
+                    DEVICE_CREATE_GRAPHICS_PIPELINE_STATE,
+                    &pso_desc as *const D3d12GraphicsPipelineStateDesc as *mut c_void,
+                    IID_ID3D12_PIPELINE_STATE_WORDS.as_ptr() as *mut c_void,
+                    &mut pipeline as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                );
+                if hr != S_OK || pipeline.is_null() {
+                    return false;
+                }
+            }
+            self.lighting_pipeline = pipeline;
+            // The lights' shared buffer (the same 256-byte UPLOAD-heap
+            // buffer the lit draw's CBV reads).
+            if self.lighting_lights_buffer.is_null() {
+                match unsafe {
+                    self_create_buffer(
+                        self.device,
+                        256,
+                        D3D12_HEAP_TYPE_UPLOAD,
+                        D3D12_RESOURCE_STATE_GENERIC_READ,
+                    )
+                } {
+                    Ok(buffer) => self.lighting_lights_buffer = buffer,
+                    Err(_) => return false,
+                }
+            }
+            // The lighting pass's own shader-visible heap: four
+            // descriptors (the three G-buffer SRVs at slots 0-2, the
+            // lights' CBV at slot 3).
+            if self.lighting_srv_heap.is_null() {
+                match unsafe {
+                    self_create_descriptor_heap(
+                        self.device,
+                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        4,
+                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    )
+                } {
+                    Ok(heap) => self.lighting_srv_heap = heap,
+                    Err(_) => return false,
+                }
+            }
+            self.lighting_ready = true;
+        }
+        true
+    }
+
     /// Builds the triangle's uniform block bytes (the MVP column-major
     /// followed by the colour).
     fn build_tri_uniform(&self) -> TriUniform {
         let aspect = self.config.width as f32 / self.config.height as f32;
-        let projection = Mat4::perspective(
-            std::f32::consts::FRAC_PI_2,
-            aspect,
-            0.1,
-            100.0,
-        );
+        let projection = Mat4::perspective(std::f32::consts::FRAC_PI_2, aspect, 0.1, 100.0);
         let view = Mat4::look_at(
             Vec3::new(0.0, 0.0, 1.0),
             Vec3::new(0.0, 0.0, 0.0),
@@ -2167,12 +2728,8 @@ impl D3d12Backend {
             return;
         }
         let uniform = self.build_tri_uniform();
-        let uniform_words = unsafe {
-            std::slice::from_raw_parts(
-                &uniform as *const TriUniform as *const u32,
-                20,
-            )
-        };
+        let uniform_words =
+            unsafe { std::slice::from_raw_parts(&uniform as *const TriUniform as *const u32, 20) };
         let viewport = D3d12Viewport {
             top_left_x: 0.0,
             top_left_y: 0.0,
@@ -2222,11 +2779,9 @@ impl D3d12Backend {
                 self.command_list as ComObject,
                 COMMAND_LIST_OMSET_RENDER_TARGETS,
                 1 as *mut c_void,
-                &self.rtv_handle as *const D3d12CpuDescriptorHandle
-                    as *mut c_void,
+                &self.rtv_handle as *const D3d12CpuDescriptorHandle as *mut c_void,
                 0 as *mut c_void,
-                &self.dsv_handle as *const D3d12CpuDescriptorHandle
-                    as *mut c_void,
+                &self.dsv_handle as *const D3d12CpuDescriptorHandle as *mut c_void,
                 std::ptr::null_mut(),
             );
             call_slot_i32_2(
@@ -2249,8 +2804,7 @@ impl D3d12Backend {
                 COMMAND_LIST_IASET_VERTEX_BUFFERS,
                 0 as *mut c_void,
                 1 as *mut c_void,
-                &vertex_buffer_view as *const D3d12VertexBufferView
-                    as *mut c_void,
+                &vertex_buffer_view as *const D3d12VertexBufferView as *mut c_void,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             );
@@ -2349,8 +2903,7 @@ impl D3d12Backend {
                 self.command_list as ComObject,
                 COMMAND_LIST_CLEAR_DEPTH_STENCIL_VIEW,
                 self.dsv_handle.ptr as *mut c_void,
-                (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL)
-                    as u32,
+                (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL) as u32,
                 self.clear_depth as f32,
                 self.clear_stencil as u32,
                 1,
@@ -2371,9 +2924,7 @@ impl D3d12Backend {
         // readback's execute closed the list (the same rule the fill's
         // one-off frame follows).
         if !self.frame_open {
-            let hr = unsafe {
-                call_slot_i32_0(self.allocator as ComObject, ALLOCATOR_RESET)
-            };
+            let hr = unsafe { call_slot_i32_0(self.allocator as ComObject, ALLOCATOR_RESET) };
             if hr != S_OK {
                 return;
             }
@@ -2558,9 +3109,7 @@ impl D3d12Backend {
         // The frame executes: the Close, the ExecuteCommandLists, the
         // queue's Signal and the wait (the GPU-side completion is what
         // the wait sees).
-        let hr = unsafe {
-            call_slot_i32_0(self.command_list as ComObject, COMMAND_LIST_CLOSE)
-        };
+        let hr = unsafe { call_slot_i32_0(self.command_list as ComObject, COMMAND_LIST_CLOSE) };
         if hr != S_OK {
             return;
         }
@@ -2592,7 +3141,7 @@ impl D3d12Backend {
             self.loader
                 .wait_for_single_object
                 .expect("the loader resolved WaitForSingleObject")(
-                self.fence_event, 5000,
+                self.fence_event, 5000
             );
         }
         // The mapped staging buffer carries the three planes.
@@ -2697,8 +3246,7 @@ impl D3d12Backend {
         let camera = self.camera;
         let aspect = self.config.width as f32 / self.config.height as f32;
         let view = Mat4::look_at(camera.eye, camera.target, camera.up);
-        let projection =
-            Mat4::perspective(camera.fov_y_rad, aspect, camera.near, camera.far);
+        let projection = Mat4::perspective(camera.fov_y_rad, aspect, camera.near, camera.far);
         let view_projection = projection.multiply(view);
         // The uniform block: the two column-major matrices (the same
         // bytes the Vulkan block carries; the shader's column_major
@@ -2707,10 +3255,7 @@ impl D3d12Backend {
         // first 128 bytes, the rest zero.
         let mut uniform = [0u8; 256];
         uniform[0..64].copy_from_slice(unsafe {
-            std::slice::from_raw_parts(
-                view_projection.m.as_ptr() as *const u8,
-                64,
-            )
+            std::slice::from_raw_parts(view_projection.m.as_ptr() as *const u8, 64)
         });
         uniform[64..128].copy_from_slice(unsafe {
             std::slice::from_raw_parts(model.m.as_ptr() as *const u8, 64)
@@ -2746,17 +3291,12 @@ impl D3d12Backend {
                 state.uniform_buffer as ComObject,
                 RESOURCE_MAP,
                 0 as *mut c_void,
-                &D3d12Range { begin: 0, end: 0 } as *const D3d12Range
-                    as *mut c_void,
+                &D3d12Range { begin: 0, end: 0 } as *const D3d12Range as *mut c_void,
                 &mut map as *mut _ as *mut c_void,
                 std::ptr::null_mut(),
             );
             if hr == S_OK && !map.is_null() {
-                std::ptr::copy_nonoverlapping(
-                    uniform.as_ptr(),
-                    map as *mut u8,
-                    256,
-                );
+                std::ptr::copy_nonoverlapping(uniform.as_ptr(), map as *mut u8, 256);
                 call_slot_i32_2(
                     state.uniform_buffer as ComObject,
                     RESOURCE_UNMAP,
@@ -2790,8 +3330,7 @@ impl D3d12Backend {
                     self.lit_lights_buffer as ComObject,
                     RESOURCE_MAP,
                     0 as *mut c_void,
-                    &D3d12Range { begin: 0, end: 0 } as *const D3d12Range
-                        as *mut c_void,
+                    &D3d12Range { begin: 0, end: 0 } as *const D3d12Range as *mut c_void,
                     &mut map as *mut _ as *mut c_void,
                     std::ptr::null_mut(),
                 );
@@ -2819,8 +3358,8 @@ impl D3d12Backend {
         let srv_desc = d3d::D3d12ShaderResourceViewDesc {
             format: DXGI_FORMAT_R8G8B8A8_UNORM,
             view_dimension: d3d::D3D12_SRV_DIMENSION_TEXTURE2D,
-            shader_4_component_mapping:
-                d3d::D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            shader_4_component_mapping: d3d::D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            header_padding: [0],
             texture_2d: d3d::D3d12Tex2DSrv {
                 most_detailed_mip: 0,
                 mip_levels: 1,
@@ -2880,46 +3419,50 @@ impl D3d12Backend {
             call_slot_i32_2(
                 self.device as ComObject,
                 DEVICE_CREATE_CONSTANT_BUFFER_VIEW,
-                &cbv_desc as *const d3d::D3d12ConstantBufferViewDesc
-                    as *mut c_void,
+                &cbv_desc as *const d3d::D3d12ConstantBufferViewDesc as *mut c_void,
                 self_heap_cpu_handle_offset(
                     state.srv_heap,
                     self.device,
                     d3d::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                     0,
-                ).ptr as *mut c_void,
+                )
+                .ptr as *mut c_void,
             );
             if lit {
                 call_slot_i32_2(
                     self.device as ComObject,
                     DEVICE_CREATE_CONSTANT_BUFFER_VIEW,
-                    &lights_cbv_desc as *const d3d::D3d12ConstantBufferViewDesc
-                        as *mut c_void,
+                    &lights_cbv_desc as *const d3d::D3d12ConstantBufferViewDesc as *mut c_void,
                     self_heap_cpu_handle_offset(
                         state.srv_heap,
                         self.device,
                         d3d::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                         2,
-                    ).ptr as *mut c_void,
+                    )
+                    .ptr as *mut c_void,
                 );
             }
             call_slot_i32_3(
                 self.device as ComObject,
                 DEVICE_CREATE_SHADER_RESOURCE_VIEW,
                 texture_resource,
-                &srv_desc as *const d3d::D3d12ShaderResourceViewDesc
-                    as *mut c_void,
+                &srv_desc as *const d3d::D3d12ShaderResourceViewDesc as *mut c_void,
                 self_heap_cpu_handle_offset(
                     state.srv_heap,
                     self.device,
                     d3d::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                     1,
-                ).ptr as *mut c_void,
+                )
+                .ptr as *mut c_void,
             );
             call_slot_i32_2(
                 self.command_list as ComObject,
                 COMMAND_LIST_SET_PIPELINE_STATE,
-                if lit { self.lit_pipeline } else { self.mesh_pipeline },
+                if lit {
+                    self.lit_pipeline
+                } else {
+                    self.mesh_pipeline
+                },
                 std::ptr::null_mut(),
             );
             // The frame's render targets: the same OMSetRenderTargets
@@ -2929,11 +3472,9 @@ impl D3d12Backend {
                 self.command_list as ComObject,
                 COMMAND_LIST_OMSET_RENDER_TARGETS,
                 1 as *mut c_void,
-                &self.rtv_handle as *const D3d12CpuDescriptorHandle
-                    as *mut c_void,
+                &self.rtv_handle as *const D3d12CpuDescriptorHandle as *mut c_void,
                 0 as *mut c_void,
-                &self.dsv_handle as *const D3d12CpuDescriptorHandle
-                    as *mut c_void,
+                &self.dsv_handle as *const D3d12CpuDescriptorHandle as *mut c_void,
                 std::ptr::null_mut(),
             );
             call_slot_i32_2(
@@ -2991,16 +3532,14 @@ impl D3d12Backend {
                 COMMAND_LIST_IASET_VERTEX_BUFFERS,
                 0 as *mut c_void,
                 1 as *mut c_void,
-                &vertex_buffer_view as *const D3d12VertexBufferView
-                    as *mut c_void,
+                &vertex_buffer_view as *const D3d12VertexBufferView as *mut c_void,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             );
             call_slot_i32_2(
                 self.command_list as ComObject,
                 COMMAND_LIST_IASET_INDEX_BUFFER,
-                &index_buffer_view as *const d3d::D3d12IndexBufferView
-                    as *mut c_void,
+                &index_buffer_view as *const d3d::D3d12IndexBufferView as *mut c_void,
                 std::ptr::null_mut(),
             );
             call_slot_i32_5(
@@ -3051,9 +3590,7 @@ impl RenderBackend for D3d12Backend {
         }
         // The frame's command list opens: the allocator and the list
         // reset, the clears and the diagnostic draw are recorded.
-        let hr = unsafe {
-            call_slot_i32_0(self.allocator as ComObject, ALLOCATOR_RESET)
-        };
+        let hr = unsafe { call_slot_i32_0(self.allocator as ComObject, ALLOCATOR_RESET) };
         if hr != S_OK {
             self.violations += 1;
             return;
@@ -3098,10 +3635,7 @@ impl RenderBackend for D3d12Backend {
         self.violations
     }
 
-    fn create_shader_program(
-        &mut self,
-        id: u32,
-    ) -> Result<ShaderProgram, RenderError> {
+    fn create_shader_program(&mut self, id: u32) -> Result<ShaderProgram, RenderError> {
         if self.shutdown {
             self.violations += 1;
             return Err(RenderError::from(
@@ -3109,10 +3643,7 @@ impl RenderBackend for D3d12Backend {
             ));
         }
         Ok(ShaderProgram {
-            inner: Arc::new(Mutex::new(ShaderProgramInner {
-                id,
-                compiled: true,
-            })),
+            inner: Arc::new(Mutex::new(ShaderProgramInner { id, compiled: true })),
         })
     }
 
@@ -3144,9 +3675,7 @@ impl RenderBackend for D3d12Backend {
     ) -> Result<(), RenderError> {
         if self.shutdown {
             self.violations += 1;
-            return Err(RenderError::from(
-                "upload_mesh: the backend is shut down",
-            ));
+            return Err(RenderError::from("upload_mesh: the backend is shut down"));
         }
         if layout.stride == 0 {
             return Err(RenderError::from(
@@ -3209,8 +3738,7 @@ impl RenderBackend for D3d12Backend {
                 vertex_buffer as ComObject,
                 RESOURCE_MAP,
                 0 as *mut c_void,
-                &D3d12Range { begin: 0, end: 0 } as *const D3d12Range
-                    as *mut c_void,
+                &D3d12Range { begin: 0, end: 0 } as *const D3d12Range as *mut c_void,
                 &mut map as *mut _ as *mut c_void,
                 std::ptr::null_mut(),
             );
@@ -3219,11 +3747,7 @@ impl RenderBackend for D3d12Backend {
                     "upload_mesh: the vertex buffer's map failed",
                 ));
             }
-            std::ptr::copy_nonoverlapping(
-                vertices.as_ptr(),
-                map as *mut u8,
-                vertices.len(),
-            );
+            std::ptr::copy_nonoverlapping(vertices.as_ptr(), map as *mut u8, vertices.len());
             call_slot_i32_2(
                 vertex_buffer as ComObject,
                 RESOURCE_UNMAP,
@@ -3235,8 +3759,7 @@ impl RenderBackend for D3d12Backend {
                 index_buffer as ComObject,
                 RESOURCE_MAP,
                 0 as *mut c_void,
-                &D3d12Range { begin: 0, end: 0 } as *const D3d12Range
-                    as *mut c_void,
+                &D3d12Range { begin: 0, end: 0 } as *const D3d12Range as *mut c_void,
                 &mut map as *mut _ as *mut c_void,
                 std::ptr::null_mut(),
             );
@@ -3343,6 +3866,658 @@ impl RenderBackend for D3d12Backend {
         self.draw_mesh_by_id(mesh_id, submission.model);
     }
 
+    /// The deferred lighting pass (M6): the two internal steps the
+    /// contract's submit_lighting_pass carries. Step one (the geometry
+    /// pass) sets the G-buffer's three RTVs, draws the mesh with the
+    /// G-buffer PSO. Step two transitions the attachments into the
+    /// pixel-shader-resource state, sets the default framebuffer's RTV,
+    /// and draws the fullscreen triangle with the lighting PSO.
+    fn submit_lighting_pass(&mut self, submission: &DrawSubmission, gbuffer: &RenderTarget) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        for light in &submission.lights {
+            if light.validate().is_err() {
+                self.violations += 1;
+            }
+        }
+        let target_index = match self
+            .targets
+            .iter()
+            .position(|x| Arc::ptr_eq(&x.inner, &gbuffer.inner))
+        {
+            Some(index) => index,
+            None => {
+                self.violations += 1;
+                return;
+            }
+        };
+        if self.targets[target_index].released {
+            self.violations += 1;
+            return;
+        }
+        let mesh_id = submission.mesh.inner.lock().unwrap().id;
+        if mesh_id >= self.meshes.len() || self.meshes[mesh_id].is_none() {
+            self.violations += 1;
+            return;
+        }
+        if !self.mesh_ready || !self.ensure_deferred_resources() {
+            return;
+        }
+        if !self.frame_open {
+            self.violations += 1;
+            return;
+        }
+        // The lights' block: the same from_lights the forward path
+        // carries.
+        let default_sun = DirectionalLight {
+            direction: Vec3::new(0.0, -1.0, 0.0),
+            color: Vec3::new(0.0, 0.0, 0.0),
+            intensity: 0.0,
+        };
+        let sun = submission.sun.as_ref().unwrap_or(&default_sun);
+        let block = LightsUniform::from_lights(sun, &submission.lights);
+        let camera = self.camera;
+        let aspect = self.config.width as f32 / self.config.height as f32;
+        let view = Mat4::look_at(camera.eye, camera.target, camera.up);
+        let projection = Mat4::perspective(camera.fov_y_rad, aspect, camera.near, camera.far);
+        let view_projection = projection.multiply(view);
+        let model = submission.model;
+        // The G-buffer's camera uniform block: the same 256-byte CBV
+        // alignment the mesh path's block carries.
+        let mut uniform = [0u8; 256];
+        uniform[0..64].copy_from_slice(unsafe {
+            std::slice::from_raw_parts(view_projection.m.as_ptr() as *const u8, 64)
+        });
+        uniform[64..128].copy_from_slice(unsafe {
+            std::slice::from_raw_parts(model.m.as_ptr() as *const u8, 64)
+        });
+        let (vertex_buffer, index_buffer, vertex_bytes, index_count, srv_heap, uniform_buffer) = {
+            let state = self.meshes[mesh_id].as_ref().unwrap();
+            (
+                state.vertex_buffer,
+                state.index_buffer,
+                state.vertex_bytes,
+                state.index_count,
+                state.srv_heap,
+                state.uniform_buffer,
+            )
+        };
+        let texture_resource = self
+            .bound_texture
+            .and_then(|i| self.textures_2d.get(i))
+            .filter(|t| !t.released)
+            .map(|t| t.resource)
+            .unwrap_or(
+                self.default_texture
+                    .and_then(|i| self.textures_2d.get(i))
+                    .filter(|t| !t.released)
+                    .map(|t| t.resource)
+                    .unwrap_or(std::ptr::null_mut()),
+            );
+        let gbuffer_resources: Vec<d3d::D3d12ResourceHandle> = self.targets[target_index]
+            .views
+            .iter()
+            .take(3)
+            .map(|v| v.resource)
+            .collect();
+        if gbuffer_resources.len() != 3 {
+            self.violations += 1;
+            return;
+        }
+        // The G-buffer's RTV heap (one descriptor per attachment): the
+        // creation happens once (the target's own heap field).
+        if self.targets[target_index].rtv_heap.is_null() {
+            match unsafe {
+                self_create_descriptor_heap(
+                    self.device,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    3,
+                    D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                )
+            } {
+                Ok(heap) => self.targets[target_index].rtv_heap = heap,
+                Err(_) => {
+                    self.violations += 1;
+                    return;
+                }
+            }
+            for (i, resource) in gbuffer_resources.iter().enumerate() {
+                let handle = unsafe {
+                    self_heap_cpu_handle_offset(
+                        self.targets[target_index].rtv_heap,
+                        self.device,
+                        D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                        i,
+                    )
+                };
+                unsafe {
+                    call_slot_i32_4(
+                        self.device as ComObject,
+                        DEVICE_CREATE_RENDER_TARGET_VIEW,
+                        *resource,
+                        std::ptr::null_mut(),
+                        handle.ptr as *mut c_void,
+                        std::ptr::null_mut(),
+                    );
+                }
+            }
+        }
+        let gbuffer_rtv_handles: [D3d12CpuDescriptorHandle; 3] = [
+            unsafe {
+                self_heap_cpu_handle_offset(
+                    self.targets[target_index].rtv_heap,
+                    self.device,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    0,
+                )
+            },
+            unsafe {
+                self_heap_cpu_handle_offset(
+                    self.targets[target_index].rtv_heap,
+                    self.device,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    1,
+                )
+            },
+            unsafe {
+                self_heap_cpu_handle_offset(
+                    self.targets[target_index].rtv_heap,
+                    self.device,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    2,
+                )
+            },
+        ];
+        let gbuffer_depth = self.targets[target_index]
+            .depth_view
+            .as_ref()
+            .map(|v| v.resource);
+        // The camera uniform's write through the mesh state's own uniform
+        // buffer.
+        let uniform_address = unsafe {
+            call_slot_u64_0(
+                uniform_buffer as ComObject,
+                RESOURCE_GET_GPU_VIRTUAL_ADDRESS,
+            )
+        };
+        unsafe {
+            let mut map: *mut c_void = std::ptr::null_mut();
+            let hr = call_slot_i32_4(
+                uniform_buffer as ComObject,
+                RESOURCE_MAP,
+                0 as *mut c_void,
+                &D3d12Range { begin: 0, end: 0 } as *const D3d12Range as *mut c_void,
+                &mut map as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if hr == S_OK && !map.is_null() {
+                std::ptr::copy_nonoverlapping(uniform.as_ptr(), map as *mut u8, 256);
+                call_slot_i32_2(
+                    uniform_buffer as ComObject,
+                    RESOURCE_UNMAP,
+                    0 as *mut c_void,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+        // The lights' bytes into the deferred path's own buffer.
+        unsafe {
+            let mut map: *mut c_void = std::ptr::null_mut();
+            let hr = call_slot_i32_4(
+                self.lighting_lights_buffer as ComObject,
+                RESOURCE_MAP,
+                0 as *mut c_void,
+                &D3d12Range { begin: 0, end: 0 } as *const D3d12Range as *mut c_void,
+                &mut map as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if hr == S_OK && !map.is_null() {
+                std::ptr::copy_nonoverlapping(
+                    &block as *const LightsUniform as *const u8,
+                    map as *mut u8,
+                    256,
+                );
+                call_slot_i32_2(
+                    self.lighting_lights_buffer as ComObject,
+                    RESOURCE_UNMAP,
+                    0 as *mut c_void,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+        let lights_address = unsafe {
+            call_slot_u64_0(
+                self.lighting_lights_buffer as ComObject,
+                RESOURCE_GET_GPU_VIRTUAL_ADDRESS,
+            )
+        };
+        let cbv_desc = d3d::D3d12ConstantBufferViewDesc {
+            buffer_location: uniform_address,
+            size_in_bytes: 256,
+            union_tail_padding: [0],
+        };
+        let lights_cbv_desc = d3d::D3d12ConstantBufferViewDesc {
+            buffer_location: lights_address,
+            size_in_bytes: 256,
+            union_tail_padding: [0],
+        };
+        let srv_desc = d3d::D3d12ShaderResourceViewDesc {
+            format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            view_dimension: d3d::D3D12_SRV_DIMENSION_TEXTURE2D,
+            shader_4_component_mapping: d3d::D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            header_padding: [0],
+            texture_2d: d3d::D3d12Tex2DSrv {
+                most_detailed_mip: 0,
+                mip_levels: 1,
+                plane_slice: 0,
+                resource_min_lod_clamp: 0.0,
+            },
+            union_tail_padding: [0, 0],
+        };
+        let vertex_buffer_view = D3d12VertexBufferView {
+            buffer_location: unsafe {
+                call_slot_u64_0(vertex_buffer as ComObject, RESOURCE_GET_GPU_VIRTUAL_ADDRESS)
+            },
+            size_in_bytes: vertex_bytes,
+            stride_in_bytes: 32,
+        };
+        let index_buffer_view = d3d::D3d12IndexBufferView {
+            buffer_location: unsafe {
+                call_slot_u64_0(index_buffer as ComObject, RESOURCE_GET_GPU_VIRTUAL_ADDRESS)
+            },
+            size_in_bytes: index_count * 4,
+            format: DXGI_FORMAT_R32_UINT,
+        };
+        let viewport = D3d12Viewport {
+            top_left_x: 0.0,
+            top_left_y: 0.0,
+            width: self.config.width as f32,
+            height: self.config.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = D3d12Rect {
+            left: 0,
+            top: 0,
+            right: self.config.width as i32,
+            bottom: self.config.height as i32,
+        };
+        let clear_colour = [
+            self.clear_color.r as f32 / 255.0,
+            self.clear_color.g as f32 / 255.0,
+            self.clear_color.b as f32 / 255.0,
+            self.clear_color.a as f32 / 255.0,
+        ];
+        let no_rect = D3d12Rect {
+            left: 0,
+            top: 0,
+            right: self.config.width as i32,
+            bottom: self.config.height as i32,
+        };
+        // ---- Step one: the geometry pass ----
+        let rtvs: [D3d12CpuDescriptorHandle; 3] = gbuffer_rtv_handles;
+        let mut gbuffer_dsv = D3d12CpuDescriptorHandle { ptr: 0 };
+        let has_dsv = gbuffer_depth.is_some();
+        if let Some(depth) = gbuffer_depth {
+            // The target's DSV heap: one descriptor (the creation
+            // happens once, the same rule the RTV heap follows).
+            if self.targets[target_index].dsv_heap.is_null() {
+                match unsafe {
+                    self_create_descriptor_heap(
+                        self.device,
+                        D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                        1,
+                        D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    )
+                } {
+                    Ok(heap) => self.targets[target_index].dsv_heap = heap,
+                    Err(_) => {
+                        self.violations += 1;
+                        return;
+                    }
+                }
+                let dsv_desc = D3d12DepthStencilViewDesc {
+                    format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+                    view_dimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                    flags: 0,
+                    texture_2d: D3d12Tex2DDsv { mip_slice: 0 },
+                };
+                let handle = unsafe { self_heap_cpu_handle(self.targets[target_index].dsv_heap) };
+                unsafe {
+                    call_slot_i32_3(
+                        self.device as ComObject,
+                        DEVICE_CREATE_DEPTH_STENCIL_VIEW,
+                        depth,
+                        &dsv_desc as *const D3d12DepthStencilViewDesc as *mut c_void,
+                        handle.ptr as *mut c_void,
+                    );
+                }
+            }
+            gbuffer_dsv = unsafe { self_heap_cpu_handle(self.targets[target_index].dsv_heap) };
+        }
+        unsafe {
+            // The attachments come in at RENDER_TARGET (the creation's
+            // state) or PIXEL_SHADER_RESOURCE (the last lighting pass's
+            // state); the barriers bring them into RENDER_TARGET before
+            // the draw.
+            if self.targets[target_index].views_state_read {
+                for resource in gbuffer_resources.iter() {
+                    let barrier = D3d12ResourceBarrier {
+                        type_: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                        flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        transition: D3d12ResourceTransitionBarrier {
+                            resource: *resource,
+                            subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            state_before: D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                            state_after: D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        },
+                    };
+                    call_slot_i32_3(
+                        self.command_list as ComObject,
+                        COMMAND_LIST_RESOURCE_BARRIER,
+                        1 as *mut c_void,
+                        &barrier as *const D3d12ResourceBarrier as *mut c_void,
+                        std::ptr::null_mut(),
+                    );
+                }
+                self.targets[target_index].views_state_read = false;
+            }
+            // The clears: the three RTVs and the depth.
+            for handle in rtvs.iter() {
+                call_slot_i32_4(
+                    self.command_list as ComObject,
+                    COMMAND_LIST_CLEAR_RENDER_TARGET_VIEW,
+                    handle.ptr as *mut c_void,
+                    clear_colour.as_ptr() as *const c_void as *mut c_void,
+                    1 as *mut c_void,
+                    &no_rect as *const D3d12Rect as *mut c_void,
+                );
+            }
+            if has_dsv {
+                call_slot_i32_f32(
+                    self.command_list as ComObject,
+                    COMMAND_LIST_CLEAR_DEPTH_STENCIL_VIEW,
+                    gbuffer_dsv.ptr as *mut c_void,
+                    (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL) as u32,
+                    self.clear_depth,
+                    self.clear_stencil as u32,
+                    1,
+                    &no_rect as *const D3d12Rect as *mut c_void,
+                );
+            }
+            call_slot_i32_2(
+                self.command_list as ComObject,
+                COMMAND_LIST_SET_PIPELINE_STATE,
+                self.gbuffer_pipeline,
+                std::ptr::null_mut(),
+            );
+            let rtv_ptrs = [
+                rtvs[0].ptr as *mut c_void,
+                rtvs[1].ptr as *mut c_void,
+                rtvs[2].ptr as *mut c_void,
+            ];
+            let rtv_count = 3;
+            call_slot_i32_5(
+                self.command_list as ComObject,
+                COMMAND_LIST_OMSET_RENDER_TARGETS,
+                rtv_count as *mut c_void,
+                rtv_ptrs.as_ptr() as *const c_void as *mut c_void,
+                0 as *mut c_void,
+                if has_dsv {
+                    &gbuffer_dsv as *const D3d12CpuDescriptorHandle as *mut c_void
+                } else {
+                    0 as *mut c_void
+                },
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_2(
+                self.command_list as ComObject,
+                COMMAND_LIST_SET_GRAPHICS_ROOT_SIGNATURE,
+                self.gbuffer_root_signature,
+                std::ptr::null_mut(),
+            );
+            // The descriptor writes: the camera's CBV at slot 0, the
+            // texture's SRV at slot 1.
+            call_slot_i32_2(
+                self.device as ComObject,
+                DEVICE_CREATE_CONSTANT_BUFFER_VIEW,
+                &cbv_desc as *const d3d::D3d12ConstantBufferViewDesc as *mut c_void,
+                self_heap_cpu_handle_offset(
+                    srv_heap,
+                    self.device,
+                    d3d::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    0,
+                )
+                .ptr as *mut c_void,
+            );
+            call_slot_i32_3(
+                self.device as ComObject,
+                DEVICE_CREATE_SHADER_RESOURCE_VIEW,
+                texture_resource,
+                &srv_desc as *const d3d::D3d12ShaderResourceViewDesc as *mut c_void,
+                self_heap_cpu_handle_offset(
+                    srv_heap,
+                    self.device,
+                    d3d::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    1,
+                )
+                .ptr as *mut c_void,
+            );
+            let heaps = [srv_heap];
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_SET_DESCRIPTOR_HEAPS,
+                1 as *mut c_void,
+                heaps.as_ptr() as *const c_void as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            let gpu_handle = self_heap_gpu_handle_offset(
+                srv_heap,
+                self.device,
+                d3d::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                0,
+            );
+            call_slot_void_ptr_u64(
+                self.command_list as ComObject,
+                COMMAND_LIST_SET_GRAPHICS_ROOT_DESCRIPTOR_TABLE,
+                0 as *mut c_void,
+                gpu_handle.ptr,
+            );
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_RSSET_VIEWPORTS,
+                1 as *mut c_void,
+                &viewport as *const D3d12Viewport as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_RSSET_SCISSOR_RECTS,
+                1 as *mut c_void,
+                &scissor as *const D3d12Rect as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_2(
+                self.command_list as ComObject,
+                COMMAND_LIST_IASET_PRIMITIVE_TOPOLOGY,
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_5(
+                self.command_list as ComObject,
+                COMMAND_LIST_IASET_VERTEX_BUFFERS,
+                0 as *mut c_void,
+                1 as *mut c_void,
+                &vertex_buffer_view as *const D3d12VertexBufferView as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_2(
+                self.command_list as ComObject,
+                COMMAND_LIST_IASET_INDEX_BUFFER,
+                &index_buffer_view as *const d3d::D3d12IndexBufferView as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            // The geometry draw.
+            call_slot_i32_5(
+                self.command_list as ComObject,
+                COMMAND_LIST_DRAW_INDEXED_INSTANCED,
+                index_count as *mut c_void,
+                1 as *mut c_void,
+                0 as *mut c_void,
+                0 as *mut c_void,
+                std::ptr::null_mut(),
+            );
+        }
+        // ---- Step two: the lighting pass ----
+        unsafe {
+            call_slot_i32_2(
+                self.command_list as ComObject,
+                COMMAND_LIST_SET_PIPELINE_STATE,
+                self.lighting_pipeline,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_5(
+                self.command_list as ComObject,
+                COMMAND_LIST_OMSET_RENDER_TARGETS,
+                1 as *mut c_void,
+                &self.rtv_handle as *const D3d12CpuDescriptorHandle as *mut c_void,
+                0 as *mut c_void,
+                0 as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            // The attachments hand off to the lighting pass's shader
+            // reads: the RENDER_TARGET -> PIXEL_SHADER_RESOURCE
+            // transitions (one barrier per call, the probe's rule). The
+            // barriers land after the lighting pass's OMSet: the G-buffer
+            // RTVs are no longer bound when the resources transition.
+            for resource in gbuffer_resources.iter() {
+                let barrier = D3d12ResourceBarrier {
+                    type_: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    transition: D3d12ResourceTransitionBarrier {
+                        resource: *resource,
+                        subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        state_before: D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        // The lighting pass's sampler reads the
+                        // attachments: the pixel-shader read state is the
+                        // layout the sampler sees.
+                        state_after: D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    },
+                };
+                call_slot_i32_3(
+                    self.command_list as ComObject,
+                    COMMAND_LIST_RESOURCE_BARRIER,
+                    1 as *mut c_void,
+                    &barrier as *const D3d12ResourceBarrier as *mut c_void,
+                    std::ptr::null_mut(),
+                );
+            }
+            self.targets[target_index].views_state_read = true;
+            call_slot_i32_2(
+                self.command_list as ComObject,
+                COMMAND_LIST_SET_GRAPHICS_ROOT_SIGNATURE,
+                self.lighting_root_signature,
+                std::ptr::null_mut(),
+            );
+            // The descriptor writes: the three G-buffer attachments'
+            // SRVs at slots 0-2, the lights' CBV at slot 3.
+            for (i, resource) in gbuffer_resources.iter().enumerate() {
+                let gbuffer_srv = d3d::D3d12ShaderResourceViewDesc {
+                    format: if i == 2 {
+                        DXGI_FORMAT_R16G16B16A16_FLOAT
+                    } else {
+                        DXGI_FORMAT_R8G8B8A8_UNORM
+                    },
+                    view_dimension: d3d::D3D12_SRV_DIMENSION_TEXTURE2D,
+                    shader_4_component_mapping: d3d::D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    header_padding: [0],
+                    texture_2d: d3d::D3d12Tex2DSrv {
+                        most_detailed_mip: 0,
+                        mip_levels: 1,
+                        plane_slice: 0,
+                        resource_min_lod_clamp: 0.0,
+                    },
+                    union_tail_padding: [0, 0],
+                };
+                call_slot_i32_3(
+                    self.device as ComObject,
+                    DEVICE_CREATE_SHADER_RESOURCE_VIEW,
+                    *resource,
+                    &gbuffer_srv as *const d3d::D3d12ShaderResourceViewDesc as *mut c_void,
+                    self_heap_cpu_handle_offset(
+                        self.lighting_srv_heap,
+                        self.device,
+                        d3d::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        i,
+                    )
+                    .ptr as *mut c_void,
+                );
+            }
+            call_slot_i32_2(
+                self.device as ComObject,
+                DEVICE_CREATE_CONSTANT_BUFFER_VIEW,
+                &lights_cbv_desc as *const d3d::D3d12ConstantBufferViewDesc as *mut c_void,
+                self_heap_cpu_handle_offset(
+                    self.lighting_srv_heap,
+                    self.device,
+                    d3d::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    3,
+                )
+                .ptr as *mut c_void,
+            );
+            let heaps = [self.lighting_srv_heap];
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_SET_DESCRIPTOR_HEAPS,
+                1 as *mut c_void,
+                heaps.as_ptr() as *const c_void as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            let gpu_handle = self_heap_gpu_handle_offset(
+                self.lighting_srv_heap,
+                self.device,
+                d3d::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                0,
+            );
+            call_slot_void_ptr_u64(
+                self.command_list as ComObject,
+                COMMAND_LIST_SET_GRAPHICS_ROOT_DESCRIPTOR_TABLE,
+                0 as *mut c_void,
+                gpu_handle.ptr,
+            );
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_RSSET_VIEWPORTS,
+                1 as *mut c_void,
+                &viewport as *const D3d12Viewport as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_RSSET_SCISSOR_RECTS,
+                1 as *mut c_void,
+                &scissor as *const D3d12Rect as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_2(
+                self.command_list as ComObject,
+                COMMAND_LIST_IASET_PRIMITIVE_TOPOLOGY,
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_DRAW_INSTANCED,
+                3 as *mut c_void,
+                1 as *mut c_void,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
     fn create_render_target(
         &mut self,
         desc: &RenderTargetDesc,
@@ -3363,6 +4538,10 @@ impl RenderBackend for D3d12Backend {
                     self.to_d3d_format(format),
                     desc.width,
                     desc.height,
+                    // The deferred lighting pass reads the attachments'
+                    // SRVs: the resource flag carries both the render
+                    // target and the shader resource (the same rule the
+                    // Vulkan's ColorAttachment | Sampled carries).
                     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                     D3D12_RESOURCE_STATE_RENDER_TARGET,
                     None,
@@ -3421,6 +4600,9 @@ impl RenderBackend for D3d12Backend {
             })),
             views,
             depth_view,
+            rtv_heap: std::ptr::null_mut(),
+            dsv_heap: std::ptr::null_mut(),
+            views_state_read: false,
             released: false,
         };
         let handle = RenderTarget {
@@ -3524,10 +4706,7 @@ impl RenderBackend for D3d12Backend {
         }
     }
 
-    fn create_texture_2d(
-        &mut self,
-        desc: &Texture2DDesc,
-    ) -> Result<TextureView, RenderError> {
+    fn create_texture_2d(&mut self, desc: &Texture2DDesc) -> Result<TextureView, RenderError> {
         if self.shutdown {
             self.violations += 1;
             return Err(RenderError::from(
@@ -3590,11 +4769,7 @@ impl RenderBackend for D3d12Backend {
         }
     }
 
-    fn fill_texture_2d(
-        &mut self,
-        view: &TextureView,
-        data: &[u8],
-    ) -> Result<(), RenderError> {
+    fn fill_texture_2d(&mut self, view: &TextureView, data: &[u8]) -> Result<(), RenderError> {
         if self.shutdown {
             self.violations += 1;
             return Err(RenderError::from(
@@ -3655,8 +4830,7 @@ impl RenderBackend for D3d12Backend {
                 staging as ComObject,
                 RESOURCE_MAP,
                 0 as *mut c_void,
-                &D3d12Range { begin: 0, end: 0 } as *const D3d12Range
-                    as *mut c_void,
+                &D3d12Range { begin: 0, end: 0 } as *const D3d12Range as *mut c_void,
                 &mut map as *mut _ as *mut c_void,
                 std::ptr::null_mut(),
             );
@@ -3669,11 +4843,7 @@ impl RenderBackend for D3d12Backend {
             for row in 0..height as usize {
                 let src = data.as_ptr().add(row * width as usize * bytes as usize);
                 let dst = map.add(row * row_pitch as usize);
-                std::ptr::copy_nonoverlapping(
-                    src,
-                    dst,
-                    width as usize * bytes as usize,
-                );
+                std::ptr::copy_nonoverlapping(src, dst, width as usize * bytes as usize);
             }
             call_slot_i32_2(
                 staging as ComObject,
@@ -3736,10 +4906,7 @@ impl RenderBackend for D3d12Backend {
             if !self.frame_open {
                 // The frame's command list opens: the allocator and the
                 // list reset (the same rule the clear's open records).
-                let hr = call_slot_i32_0(
-                    self.allocator as ComObject,
-                    ALLOCATOR_RESET,
-                );
+                let hr = call_slot_i32_0(self.allocator as ComObject, ALLOCATOR_RESET);
                 if hr != S_OK {
                     return Err(RenderError::from(
                         "fill_texture_2d: the allocator's reset failed",
@@ -3791,9 +4958,7 @@ impl RenderBackend for D3d12Backend {
         // The one-off frame executes: the Close, the ExecuteCommandLists,
         // the queue's Signal and the wait (the same sequence the
         // readback's copies follow).
-        let hr = unsafe {
-            call_slot_i32_0(self.command_list as ComObject, COMMAND_LIST_CLOSE)
-        };
+        let hr = unsafe { call_slot_i32_0(self.command_list as ComObject, COMMAND_LIST_CLOSE) };
         if hr != S_OK {
             return Err(RenderError::from(
                 "fill_texture_2d: the command list's close failed",
@@ -3827,18 +4992,14 @@ impl RenderBackend for D3d12Backend {
             self.loader
                 .wait_for_single_object
                 .expect("the loader resolved WaitForSingleObject")(
-                self.fence_event, 5000,
+                self.fence_event, 5000
             );
         }
         self.frame_open = false;
         Ok(())
     }
 
-    fn read_texture_2d(
-        &self,
-        view: &TextureView,
-        data: &mut [u8],
-    ) -> Result<bool, RenderError> {
+    fn read_texture_2d(&self, view: &TextureView, data: &mut [u8]) -> Result<bool, RenderError> {
         let index = self
             .textures_2d
             .iter()

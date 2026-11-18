@@ -181,3 +181,137 @@ float4 psMain(MeshVsOut input) : SV_TARGET {\n\
 \x20   return float4(colour, 1.0);\n\
 }\n\
 ";
+/// The deferred geometry pass's vertex shader (M6, HLSL 5.0): the same
+/// transform the lit path's vertex shader carries, writing the world
+/// position and the world-space normal for the G-buffer's attachments.
+pub const GBUFFER_VERTEX_SHADER: &str = "\
+struct MeshVsIn {\n\
+\x20   float3 position : POSITION;\n\
+\x20   float3 normal : NORMAL;\n\
+\x20   float2 texcoord0 : TEXCOORD0;\n\
+};\n\
+\n\
+struct GbufferVsOut {\n\
+\x20   float4 position : SV_POSITION;\n\
+\x20   float3 normal : NORMAL0;\n\
+\x20   float2 uv : TEXCOORD0;\n\
+\x20   float3 world : WORLD0;\n\
+};\n\
+\n\
+cbuffer Frame : register(b0) {\n\
+\x20   column_major float4x4 view_projection;\n\
+\x20   column_major float4x4 model;\n\
+};\n\
+\n\
+GbufferVsOut vsMain(MeshVsIn input) {\n\
+\x20   GbufferVsOut output;\n\
+\x20   float4 world = mul(model, float4(input.position, 1.0));\n\
+\x20   output.position = mul(view_projection, world);\n\
+\x20   output.normal = mul((float3x3)model, input.normal);\n\
+\x20   output.uv = input.texcoord0;\n\
+\x20   output.world = world.xyz;\n\
+\x20   return output;\n\
+}\n\
+";
+/// The deferred geometry pass's pixel shader (M6, HLSL 5.0): the three
+/// G-buffer writes (the albedo with its alpha at 0.0 marking geometry,
+/// the 0.5-offset normal, the world position).
+pub const GBUFFER_PIXEL_SHADER: &str = "\
+struct GbufferVsOut {\n\
+\x20   float4 position : SV_POSITION;\n\
+\x20   float3 normal : NORMAL0;\n\
+\x20   float2 uv : TEXCOORD0;\n\
+\x20   float3 world : WORLD0;\n\
+};\n\
+\n\
+Texture2D surface_texture : register(t0);\n\
+SamplerState surface_sampler : register(s0);\n\
+\n\
+struct GbufferOut {\n\
+\x20   float4 albedo : SV_TARGET0;\n\
+\x20   float4 normal : SV_TARGET1;\n\
+\x20   float4 world : SV_TARGET2;\n\
+};\n\
+\n\
+GbufferOut psMain(GbufferVsOut input) {\n\
+\x20   GbufferOut output;\n\
+\x20   float4 base = surface_texture.Sample(surface_sampler, input.uv);\n\
+\x20   output.albedo = float4(base.rgb, 0.0);\n\
+\x20   output.normal = float4(normalize(input.normal) * 0.5 + 0.5, 1.0);\n\
+\x20   output.world = float4(input.world, 1.0);\n\
+\x20   return output;\n\
+}\n\
+";
+/// The deferred lighting pass's vertex shader (M6, HLSL 5.0): the
+/// fullscreen triangle from SV_VertexID (no vertex buffer, the same
+/// shape the Vulkan and the OpenGL lighting vertex shaders carry).
+pub const LIGHTING_VERTEX_SHADER: &str = "\
+struct LightingVsOut {\n\
+\x20   float4 position : SV_POSITION;\n\
+\x20   float2 uv : TEXCOORD0;\n\
+};\n\
+\n\
+LightingVsOut vsMain(uint vertex_id : SV_VertexID) {\n\
+\x20   LightingVsOut output;\n\
+\x20   float2 corner = float2(float((vertex_id & 1) << 2) - 1.0,\n\
+\x20                          float((vertex_id & 2) << 1) - 1.0);\n\
+\x20   output.uv = corner * 0.5 + 0.5;\n\
+\x20   output.position = float4(corner, 0.0, 1.0);\n\
+\x20   return output;\n\
+}\n\
+";
+/// The deferred lighting pass's pixel shader (M6, HLSL 5.0): the same
+/// Blinn-Phong shading the forward path carries, sampling the G-buffer's
+/// three attachments (the background pixels copy through the albedo's
+/// alpha rule).
+pub const LIGHTING_PIXEL_SHADER: &str = "\
+struct LightingVsOut {\n\
+\x20   float4 position : SV_POSITION;\n\
+\x20   float2 uv : TEXCOORD0;\n\
+};\n\
+\n\
+Texture2D gbuffer_albedo : register(t0);\n\
+Texture2D gbuffer_normal : register(t1);\n\
+Texture2D gbuffer_world : register(t2);\n\
+SamplerState surface_sampler : register(s0);\n\
+\n\
+cbuffer Lights : register(b1) {\n\
+\x20   float4 sun_direction;\n\
+\x20   float4 sun_color_intensity;\n\
+\x20   float4 point_position_radius[4];\n\
+\x20   float4 point_color_intensity[4];\n\
+\x20   float4 params;\n\
+};\n\
+\n\
+float4 psMain(LightingVsOut input) : SV_TARGET {\n\
+\x20   float4 albedo = gbuffer_albedo.Sample(surface_sampler, input.uv);\n\
+\x20   if (albedo.a != 0.0) {\n\
+\x20       return albedo;\n\
+\x20   }\n\
+\x20   float3 normal = normalize(gbuffer_normal.Sample(surface_sampler, input.uv).rgb * 2.0 - 1.0);\n\
+\x20   float3 world = gbuffer_world.Sample(surface_sampler, input.uv).rgb;\n\
+\x20   float3 base = albedo.rgb;\n\
+\x20   float3 sun_dir = normalize(-sun_direction.xyz);\n\
+\x20   float sun_diffuse = max(dot(normal, sun_dir), 0.0);\n\
+\x20   float3 colour = base * sun_color_intensity.rgb\n\
+\x20       * sun_color_intensity.a * sun_diffuse;\n\
+\x20   for (int i = 0; i < 4; i++) {\n\
+\x20       if (float(i) >= params.x) {\n\
+\x20           break;\n\
+\x20       }\n\
+\x20       float3 to_light = point_position_radius[i].xyz - world;\n\
+\x20       float dist = length(to_light);\n\
+\x20       to_light /= dist;\n\
+\x20       float radius = point_position_radius[i].w;\n\
+\x20       float window = 1.0 - (dist / radius) * (dist / radius);\n\
+\x20       float attenuation = window * window / (1.0 + dist * dist);\n\
+\x20       if (dist >= radius) {\n\
+\x20           attenuation = 0.0;\n\
+\x20       }\n\
+\x20       float diffuse = max(dot(normal, to_light), 0.0);\n\
+\x20       colour += base * point_color_intensity[i].rgb\n\
+\x20           * point_color_intensity[i].a * attenuation * diffuse;\n\
+\x20   }\n\
+\x20   return float4(colour, 1.0);\n\
+}\n\
+";

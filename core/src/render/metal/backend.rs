@@ -42,7 +42,8 @@ use super::mtl_loader::{
 use super::super::{
     bytes_per_pixel, CameraParams, ClearBuffer, ClearColor,
     DirectionalLight, DrawSubmission, DynamicLight, GpuMesh, GpuMeshInner,
-    PixelFormat, ReadbackSample, RenderBackend, RenderError, RenderTarget,
+    PixelFormat, PostChainConfig, ReadbackSample, RenderBackend,
+    RenderError, RenderTarget,
     RenderTargetDesc, RenderTargetInner, ShaderProgram, ShaderProgramInner,
     Texture2DDesc, TextureView, TextureViewInner, VertexLayout,
     DEPTH_ATTACHMENT,
@@ -290,6 +291,18 @@ pub struct MetalBackend {
     lighting_lights_buffer: *mut c_void,
     deferred_ready: bool,
     deferred_error: String,
+    // The post-processing chain's state (M7): the HDR geometry pipeline
+    // (the two Rgba16F attachments) and the composite pipeline (the
+    // fullscreen triangle over the default framebuffer) plus the lights'
+    // and the config's shared buffers the passes write. The depth/stencil
+    // state and the sampler are the mesh path's own (the post pipelines
+    // share them).
+    post_gbuffer_pipeline: super::mtl_loader::MtlRenderPipelineStateHandle,
+    post_composite_pipeline: super::mtl_loader::MtlRenderPipelineStateHandle,
+    post_lights_buffer: *mut c_void,
+    post_config_buffer: *mut c_void,
+    post_ready: bool,
+    post_error: String,
     /// The default texture's index into `textures_2d` (the 1x1 white
     /// texture the setup created; the draws fall back to it when no
     /// texture is bound) and the bound texture's index (the
@@ -390,6 +403,12 @@ impl MetalBackend {
             lighting_lights_buffer: std::ptr::null_mut(),
             deferred_ready: false,
             deferred_error: String::new(),
+            post_gbuffer_pipeline: std::ptr::null_mut(),
+            post_composite_pipeline: std::ptr::null_mut(),
+            post_lights_buffer: std::ptr::null_mut(),
+            post_config_buffer: std::ptr::null_mut(),
+            post_ready: false,
+            post_error: String::new(),
             default_texture: None,
             bound_texture: None,
             readback_queue: Vec::new(),
@@ -1571,6 +1590,321 @@ impl MetalBackend {
         self.deferred_ready = true;
         true
     }
+    /// The post-processing chain's resources (M7): the HDR geometry
+    /// pipeline (the two Rgba16F attachments) and the composite pipeline
+    /// (the fullscreen triangle over the default framebuffer) plus the
+    /// lights' and the config's shared buffers the passes write.
+    fn ensure_post_resources(&mut self) -> bool {
+        if self.post_ready {
+            return true;
+        }
+        // The post geometry pipeline: the two MSL libraries compile (the
+        // same compile shape the deferred path carries), the vertex
+        // descriptor carries the PNU attributes (the same three
+        // attributes the mesh path carries), the colour attachments are
+        // the two Rgba16F formats the HDR target carries, the depth test
+        // on.
+        let vertex_library = match self.compile_stage(
+            super::shader_library::GBUFFER_VERTEX_SHADER,
+            "the post geometry vertex stage's library",
+        ) {
+            Ok(library) => library,
+            Err(message) => {
+                self.post_error = message;
+                return false;
+            }
+        };
+        let vertex_function =
+            match self.new_function(vertex_library, "gbufferVertexMain") {
+                Some(function) => function,
+                None => {
+                    self.post_error =
+                        "gbufferVertexMain lookup failed".to_string();
+                    return false;
+                }
+            };
+        let fragment_library = match self.compile_stage(
+            super::shader_library::POST_GBUFFER_FRAGMENT_SHADER,
+            "the post geometry fragment stage's library",
+        ) {
+            Ok(library) => library,
+            Err(message) => {
+                self.post_error = message;
+                return false;
+            }
+        };
+        let fragment_function = match self.new_function(
+            fragment_library,
+            "postGbufferFragmentMain",
+        ) {
+            Some(function) => function,
+            None => {
+                self.post_error =
+                    "postGbufferFragmentMain lookup failed".to_string();
+                return false;
+            }
+        };
+        let gbuffer_descriptor = unsafe {
+            self.loader
+                .alloc_init(self.loader.cls_mtl_render_pipeline_descriptor)
+        };
+        if gbuffer_descriptor.is_null() {
+            self.post_error =
+                "the post geometry pipeline descriptor alloc failed"
+                    .to_string();
+            return false;
+        }
+        unsafe {
+            // The same three attributes the mesh path carries (position,
+            // normal, uv at buffer index 1).
+            let vertex_descriptor = self.loader.alloc_init(
+                self.loader.cls_mtl_vertex_descriptor,
+            );
+            let attributes = self.loader.send0(
+                vertex_descriptor,
+                self.loader.sel("attributes"),
+            );
+            let layouts = self.loader.send0(
+                vertex_descriptor,
+                self.loader.sel("layouts"),
+            );
+            for (index, (format, offset)) in [
+                (MTLVF_FLOAT3, 0usize),
+                (MTLVF_FLOAT3, 12usize),
+                (MTLVF_FLOAT2, 24usize),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let attribute = self.loader.send_ul_ret_ptr(
+                    attributes,
+                    self.loader.sel("objectAtIndexedSubscript:"),
+                    index as super::mtl_loader::NsUInteger,
+                );
+                self.loader.send_void_ul(
+                    attribute,
+                    self.loader.sel("setFormat:"),
+                    *format,
+                );
+                self.loader.send_void_ul(
+                    attribute,
+                    self.loader.sel("setBufferIndex:"),
+                    1,
+                );
+                self.loader.send_void_ul(
+                    attribute,
+                    self.loader.sel("setOffset:"),
+                    *offset as super::mtl_loader::NsUInteger,
+                );
+            }
+            let layout_1 = self.loader.send_ul_ret_ptr(
+                layouts,
+                self.loader.sel("objectAtIndexedSubscript:"),
+                1,
+            );
+            self.loader.send_void_ul(
+                layout_1,
+                self.loader.sel("setStride:"),
+                32,
+            );
+            self.loader.send_void_ul(
+                layout_1,
+                self.loader.sel("setStepFunction:"),
+                MTLSF_PER_VERTEX,
+            );
+            self.loader.send_void_ptr(
+                gbuffer_descriptor,
+                self.loader.sel("setVertexDescriptor:"),
+                vertex_descriptor,
+            );
+            // The two colour attachments: the HDR target's radiance and
+            // world position formats.
+            let colour_attachments = self.loader.send0(
+                gbuffer_descriptor,
+                self.loader.sel("colorAttachments"),
+            );
+            for (index, format) in
+                [MTLPX_RGBA16_FLOAT, MTLPX_RGBA16_FLOAT].iter().enumerate()
+            {
+                let attachment = self.loader.send_ul_ret_ptr(
+                    colour_attachments,
+                    self.loader.sel("objectAtIndexedSubscript:"),
+                    index as super::mtl_loader::NsUInteger,
+                );
+                self.loader.send_void_ul(
+                    attachment,
+                    self.loader.sel("setPixelFormat:"),
+                    *format,
+                );
+            }
+            self.loader.send_void_ul(
+                gbuffer_descriptor,
+                self.loader.sel("setDepthAttachmentPixelFormat:"),
+                self.depth_format,
+            );
+            self.loader.send_void_ul(
+                gbuffer_descriptor,
+                self.loader.sel("setStencilAttachmentPixelFormat:"),
+                self.depth_format,
+            );
+            self.loader.send_void_ptr(
+                gbuffer_descriptor,
+                self.loader.sel("setVertexFunction:"),
+                vertex_function,
+            );
+            self.loader.send_void_ptr(
+                gbuffer_descriptor,
+                self.loader.sel("setFragmentFunction:"),
+                fragment_function,
+            );
+        }
+        let gbuffer_pipeline = unsafe {
+            let mut pipeline_error: *mut c_void = std::ptr::null_mut();
+            let pipeline = self.loader.send_ptr_arg2(
+                self.device,
+                self.loader
+                    .sel("newRenderPipelineStateWithDescriptor:error:"),
+                gbuffer_descriptor,
+                &mut pipeline_error as *mut *mut c_void as *mut c_void,
+            );
+            if pipeline.is_null() {
+                self.post_error = if pipeline_error.is_null() {
+                    "the post geometry pipeline state creation returned nil"
+                        .to_string()
+                } else {
+                    self.ns_error_text(pipeline_error)
+                };
+                return false;
+            }
+            pipeline
+        };
+        // The composite pipeline: the two MSL libraries compile, no
+        // vertex descriptor (the fullscreen triangle the vertex id
+        // generates), one colour attachment (the default framebuffer's
+        // Rgba8), no depth attachment (the depth test off).
+        let composite_vertex_library = match self.compile_stage(
+            super::shader_library::LIGHTING_VERTEX_SHADER,
+            "the composite vertex stage's library",
+        ) {
+            Ok(library) => library,
+            Err(message) => {
+                self.post_error = message;
+                return false;
+            }
+        };
+        let composite_vertex_function = match self.new_function(
+            composite_vertex_library,
+            "lightingVertexMain",
+        ) {
+            Some(function) => function,
+            None => {
+                self.post_error =
+                    "lightingVertexMain lookup failed".to_string();
+                return false;
+            }
+        };
+        let composite_fragment_library = match self.compile_stage(
+            super::shader_library::POST_COMPOSITE_FRAGMENT_SHADER,
+            "the composite fragment stage's library",
+        ) {
+            Ok(library) => library,
+            Err(message) => {
+                self.post_error = message;
+                return false;
+            }
+        };
+        let composite_fragment_function = match self.new_function(
+            composite_fragment_library,
+            "postCompositeFragmentMain",
+        ) {
+            Some(function) => function,
+            None => {
+                self.post_error =
+                    "postCompositeFragmentMain lookup failed".to_string();
+                return false;
+            }
+        };
+        let composite_descriptor = unsafe {
+            self.loader
+                .alloc_init(self.loader.cls_mtl_render_pipeline_descriptor)
+        };
+        if composite_descriptor.is_null() {
+            self.post_error =
+                "the composite pipeline descriptor alloc failed".to_string();
+            return false;
+        }
+        unsafe {
+            // One colour attachment (the default framebuffer's Rgba8),
+            // no depth attachment (the depth test off — the composite's
+            // triangle covers the frame).
+            let colour_attachments = self.loader.send0(
+                composite_descriptor,
+                self.loader.sel("colorAttachments"),
+            );
+            let attachment_0 = self.loader.send_ul_ret_ptr(
+                colour_attachments,
+                self.loader.sel("objectAtIndexedSubscript:"),
+                0,
+            );
+            self.loader.send_void_ul(
+                attachment_0,
+                self.loader.sel("setPixelFormat:"),
+                MTLPX_RGBA8_UNORM,
+            );
+            self.loader.send_void_ptr(
+                composite_descriptor,
+                self.loader.sel("setVertexFunction:"),
+                composite_vertex_function,
+            );
+            self.loader.send_void_ptr(
+                composite_descriptor,
+                self.loader.sel("setFragmentFunction:"),
+                composite_fragment_function,
+            );
+        }
+        let composite_pipeline = unsafe {
+            let mut pipeline_error: *mut c_void = std::ptr::null_mut();
+            let pipeline = self.loader.send_ptr_arg2(
+                self.device,
+                self.loader
+                    .sel("newRenderPipelineStateWithDescriptor:error:"),
+                composite_descriptor,
+                &mut pipeline_error as *mut *mut c_void as *mut c_void,
+            );
+            if pipeline.is_null() {
+                self.post_error = if pipeline_error.is_null() {
+                    "the composite pipeline state creation returned nil"
+                        .to_string()
+                } else {
+                    self.ns_error_text(pipeline_error)
+                };
+                return false;
+            }
+            pipeline
+        };
+        // The lights' shared buffer (one 256-byte block the geometry
+        // pass writes and the fragment stage's [[buffer(1)]] reads).
+        let lights_buffer = self.create_shared_buffer(&[0u8; 256]);
+        if lights_buffer.is_null() {
+            self.post_error =
+                "the post lights buffer could not be allocated".to_string();
+            return false;
+        }
+        // The config's shared buffer (one 48-byte block the composite
+        // pass writes and the fragment stage's [[buffer(0)]] reads).
+        let config_buffer = self.create_shared_buffer(&[0u8; 48]);
+        if config_buffer.is_null() {
+            self.post_error =
+                "the post config buffer could not be allocated".to_string();
+            return false;
+        }
+        self.post_gbuffer_pipeline = gbuffer_pipeline;
+        self.post_composite_pipeline = composite_pipeline;
+        self.post_lights_buffer = lights_buffer;
+        self.post_config_buffer = config_buffer;
+        self.post_ready = true;
+        true
+    }
 
     /// The diagnostic triangle's pipeline: the MSL library compiles, the
     /// vertex descriptor carries the Float3 attribute, the colour
@@ -2413,6 +2747,144 @@ impl MetalBackend {
                     attachment,
                     self.loader.sel("setClearColor:"),
                     clear,
+                );
+                self.loader.send_void_ul(
+                    attachment,
+                    self.loader.sel("setLoadAction:"),
+                    MTLLA_CLEAR,
+                );
+                self.loader.send_void_ul(
+                    attachment,
+                    self.loader.sel("setStoreAction:"),
+                    MTLSA_STORE,
+                );
+            }
+        }
+        if !depth_texture.is_null() {
+            unsafe {
+                self.loader.send_void_ptr(
+                    depth_attachment,
+                    self.loader.sel("setTexture:"),
+                    depth_texture,
+                );
+                self.loader.send_void_double(
+                    depth_attachment,
+                    self.loader.sel("setClearDepth:"),
+                    self.clear_depth as f64,
+                );
+                self.loader.send_void_ul(
+                    depth_attachment,
+                    self.loader.sel("setLoadAction:"),
+                    MTLLA_CLEAR,
+                );
+                self.loader.send_void_ul(
+                    depth_attachment,
+                    self.loader.sel("setStoreAction:"),
+                    MTLSA_STORE,
+                );
+                self.loader.send_void_ptr(
+                    stencil_attachment,
+                    self.loader.sel("setTexture:"),
+                    depth_texture,
+                );
+                self.loader.send_void_ul(
+                    stencil_attachment,
+                    self.loader.sel("setClearStencil:"),
+                    self.clear_stencil as super::mtl_loader::NsUInteger,
+                );
+                self.loader.send_void_ul(
+                    stencil_attachment,
+                    self.loader.sel("setLoadAction:"),
+                    MTLLA_CLEAR,
+                );
+                self.loader.send_void_ul(
+                    stencil_attachment,
+                    self.loader.sel("setStoreAction:"),
+                    MTLSA_STORE,
+                );
+            }
+        }
+        pass_descriptor
+    }
+
+    /// The post chain's HDR pass descriptor (M7): the two colour
+    /// attachments the HDR target carries (the radiance clears to the
+    /// clear colour's radiance, the world position clears to zero — the
+    /// alpha 0 marks the background) plus the depth attachment.
+    fn hdr_pass_descriptor(&mut self, target_index: usize) -> *mut c_void {
+        let pass_descriptor = unsafe {
+            self.loader.alloc_init(
+                self.loader.cls_mtl_render_pass_descriptor,
+            )
+        };
+        if pass_descriptor.is_null() {
+            self.violations += 1;
+            return std::ptr::null_mut();
+        }
+        let colour_attachments = unsafe {
+            self.loader.send0(
+                pass_descriptor,
+                self.loader.sel("colorAttachments"),
+            )
+        };
+        let depth_attachment = unsafe {
+            self.loader.send0(
+                pass_descriptor,
+                self.loader.sel("depthAttachment"),
+            )
+        };
+        let stencil_attachment = unsafe {
+            self.loader.send0(
+                pass_descriptor,
+                self.loader.sel("stencilAttachment"),
+            )
+        };
+        let depth_texture = self.targets[target_index]
+            .depth_view
+            .as_ref()
+            .map(|d| d.texture)
+            .unwrap_or(std::ptr::null_mut());
+        let colour = self.clear_color;
+        let clear = MtlClearColor {
+            red: colour.r as f64 / 255.0,
+            green: colour.g as f64 / 255.0,
+            blue: colour.b as f64 / 255.0,
+            alpha: colour.a as f64 / 255.0,
+        };
+        // The two colour attachments: the radiance clears to the clear
+        // colour's radiance, the world position clears to zero.
+        for (index, clear_value) in [clear, MtlClearColor { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 }]
+            .iter()
+            .enumerate()
+        {
+            let view = match self.targets[target_index].views.get(index) {
+                Some(view) => view,
+                None => {
+                    self.violations += 1;
+                    return std::ptr::null_mut();
+                }
+            };
+            let attachment = unsafe {
+                self.loader.send_ul_ret_ptr(
+                    colour_attachments,
+                    self.loader.sel("objectAtIndexedSubscript:"),
+                    index as super::mtl_loader::NsUInteger,
+                )
+            };
+            if attachment.is_null() {
+                self.violations += 1;
+                return std::ptr::null_mut();
+            }
+            unsafe {
+                self.loader.send_void_ptr(
+                    attachment,
+                    self.loader.sel("setTexture:"),
+                    view.texture,
+                );
+                self.loader.send_void_clear_color(
+                    attachment,
+                    self.loader.sel("setClearColor:"),
+                    *clear_value,
                 );
                 self.loader.send_void_ul(
                     attachment,
@@ -3660,6 +4132,366 @@ impl RenderBackend for MetalBackend {
             );
             self.loader.send_void(
                 lighting_encoder,
+                self.loader.sel("endEncoding"),
+            );
+        }
+    }
+    /// The post-processing chain (M7): the two internal steps the
+    /// contract's submit_post_chain carries. Step one (the geometry pass)
+    /// opens the HDR target's pass descriptor (the two Rgba16F colour
+    /// attachments plus the depth attachment, each with the clear load
+    /// action), binds the post geometry pipeline and draws the mesh into
+    /// the radiance and the world attachments. Step two (the composite
+    /// pass) opens the default framebuffer's pass descriptor, binds the
+    /// composite pipeline and draws the fullscreen triangle that applies
+    /// the enabled effects onto the display's range.
+    fn submit_post_chain(
+        &mut self,
+        submission: &DrawSubmission,
+        hdr_target: &RenderTarget,
+        config: &PostChainConfig,
+    ) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        for light in &submission.lights {
+            if light.validate().is_err() {
+                self.violations += 1;
+            }
+        }
+        let target_index = match self
+            .targets
+            .iter()
+            .position(|x| Arc::ptr_eq(&x.inner, &hdr_target.inner))
+        {
+            Some(index) => index,
+            None => {
+                // A foreign target is a protocol violation (the same rule
+                // the target handles follow).
+                self.violations += 1;
+                return;
+            }
+        };
+        if self.targets[target_index].released {
+            self.violations += 1;
+            return;
+        }
+        let mesh_id = submission.mesh.inner.lock().unwrap().id;
+        if mesh_id >= self.meshes.len() || self.meshes[mesh_id].is_none() {
+            self.violations += 1;
+            return;
+        }
+        if !self.mesh_ready || !self.ensure_post_resources() {
+            return;
+        }
+        if !self.frame_open {
+            // The post chain runs inside the frame's open command buffer
+            // (the clear() the frame's first step runs opened it); a
+            // missing frame is a violation.
+            self.violations += 1;
+            return;
+        }
+        // The lights' block: the same from_lights the forward path's
+        // block carries (the sun absent means the intensity zero; the
+        // point lights' four slots).
+        let default_sun = DirectionalLight {
+            direction: Vec3::new(0.0, -1.0, 0.0),
+            color: Vec3::new(0.0, 0.0, 0.0),
+            intensity: 0.0,
+        };
+        let sun = submission.sun.as_ref().unwrap_or(&default_sun);
+        let lights_block = LightsUniform::from_lights(sun, &submission.lights);
+        if !self.post_lights_buffer.is_null() {
+            let contents = unsafe {
+                self.loader.send0(
+                    self.post_lights_buffer,
+                    self.loader.sel("contents"),
+                )
+            };
+            if !contents.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &lights_block as *const LightsUniform as *const u8,
+                        contents as *mut u8,
+                        std::mem::size_of::<LightsUniform>(),
+                    );
+                }
+            }
+        }
+        // The config block: the three vec4 params the composite shader's
+        // Config block carries (the toggles, the bloom's parameters, the
+        // focus's parameters).
+        let config_block = [
+            [
+                if config.tonemapping { 1.0f32 } else { 0.0 },
+                if config.bloom { 1.0 } else { 0.0 },
+                if config.depth_of_field { 1.0 } else { 0.0 },
+                if config.ssao { 1.0 } else { 0.0 },
+            ],
+            [
+                config.bloom_threshold,
+                config.bloom_knee,
+                config.bloom_intensity,
+                config.ssao_radius,
+            ],
+            [
+                config.focal_distance,
+                config.focus_near_range,
+                config.focus_far_range,
+                if config.anti_aliasing { 1.0 } else { 0.0 },
+            ],
+        ];
+        if !self.post_config_buffer.is_null() {
+            let contents = unsafe {
+                self.loader.send0(
+                    self.post_config_buffer,
+                    self.loader.sel("contents"),
+                )
+            };
+            if !contents.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        config_block.as_ptr() as *const u8,
+                        contents as *mut u8,
+                        48,
+                    );
+                }
+            }
+        }
+        // The camera block: the view-projection matrix from the
+        // set_camera state and the model matrix the submission carries
+        // (the same bytes the mesh path's uniform buffer carries).
+        let uniform = self.build_mesh_uniform(submission.model);
+        let mesh_state = self.meshes[mesh_id].as_ref().unwrap();
+        let uniform_bytes = mesh_state.uniform_buffer;
+        let contents = unsafe {
+            self.loader.send0(uniform_bytes, self.loader.sel("contents"))
+        };
+        if contents.is_null() {
+            self.violations += 1;
+            return;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                uniform.as_ptr(),
+                contents as *mut u8,
+                uniform.len(),
+            );
+        }
+        let (vertex_buffer, index_buffer, index_count) = (
+            mesh_state.vertex_buffer,
+            mesh_state.index_buffer,
+            mesh_state.index_count,
+        );
+        let depth_state = self
+            .mesh_resources
+            .as_ref()
+            .map(|r| r.depth_state)
+            .unwrap_or(std::ptr::null_mut());
+        let sampler = self
+            .mesh_resources
+            .as_ref()
+            .map(|r| r.sampler)
+            .unwrap_or(std::ptr::null_mut());
+        let texture = self
+            .bound_texture
+            .and_then(|i| self.textures_2d.get(i))
+            .filter(|t| !t.released)
+            .map(|t| t.texture)
+            .or_else(|| {
+                self.default_texture
+                    .and_then(|i| self.textures_2d.get(i))
+                    .filter(|t| !t.released)
+                    .map(|t| t.texture)
+            });
+        let texture = match texture {
+            Some(texture) => texture,
+            None => {
+                self.violations += 1;
+                return;
+            }
+        };
+        let command_buffer = self.frame_command_buffer;
+        let post_gbuffer_pipeline = self.post_gbuffer_pipeline;
+        let post_composite_pipeline = self.post_composite_pipeline;
+        let post_lights_buffer = self.post_lights_buffer;
+        let post_config_buffer = self.post_config_buffer;
+        let hdr_views: Vec<_> = {
+            let target = &self.targets[target_index];
+            let views: Vec<_> = target
+                .views
+                .iter()
+                .take(2)
+                .map(|v| v.texture)
+                .collect();
+            views
+        };
+        if hdr_views.len() != 2 {
+            self.violations += 1;
+            return;
+        }
+        // ---- Step one: the geometry pass ----
+        // The HDR target's pass descriptor: the two colour attachments
+        // (the radiance and the world position) plus the depth attachment,
+        // each with the clear load action (the world attachment clears to
+        // zero — the alpha 0 marks the background).
+        let pass_descriptor = self.hdr_pass_descriptor(target_index);
+        if pass_descriptor.is_null() {
+            return;
+        }
+        let encoder = unsafe {
+            self.loader.send_ptr_arg(
+                command_buffer,
+                self.loader.sel("renderCommandEncoderWithDescriptor:"),
+                pass_descriptor,
+            )
+        };
+        if encoder.is_null() {
+            self.violations += 1;
+            return;
+        }
+        unsafe {
+            // The post geometry pipeline and the mesh path's depth/stencil
+            // state (the depth test on).
+            self.loader.send_void_ptr(
+                encoder,
+                self.loader.sel("setRenderPipelineState:"),
+                post_gbuffer_pipeline,
+            );
+            self.loader.send_void_ptr(
+                encoder,
+                self.loader.sel("setDepthStencilState:"),
+                depth_state,
+            );
+            // The camera block at the vertex stage's buffer index 0 (the
+            // gbuffer vertex shader's `buffer(0)` qualifier).
+            self.loader.send_void_ptr_ul2(
+                encoder,
+                self.loader.sel("setVertexBuffer:offset:atIndex:"),
+                uniform_bytes,
+                0,
+                0,
+            );
+            // The vertex buffer at buffer index 1 (the vertex
+            // descriptor's attributes point there).
+            self.loader.send_void_ptr_ul2(
+                encoder,
+                self.loader.sel("setVertexBuffer:offset:atIndex:"),
+                vertex_buffer,
+                0,
+                1,
+            );
+            // The lights' buffer at the fragment stage's buffer index 1
+            // (the post geometry fragment shader's `buffer(1)` qualifier).
+            self.loader.send_void_ptr_ul2(
+                encoder,
+                self.loader.sel("setFragmentBuffer:offset:atIndex:"),
+                post_lights_buffer,
+                0,
+                1,
+            );
+            // The bound texture and the sampler at the fragment stage's
+            // slot 0 (the post geometry fragment shader's `texture(0)` and
+            // `sampler(0)` qualifiers).
+            self.loader.send_void_ptr_ul(
+                encoder,
+                self.loader.sel("setFragmentTexture:atIndex:"),
+                texture,
+                0,
+            );
+            self.loader.send_void_ptr_ul(
+                encoder,
+                self.loader.sel("setFragmentSamplerState:atIndex:"),
+                sampler,
+                0,
+            );
+            // The indexed draw: the same call the mesh path carries.
+            self.loader.send_void_ul3_ptr_ul(
+                encoder,
+                self.loader.sel(
+                    "drawIndexedPrimitives:indexCount:indexType:\
+                     indexBuffer:indexBufferOffset:",
+                ),
+                MTLPT_TRIANGLE,
+                index_count as super::mtl_loader::NsUInteger,
+                MTLIT_UINT32,
+                index_buffer,
+                0,
+            );
+            self.loader.send_void(encoder, self.loader.sel("endEncoding"));
+        }
+        // ---- Step two: the composite pass ----
+        // The default framebuffer's pass descriptor: the LOAD load action
+        // keeps the clear's pixels (the same rule the mesh pass
+        // descriptor's descriptor records).
+        let composite_pass_descriptor = self.mesh_pass_descriptor();
+        if composite_pass_descriptor.is_null() {
+            return;
+        }
+        let composite_encoder = unsafe {
+            self.loader.send_ptr_arg(
+                command_buffer,
+                self.loader.sel("renderCommandEncoderWithDescriptor:"),
+                composite_pass_descriptor,
+            )
+        };
+        if composite_encoder.is_null() {
+            self.violations += 1;
+            return;
+        }
+        unsafe {
+            // The composite pipeline binds; no depth/stencil state (the
+            // depth test off — the composite's triangle covers the frame).
+            self.loader.send_void_ptr(
+                composite_encoder,
+                self.loader.sel("setRenderPipelineState:"),
+                post_composite_pipeline,
+            );
+            // The config block at the fragment stage's buffer index 0
+            // (the composite fragment shader's `buffer(0)` qualifier).
+            self.loader.send_void_ptr_ul2(
+                composite_encoder,
+                self.loader.sel("setFragmentBuffer:offset:atIndex:"),
+                post_config_buffer,
+                0,
+                0,
+            );
+            // The two HDR attachments' textures at the fragment stage's
+            // slots 0 and 1 (the composite fragment shader's `texture(0)`
+            // and `texture(1)` qualifiers).
+            self.loader.send_void_ptr_ul(
+                composite_encoder,
+                self.loader.sel("setFragmentTexture:atIndex:"),
+                hdr_views[0],
+                0,
+            );
+            self.loader.send_void_ptr_ul(
+                composite_encoder,
+                self.loader.sel("setFragmentTexture:atIndex:"),
+                hdr_views[1],
+                1,
+            );
+            // The sampler at the fragment stage's slot 0 (the composite
+            // fragment shader's `sampler(0)` qualifier).
+            self.loader.send_void_ptr_ul(
+                composite_encoder,
+                self.loader.sel("setFragmentSamplerState:atIndex:"),
+                sampler,
+                0,
+            );
+            // The fullscreen triangle: the three vertices the vertex id
+            // generates (no vertex buffer, no index buffer).
+            self.loader.send_void_ul3(
+                composite_encoder,
+                self.loader
+                    .sel("drawPrimitives:vertexStart:vertexCount:"),
+                MTLPT_TRIANGLE,
+                0,
+                3,
+            );
+            self.loader.send_void(
+                composite_encoder,
                 self.loader.sel("endEncoding"),
             );
         }

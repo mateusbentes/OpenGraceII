@@ -19,7 +19,7 @@ The `.docx` files in this directory are generated from the `.md` sources with
 | 4 | Render foundation: math, mesh, shader, material | Done (the math and the mesh modules carry their unit tests; the textured cube runs through the real mesh path on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
 | 5 | Forward lighting: light types, shadow mapping | Done (the Blinn-Phong path with the sun and up to four point lights runs on all four backends; the shadow mapping follows in a later milestone) |
 | 6 | Deferred lighting: MRT G-buffer, the lighting pass | Done (the three-attachment geometry pass and the fullscreen lighting pass run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
-| 7 | Post-processing chain: HDR, bloom, filmic tonemapping, depth of field, morphological anti-aliasing, SSAO-STF | Planned |
+| 7 | Post-processing chain: HDR, bloom, filmic tonemapping, depth of field, morphological anti-aliasing, SSAO-STF | Done (the HDR geometry pass and the five-effect composite pass run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d; the Metal run awaits the A18 Pro's hardware validation) |
 | 8 | Global illumination by light volume propagation | Planned |
 | 9 | Platform layer: the engine's own windowing, input and events, replacing SDL2 | Planned |
 | 10 | Audio: the engine's own backend per platform, the WAV and Ogg Vorbis decoders | Planned |
@@ -491,6 +491,104 @@ The validation runs, all through the same contract:
 The deferred smokes carry the same two-readback pattern, and the lit,
 unlit and triangle smokes keep passing — nothing the milestone touched
 broke.
+
+---
+
+## Milestone 7: Post-processing chain
+
+Milestone 7 lands the engine's own post-processing chain: the HDR
+geometry pass that renders the deferred scene into two Rgba16F
+attachments, and the single fullscreen composite pass that carries the
+five effects — SSAO, bloom, depth of field, filmic tonemapping and the
+morphological anti-aliasing — over the HDR radiance.
+
+**The HDR contract**: one render target with two Rgba16F colour
+attachments plus the depth attachment. The first attachment holds the
+deferred scene's radiance (the lighting pass's shaded output, linear,
+unclamped); the second holds the fragment's world-space position, which
+the SSAO's occlusion samples and the depth of field's focus share read.
+The geometry pass's vertex shader is the M6 gbuffer's, and its fragment
+shader writes the same three outputs the deferred pass carries — the
+shading runs in the same pass, so the chain's entry holds the radiance
+already lit. Each backend maps the contract onto its own render-target
+plumbing: Vulkan's second render pass with two Rgba16F attachment
+references and its own image views (the M7 run's lesson: the render
+pass's declared formats must match the framebuffer's views byte for
+byte — lavapipe segfaults on the mismatch), OpenGL's two-attachment
+draw buffer on the chain's framebuffer, D3D12's PSO with
+`NumRenderTargets = 2` and its own SRV heap for the composite pass's
+reads, Metal's render pass descriptor with two `MTLPixelFormatRGBA16Float`
+color attachments.
+
+**The composite pass**: a full-frame triangle (the M6 lighting pass's
+vertex shader) drawn into the default framebuffer with the depth test
+off. The fragment shader samples the two HDR attachments and the chain's
+configuration uniform (three vec4s, 48 bytes), then applies the effects
+in a fixed order — the SSAO's occlusion darkens the radiance, the
+bloom's threshold weights the blurred radiance, the depth of field's
+focus share blends the blurred radiance, and the filmic tonemapping maps
+the linear radiance onto the display curve, with the morphological
+anti-aliasing's edge blend following the tonemap. The configuration
+uniform carries the on/off flags (params0), the tunables (params1:
+bloom threshold, knee and intensity, the SSAO's radius), and the depth
+of field's focal distance and near/far ranges plus the anti-aliasing
+flag (params2). Every effect degrades to the identity when its flag is
+off, so the chain's default (tonemapping only) is the tonemapped scene
+the M6 readback's radiance predicts.
+
+**The morphological anti-aliasing** is the single-pass approximation
+the chain's contract documents: the composite reads the four
+neighbouring pixels' tonemapped luminances, finds the dominant crossing
+edge (the neighbour whose luminance differs most from the centre's), and
+blends the pixel toward the dominant side by the crossing ratio the
+`mlaa_crossing` CPU reference pins. The edges aligned with the pixel
+grid keep their colour; the cut pixels carry the half-of-each-side
+blend. The full three-pass Reshetov chain (the edge detection, the
+blending weights and the neighbour search) needs its own intermediate
+targets on every backend; the approximation is honest about what it
+carries, and the deferred milestone's plan documents the upgrade path.
+
+**The integration test** follows the M4/M5/M6 rule: the post chain must
+produce the pixels the chain's own reference produces from the same
+scene. The cube from M6 (the 180 grey, the sun at 0.5, one point light
+in front) reads the radiance 145 at the centre — the deferred path's
+pin — and the composite's tonemapping maps it to 211. The corner carries
+the chain's clear colour, and the silhouette's edge pair carries the
+anti-aliasing's blend: the last lit pixel (176) keeps its 209 (the
+grid-aligned edge) and the first background pixel (177) blends to 105
+(the half-of-each-side cut the midpoint rule pins). The protocol stays
+clean (zero violations).
+
+The validation runs, all through the same contract:
+
+- **Vulkan** (`cube_post`, lavapipe in the sandbox): centre 211, 211,
+  211, depth 1.0, corner clear, edge pair 209/105, zero violations. The
+  run's own findings, fixed in the same milestone: the post render
+  pass's declared colour formats must match the framebuffer's image
+  views (the Rgba16F pair the HDR contract carries — the earlier
+  Rgba8 declaration segfaulted in `vkCmdBeginRenderPass`), and the
+  composite pass's own descriptor set reads the two HDR attachments
+  through the same combined image sampler the M6 lighting pass
+  establishes.
+- **OpenGL** (`cube_post_gl`, EGL surfaceless + GL 3.3 core in the
+  sandbox): centre 211, 211, 211, depth 1.0, corner clear, edge pair
+  209/105, zero violations.
+- **Direct3D 12** (`cube_post_d3d12`, Wine with vkd3d): centre 211,
+  211, 211, depth 1.0, corner clear, edge pair 209/105, zero
+  violations. The lights' CBV joins the post gbuffer pass's root
+  signature (the mesh srv_heap's third slot), and the composite pass
+  carries its own SRV heap for the two HDR attachments plus the
+  configuration CBV.
+- **Metal** (`cube_post_mtl`): implemented and building clean (the MSL
+  shaders, the `ensure_post_resources` and the `submit_post_chain` in
+  the same pattern the M6 deferred pass carries); the hardware run
+  awaits the A18 Pro's validation.
+
+The post smokes carry the same three-readback pattern (the centre, the
+corner and the edge pair), and the deferred, lit, unlit and triangle
+smokes keep passing — nothing the milestone touched broke. The Vulkan
+backend's committed SPIR-V fallback carries the two post shaders' byte
+arrays, so the macOS build compiles the chain without the validator.
 
 ---
 

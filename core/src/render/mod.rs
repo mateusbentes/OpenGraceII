@@ -506,6 +506,22 @@ pub trait RenderBackend {
         gbuffer: &RenderTarget,
     );
 
+    /// Runs the post-processing chain (M7): the geometry pass writes
+    /// the submission's mesh into the HDR target's two colour
+    /// attachments (the linear HDR radiance in attachment 0, the world
+    /// position in attachment 1) and the chain's enabled effects
+    /// process it into the default framebuffer. The order is fixed:
+    /// SSAO darkens the radiance first (the world buffer's occlusion),
+    /// the bloom extracts and composites second, the depth of field's
+    /// focus blur third, and the filmic tonemapping last (the display's
+    /// LDR write). The disabled effects leave their stage a pass-through.
+    fn submit_post_chain(
+        &mut self,
+        submission: &DrawSubmission,
+        hdr_target: &RenderTarget,
+        config: &PostChainConfig,
+    );
+
     // -- Render passes and targets -------------------------------------------
     /// Creates a render target. Throws `RenderError` on an invalid or
     /// incomplete desc.
@@ -629,6 +645,62 @@ pub struct DrawSubmission {
     pub material: Material,
     pub sun: Option<DirectionalLight>,
     pub lights: Vec<DynamicLight>,
+}
+
+/// The post-processing chain's configuration (M7): the effect toggles
+/// and the parameters the chain's passes read. The defaults carry the
+/// deterministic test values the examples assert.
+#[derive(Clone, Copy, Debug)]
+pub struct PostChainConfig {
+    /// The filmic tonemapping toggle (the chain's final pass maps the
+    /// HDR radiance onto the display's [0, 255] range).
+    pub tonemapping: bool,
+    /// The bloom toggle: the radiance above the threshold extracts into
+    /// the half-res buffer, blurs, and composites back.
+    pub bloom: bool,
+    /// The bloom's threshold (the radiance where the extract begins).
+    pub bloom_threshold: f32,
+    /// The bloom's soft knee (the rise's width above the threshold).
+    pub bloom_knee: f32,
+    /// The bloom's composite intensity (the blurred buffer's share).
+    pub bloom_intensity: f32,
+    /// The depth of field's toggle: the focus share from the world
+    /// buffer's distances spreads the blur's samples.
+    pub depth_of_field: bool,
+    /// The focal plane's distance (the world-space distance the
+    /// sharpest plane sits at).
+    pub focal_distance: f32,
+    /// The near range from the focal plane where sharpness reaches zero.
+    pub focus_near_range: f32,
+    /// The far range from the focal plane where sharpness reaches zero.
+    pub focus_far_range: f32,
+    /// The morphological anti-aliasing's toggle: the edge detection and
+    /// the area blend run on the chain's LDR image.
+    pub anti_aliasing: bool,
+    /// The SSAO's toggle: the hemisphere's occlusion darkens the
+    /// contact edges (the world buffer's distances drive it).
+    pub ssao: bool,
+    /// The SSAO's world-space radius (the occlusion's reach).
+    pub ssao_radius: f32,
+}
+
+impl Default for PostChainConfig {
+    fn default() -> Self {
+        Self {
+            tonemapping: true,
+            bloom: true,
+            bloom_threshold: 1.0,
+            bloom_knee: 0.5,
+            bloom_intensity: 0.5,
+            depth_of_field: false,
+            focal_distance: 2.0,
+            focus_near_range: 0.5,
+            focus_far_range: 0.5,
+            anti_aliasing: false,
+            ssao: false,
+            ssao_radius: 1.0,
+        }
+    }
 }
 
 /// The material's surface parameters, validated. The contract's values, the

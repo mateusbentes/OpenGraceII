@@ -242,3 +242,245 @@ void main()
     fragColor = vec4(colour, 1.0);
 }
 ";
+
+/// The post chain's geometry pass's fragment shader (M7): the two HDR
+/// writes — the full Blinn-Phong shading's linear radiance (attachment
+/// 0) and the fragment's world position (attachment 1, the distances the
+/// SSAO and the depth of field's focus share read). The background
+/// fragments write the clear colour's radiance and a zero world position
+/// (the alpha 0 marks background for the composite). The same shading
+/// the forward path's shader carries.
+pub const POST_GBUFFER_FRAGMENT_SHADER: &str = r"
+#version 330 core
+in vec3 v_normal;
+in vec2 v_uv;
+in vec3 v_world;
+uniform sampler2D surface_texture;
+uniform vec4 sun_direction;
+uniform vec4 sun_color_intensity;
+uniform vec4 point_position_radius[4];
+uniform vec4 point_color_intensity[4];
+uniform vec4 params;
+layout(location = 0) out vec4 outRadiance;
+layout(location = 1) out vec4 outWorld;
+void main()
+{
+    vec3 base = texture(surface_texture, v_uv).rgb;
+    vec3 normal = normalize(v_normal);
+    vec3 sun_dir = normalize(-sun_direction.xyz);
+    float sun_diffuse = max(dot(normal, sun_dir), 0.0);
+    vec3 colour = base * sun_color_intensity.rgb
+        * sun_color_intensity.a * sun_diffuse;
+    for (int i = 0; i < 4; i++) {
+        if (float(i) >= params.x) {
+            break;
+        }
+        vec3 to_light = point_position_radius[i].xyz - v_world;
+        float dist = length(to_light);
+        to_light /= dist;
+        float radius = point_position_radius[i].w;
+        float window = 1.0 - (dist / radius) * (dist / radius);
+        float attenuation = window * window / (1.0 + dist * dist);
+        if (dist >= radius) {
+            attenuation = 0.0;
+        }
+        float diffuse = max(dot(normal, to_light), 0.0);
+        colour += base * point_color_intensity[i].rgb
+            * point_color_intensity[i].a * attenuation * diffuse;
+    }
+    outRadiance = vec4(colour, 1.0);
+    outWorld = vec4(v_world, 1.0);
+}
+";
+
+/// The post chain's composite pass's fragment shader (M7): the two HDR
+/// attachments sampled and the enabled effects applied in the fixed
+/// order — the SSAO's occlusion darkens the radiance, the bloom's
+/// threshold-and-blur lifts the bright regions, the depth of field's
+/// focus share blends the blurred radiance, and the filmic tonemapping
+/// maps the result onto the display's range; the morphological
+/// anti-aliasing's edge blend follows the tonemap (the LDR image the
+/// edge detection reads). The effects' toggles and parameters ride
+/// GLSL uniforms (the driver's uniform path — the OpenGL path needs no
+/// config block).
+pub const POST_COMPOSITE_FRAGMENT_SHADER: &str = r"
+#version 330 core
+in vec2 v_uv;
+uniform sampler2D radiance_texture;
+uniform sampler2D world_texture;
+uniform vec4 params0; // tonemapping, bloom, dof, ssao (the 1.0/0.0 flags)
+uniform vec4 params1; // bloom_threshold, bloom_knee, bloom_intensity, ssao_radius
+uniform vec4 params2; // focal_distance, focus_near_range, focus_far_range, anti_aliasing
+out vec4 fragColor;
+vec3 sample_blurred(sampler2D tex, vec2 uv, vec2 texel)
+{
+    // The 5-tap gaussian: the centre plus the two symmetric pairs at
+    // the 1.5-texel and 3.5-texel offsets (the weights the CPU
+    // reference's GAUSSIAN_WEIGHTS carry).
+    vec3 sum = texture(tex, uv).rgb * 0.2887;
+    sum += texture(tex, uv + vec2(1.5, 0.0) * texel).rgb * 0.2331;
+    sum += texture(tex, uv - vec2(1.5, 0.0) * texel).rgb * 0.2331;
+    sum += texture(tex, uv + vec2(3.5, 0.0) * texel).rgb * 0.1225;
+    sum += texture(tex, uv - vec2(3.5, 0.0) * texel).rgb * 0.1225;
+    sum += texture(tex, uv + vec2(0.0, 1.5) * texel).rgb * 0.2331;
+    sum += texture(tex, uv - vec2(0.0, 1.5) * texel).rgb * 0.2331;
+    sum += texture(tex, uv + vec2(0.0, 3.5) * texel).rgb * 0.1225;
+    sum += texture(tex, uv - vec2(0.0, 3.5) * texel).rgb * 0.1225;
+    return sum;
+}
+float bloom_weight(float radiance, float threshold, float knee)
+{
+    if (radiance <= threshold) {
+        return 0.0;
+    }
+    float excess = radiance - threshold;
+    float soft = min(excess / max(knee, 1e-6), 1.0);
+    float eased = soft * soft * (3.0 - 2.0 * soft);
+    if (excess >= knee) {
+        return excess;
+    }
+    return eased * excess;
+}
+float focus_share(float distance, float focal, float near_range, float far_range)
+{
+    float delta = distance - focal;
+    float range = delta < 0.0 ? near_range : far_range;
+    return clamp(1.0 - abs(delta) / max(range, 1e-6), 0.0, 1.0);
+}
+float ssao_sample(float height, float dist, float radius)
+{
+    if (height <= 0.0 || dist <= 0.0 || dist >= radius) {
+        return 0.0;
+    }
+    float horizon = height / dist;
+    float falloff = 1.0 - (dist / radius) * (dist / radius);
+    return horizon * falloff;
+}
+float mlaa_crossing(float centre, float neighbour)
+{
+    // The midpoint rule: an edge that cuts the pixel (the centre's
+    // luminance differs from the neighbour's) blends half of each side;
+    // aligned edges keep the pixel's own colour.
+    if (abs(centre - neighbour) > 1e-6) {
+        return 0.5;
+    }
+    return 0.0;
+}
+float mlaa_blend(float crossing)
+{
+    return clamp(crossing, 0.0, 1.0);
+}
+void main()
+{
+    vec4 radiance_sample = texture(radiance_texture, v_uv);
+    vec4 world_sample = texture(world_texture, v_uv);
+    vec3 colour = radiance_sample.rgb;
+    bool background = world_sample.a == 0.0;
+    float texel_x = 1.0 / 320.0;
+    float texel_y = 1.0 / 240.0;
+    // The SSAO: the four hemisphere samples around the fragment's world
+    // position (the +x, -x, +y, -y offsets at the radius's eighth), the
+    // occlusion the world buffer's own heights against the fragment's
+    // plane carry.
+    if (params0.w > 0.5 && !background) {
+        vec3 world = world_sample.rgb;
+        float occlusion = 0.0;
+        float radius = params1.w;
+        for (int i = 0; i < 4; i++) {
+            vec2 offset = vec2(0.0);
+            offset.x = (i == 0) ? radius * 0.125 : (i == 1) ? -radius * 0.125 : 0.0;
+            offset.y = (i == 2) ? radius * 0.125 : (i == 3) ? -radius * 0.125 : 0.0;
+            vec3 sample_world = texture(world_texture,
+                v_uv + vec2(offset.x * texel_x, offset.y * texel_y)).rgb;
+            vec3 to_sample = sample_world - world;
+            float dist = length(to_sample);
+            float height = to_sample.y;
+            occlusion += ssao_sample(height, dist, radius);
+        }
+        colour *= 1.0 - clamp(occlusion * 0.25, 0.0, 1.0) * 0.5;
+    }
+    // The bloom: the blurred radiance's weight above the threshold
+    // lifts the frame's bright regions (the composite's intensity the
+    // params carry scales it).
+    if (params0.y > 0.5) {
+        vec3 blurred = sample_blurred(radiance_texture, v_uv,
+            vec2(texel_x, texel_y));
+        float weight = bloom_weight(max(blurred.r, max(blurred.g, blurred.b)),
+            params1.x, params1.y);
+        colour += blurred * weight * params1.z;
+    }
+    // The depth of field: the focus share blends the blurred radiance
+    // over the sharp one (the background fragments stay untouched — the
+    // chain blurs the scene's own geometry).
+    if (params0.z > 0.5 && !background) {
+        vec3 blurred = sample_blurred(radiance_texture, v_uv,
+            vec2(texel_x, texel_y));
+        float distance = length(world_sample.rgb - vec3(0.0));
+        float share = 1.0 - focus_share(distance, params2.x, params2.y, params2.z);
+        colour = mix(colour, blurred, clamp(share, 0.0, 1.0));
+    }
+    // The tonemapping: the filmic curve maps the linear radiance onto
+    // the display's [0, 1] (the gamma the framebuffer's 8-bit encoding
+    // assumes follows).
+    if (params0.x > 0.5) {
+        float num = colour.r * (2.51 * colour.r + 0.03);
+        float den = colour.r * (2.43 * colour.r + 0.59) + 0.14;
+        float mapped_r = clamp(num / den, 0.0, 1.0);
+        num = colour.g * (2.51 * colour.g + 0.03);
+        den = colour.g * (2.43 * colour.g + 0.59) + 0.14;
+        float mapped_g = clamp(num / den, 0.0, 1.0);
+        num = colour.b * (2.51 * colour.b + 0.03);
+        den = colour.b * (2.43 * colour.b + 0.59) + 0.14;
+        float mapped_b = clamp(num / den, 0.0, 1.0);
+        colour = vec3(mapped_r, mapped_g, mapped_b);
+        colour = pow(colour, vec3(1.0 / 2.2));
+    }
+    // The morphological anti-aliasing: the tonemapped luminance's edge
+    // detection reads the four direct neighbours, the crossing ratio
+    // against the dominant edge neighbour drives the blend (the single-
+    // pass approximation of the classic three-pass morphological
+    // operator — the deterministic edge test the example carries).
+    if (params2.w > 0.5) {
+        float centre = dot(colour, vec3(0.299, 0.587, 0.114));
+        vec3 left = texture(radiance_texture, v_uv + vec2(-texel_x, 0.0)).rgb;
+        vec3 right = texture(radiance_texture, v_uv + vec2(texel_x, 0.0)).rgb;
+        vec3 up = texture(radiance_texture, v_uv + vec2(0.0, texel_y)).rgb;
+        vec3 down = texture(radiance_texture, v_uv + vec2(0.0, -texel_y)).rgb;
+        vec3 tonemapped[4];
+        tonemapped[0] = left;
+        tonemapped[1] = right;
+        tonemapped[2] = up;
+        tonemapped[3] = down;
+        if (params0.x > 0.5) {
+            for (int i = 0; i < 4; i++) {
+                float num = tonemapped[i].r * (2.51 * tonemapped[i].r + 0.03);
+                float den = tonemapped[i].r * (2.43 * tonemapped[i].r + 0.59) + 0.14;
+                tonemapped[i].r = clamp(num / den, 0.0, 1.0);
+                num = tonemapped[i].g * (2.51 * tonemapped[i].g + 0.03);
+                den = tonemapped[i].g * (2.43 * tonemapped[i].g + 0.59) + 0.14;
+                tonemapped[i].g = clamp(num / den, 0.0, 1.0);
+                num = tonemapped[i].b * (2.51 * tonemapped[i].b + 0.03);
+                den = tonemapped[i].b * (2.43 * tonemapped[i].b + 0.59) + 0.14;
+                tonemapped[i].b = clamp(num / den, 0.0, 1.0);
+                tonemapped[i] = pow(tonemapped[i], vec3(1.0 / 2.2));
+            }
+        }
+        float luma[4];
+        luma[0] = dot(tonemapped[0], vec3(0.299, 0.587, 0.114));
+        luma[1] = dot(tonemapped[1], vec3(0.299, 0.587, 0.114));
+        luma[2] = dot(tonemapped[2], vec3(0.299, 0.587, 0.114));
+        luma[3] = dot(tonemapped[3], vec3(0.299, 0.587, 0.114));
+        int dominant = 0;
+        float dominant_crossing = mlaa_crossing(centre, luma[0]);
+        for (int i = 1; i < 4; i++) {
+            float crossing = mlaa_crossing(centre, luma[i]);
+            if (crossing > dominant_crossing) {
+                dominant_crossing = crossing;
+                dominant = i;
+            }
+        }
+        colour = mix(colour, tonemapped[dominant], mlaa_blend(dominant_crossing));
+    }
+    fragColor = vec4(colour, 1.0);
+}
+";

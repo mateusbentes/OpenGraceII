@@ -22,6 +22,7 @@ pub enum NullEvent {
     BeginRenderPass,
     EndRenderPass,
     SubmitLightingPass,
+    SubmitPostChain,
     ReleaseRenderTarget,
     BindTexture,
     CreateTexture2D,
@@ -360,6 +361,28 @@ impl RenderBackend for NullRenderBackend {
             }
             let _ = &submission.sun;
             let _ = &submission.mesh;
+        }
+    }
+    fn submit_post_chain(
+        &mut self,
+        submission: &DrawSubmission,
+        hdr_target: &RenderTarget,
+        config: &PostChainConfig,
+    ) {
+        self.record(NullEvent::SubmitPostChain);
+        let _ = config;
+        if self.require_ready("submit_post_chain") {
+            match self.find_target_index(hdr_target) {
+                Some(index) => {
+                    if self.targets[index].released {
+                        self.violations += 1;
+                    }
+                }
+                None => {
+                    self.violations += 1;
+                }
+            }
+            let _ = submission;
         }
     }
 

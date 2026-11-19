@@ -59,6 +59,22 @@ name = "cube_deferred"
 required-features = ["vulkan"]
 
 [[example]]
+name = "cube_post"
+required-features = ["vulkan"]
+
+[[example]]
+name = "cube_post_gl"
+required-features = ["opengl"]
+
+[[example]]
+name = "cube_post_d3d12"
+required-features = ["d3d12"]
+
+[[example]]
+name = "cube_post_mtl"
+required-features = ["metal"]
+
+[[example]]
 name = "cube_lit_gl"
 required-features = ["opengl"]
 

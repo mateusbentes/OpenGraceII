@@ -29,6 +29,9 @@ use super::shader_library::{GBUFFER_FRAGMENT_SHADER, GBUFFER_VERTEX_SHADER};
 use super::shader_library::{
     LIGHTING_FRAGMENT_SHADER, LIGHTING_VERTEX_SHADER,
 };
+use super::shader_library::{
+    POST_COMPOSITE_FRAGMENT_SHADER, POST_GBUFFER_FRAGMENT_SHADER,
+};
 use crate::math::{Mat4, Vec3};
 use std::sync::{Arc, Mutex};
 use std::os::raw::{c_char, c_void};
@@ -247,6 +250,26 @@ pub struct OpenGlBackend {
     lighting_uniform_normal: i32,
     lighting_uniform_world: i32,
     lighting_ready: bool,
+    // The post-processing chain's programs (M7): the HDR geometry-pass
+    // program and the fullscreen composite-pass program.
+    post_gbuffer_program: u32,
+    post_gbuffer_uniform_view_projection: i32,
+    post_gbuffer_uniform_model: i32,
+    post_gbuffer_uniform_sampler: i32,
+    post_gbuffer_uniform_sun_direction: i32,
+    post_gbuffer_uniform_sun_color_intensity: i32,
+    post_gbuffer_uniform_point_position_radius: i32,
+    post_gbuffer_uniform_point_color_intensity: i32,
+    post_gbuffer_uniform_params: i32,
+    post_gbuffer_ready: bool,
+    post_composite_program: u32,
+    post_composite_uniform_radiance: i32,
+    post_composite_uniform_world: i32,
+    post_composite_uniform_params0: i32,
+    post_composite_uniform_params1: i32,
+    post_composite_uniform_params2: i32,
+    post_composite_ready: bool,
+    post_composite_vao: u32,
     /// The fullscreen triangle's own VAO (the core profile forbids the
     /// VAO 0 draw; an attribute-less draw still needs a bound VAO).
     lighting_vao: u32,
@@ -351,6 +374,24 @@ impl OpenGlBackend {
             lighting_uniform_normal: -1,
             lighting_uniform_world: -1,
             lighting_ready: false,
+            post_gbuffer_program: 0,
+            post_gbuffer_uniform_view_projection: -1,
+            post_gbuffer_uniform_model: -1,
+            post_gbuffer_uniform_sampler: -1,
+            post_gbuffer_uniform_sun_direction: -1,
+            post_gbuffer_uniform_sun_color_intensity: -1,
+            post_gbuffer_uniform_point_position_radius: -1,
+            post_gbuffer_uniform_point_color_intensity: -1,
+            post_gbuffer_uniform_params: -1,
+            post_gbuffer_ready: false,
+            post_composite_program: 0,
+            post_composite_uniform_radiance: -1,
+            post_composite_uniform_world: -1,
+            post_composite_uniform_params0: -1,
+            post_composite_uniform_params1: -1,
+            post_composite_uniform_params2: -1,
+            post_composite_ready: false,
+            post_composite_vao: 0,
             lighting_vao: 0,
             lit_block: LightsUniform::none(),
             meshes: Vec::new(),
@@ -1287,6 +1328,226 @@ impl OpenGlBackend {
         self.lighting_ready = true;
         true
     }
+    /// The post chain's geometry pass's program (M7): the G-buffer
+    /// shader pair (the same PNU vertex shape, the two-attachment HDR
+    /// fragment shader), compiled at runtime (the same lazy ensure the
+    /// lit path follows).
+    pub(crate) fn ensure_post_gbuffer_program(&mut self) -> bool {
+        if self.post_gbuffer_ready {
+            return true;
+        }
+        let program = unsafe {
+            (self.loader.gl_create_program.unwrap())()
+        };
+        if program == 0 {
+            return false;
+        }
+        let vs = unsafe { (self.loader.gl_create_shader.unwrap())(GL_VERTEX_SHADER) };
+        let fs = unsafe {
+            (self.loader.gl_create_shader.unwrap())(GL_FRAGMENT_SHADER)
+        };
+        if vs == 0 || fs == 0 {
+            return false;
+        }
+        let vs_source = [GBUFFER_VERTEX_SHADER.as_ptr() as *const c_char];
+        let vs_len = [GBUFFER_VERTEX_SHADER.len() as i32];
+        let fs_source = [POST_GBUFFER_FRAGMENT_SHADER.as_ptr() as *const c_char];
+        let fs_len = [POST_GBUFFER_FRAGMENT_SHADER.len() as i32];
+        unsafe {
+            (self.loader.gl_shader_source.unwrap())(
+                vs,
+                1,
+                vs_source.as_ptr(),
+                vs_len.as_ptr(),
+            );
+            (self.loader.gl_compile_shader.unwrap())(vs);
+            (self.loader.gl_shader_source.unwrap())(
+                fs,
+                1,
+                fs_source.as_ptr(),
+                fs_len.as_ptr(),
+            );
+            (self.loader.gl_compile_shader.unwrap())(fs);
+            (self.loader.gl_attach_shader.unwrap())(program, vs);
+            (self.loader.gl_attach_shader.unwrap())(program, fs);
+            (self.loader.gl_link_program.unwrap())(program);
+        }
+        let mut linked: i32 = 0;
+        unsafe {
+            (self.loader.gl_get_programiv.unwrap())(
+                program,
+                GL_LINK_STATUS,
+                &mut linked,
+            );
+        }
+        if linked != GL_TRUE as i32 {
+            unsafe {
+                (self.loader.gl_delete_shader.unwrap())(vs);
+                (self.loader.gl_delete_shader.unwrap())(fs);
+                (self.loader.gl_delete_program.unwrap())(program);
+            }
+            return false;
+        }
+        unsafe {
+            (self.loader.gl_delete_shader.unwrap())(vs);
+            (self.loader.gl_delete_shader.unwrap())(fs);
+        }
+        self.post_gbuffer_program = program;
+        self.post_gbuffer_uniform_view_projection = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"view_projection\0".as_ptr() as *const c_char,
+            )
+        };
+        self.post_gbuffer_uniform_model = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"model\0".as_ptr() as *const c_char,
+            )
+        };
+        self.post_gbuffer_uniform_sampler = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"surface_texture\0".as_ptr() as *const c_char,
+            )
+        };
+        self.post_gbuffer_uniform_sun_direction = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"sun_direction\0".as_ptr() as *const c_char,
+            )
+        };
+        self.post_gbuffer_uniform_sun_color_intensity = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"sun_color_intensity\0".as_ptr() as *const c_char,
+            )
+        };
+        self.post_gbuffer_uniform_point_position_radius = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"point_position_radius\0".as_ptr() as *const c_char,
+            )
+        };
+        self.post_gbuffer_uniform_point_color_intensity = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"point_color_intensity\0".as_ptr() as *const c_char,
+            )
+        };
+        self.post_gbuffer_uniform_params = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"params\0".as_ptr() as *const c_char,
+            )
+        };
+        self.post_gbuffer_ready = true;
+        true
+    }
+    /// The post chain's composite pass's program (M7): the fullscreen
+    /// shader pair (the same gl_VertexID triangle the lighting path
+    /// carries, the composite fragment shader).
+    pub(crate) fn ensure_post_composite_program(&mut self) -> bool {
+        if self.post_composite_ready {
+            return true;
+        }
+        let program = unsafe {
+            (self.loader.gl_create_program.unwrap())()
+        };
+        if program == 0 {
+            return false;
+        }
+        let vs = unsafe { (self.loader.gl_create_shader.unwrap())(GL_VERTEX_SHADER) };
+        let fs = unsafe {
+            (self.loader.gl_create_shader.unwrap())(GL_FRAGMENT_SHADER)
+        };
+        if vs == 0 || fs == 0 {
+            return false;
+        }
+        let vs_source = [LIGHTING_VERTEX_SHADER.as_ptr() as *const c_char];
+        let vs_len = [LIGHTING_VERTEX_SHADER.len() as i32];
+        let fs_source = [POST_COMPOSITE_FRAGMENT_SHADER.as_ptr() as *const c_char];
+        let fs_len = [POST_COMPOSITE_FRAGMENT_SHADER.len() as i32];
+        unsafe {
+            (self.loader.gl_shader_source.unwrap())(
+                vs,
+                1,
+                vs_source.as_ptr(),
+                vs_len.as_ptr(),
+            );
+            (self.loader.gl_compile_shader.unwrap())(vs);
+            (self.loader.gl_shader_source.unwrap())(
+                fs,
+                1,
+                fs_source.as_ptr(),
+                fs_len.as_ptr(),
+            );
+            (self.loader.gl_compile_shader.unwrap())(fs);
+            (self.loader.gl_attach_shader.unwrap())(program, vs);
+            (self.loader.gl_attach_shader.unwrap())(program, fs);
+            (self.loader.gl_link_program.unwrap())(program);
+        }
+        let mut linked: i32 = 0;
+        unsafe {
+            (self.loader.gl_get_programiv.unwrap())(
+                program,
+                GL_LINK_STATUS,
+                &mut linked,
+            );
+        }
+        if linked != GL_TRUE as i32 {
+            unsafe {
+                (self.loader.gl_delete_shader.unwrap())(vs);
+                (self.loader.gl_delete_shader.unwrap())(fs);
+                (self.loader.gl_delete_program.unwrap())(program);
+            }
+            return false;
+        }
+        unsafe {
+            (self.loader.gl_delete_shader.unwrap())(vs);
+            (self.loader.gl_delete_shader.unwrap())(fs);
+        }
+        self.post_composite_program = program;
+        self.post_composite_uniform_radiance = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"radiance_texture\0".as_ptr() as *const c_char,
+            )
+        };
+        self.post_composite_uniform_world = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"world_texture\0".as_ptr() as *const c_char,
+            )
+        };
+        self.post_composite_uniform_params0 = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"params0\0".as_ptr() as *const c_char,
+            )
+        };
+        self.post_composite_uniform_params1 = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"params1\0".as_ptr() as *const c_char,
+            )
+        };
+        self.post_composite_uniform_params2 = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"params2\0".as_ptr() as *const c_char,
+            )
+        };
+        // The fullscreen triangle's own VAO (the core profile forbids
+        // the VAO 0 draw — the same rule the lighting path follows).
+        let mut vao: u32 = 0;
+        unsafe {
+            (self.loader.gl_gen_vertex_arrays.unwrap())(1, &mut vao);
+        }
+        self.post_composite_vao = vao;
+        self.post_composite_ready = true;
+        true
+    }
 
     /// The generic draw path: the mesh's VAO, the camera uniforms (the
     /// set_camera state's view-projection and the submission's model) and
@@ -1961,6 +2222,277 @@ impl RenderBackend for OpenGlBackend {
         }
     }
 
+    /// The post-processing chain (M7): the HDR geometry pass writes the
+    /// shaded radiance and the world position into the target's two
+    /// Rgba16F attachments, the composite pass samples both and applies
+    /// the enabled effects into the default framebuffer (the same two-
+    /// pass flow the Vulkan path carries).
+    fn submit_post_chain(
+        &mut self,
+        submission: &crate::render::DrawSubmission,
+        hdr_target: &RenderTarget,
+        config: &crate::render::PostChainConfig,
+    ) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        for light in &submission.lights {
+            if light.validate().is_err() {
+                self.violations += 1;
+            }
+        }
+        let target_index = match self
+            .targets
+            .iter()
+            .position(|x| Arc::ptr_eq(&x.inner, &hdr_target.inner))
+        {
+            Some(index) => index,
+            None => {
+                self.violations += 1;
+                return;
+            }
+        };
+        if self.targets[target_index].released {
+            self.violations += 1;
+            return;
+        }
+        let mesh_id = submission.mesh.inner.lock().unwrap().id;
+        if self.meshes.get(mesh_id).map(|m| m.is_none()).unwrap_or(true) {
+            self.violations += 1;
+            return;
+        }
+        if !self.ensure_post_gbuffer_program()
+            || !self.ensure_post_composite_program()
+        {
+            return;
+        }
+        if !self.frame_open {
+            self.violations += 1;
+            return;
+        }
+        let default_sun = DirectionalLight {
+            direction: Vec3::new(0.0, -1.0, 0.0),
+            color: Vec3::new(0.0, 0.0, 0.0),
+            intensity: 0.0,
+        };
+        let sun = submission.sun.as_ref().unwrap_or(&default_sun);
+        let block = LightsUniform::from_lights(sun, &submission.lights);
+        let camera = self.camera;
+        let aspect = self.config.width as f32 / self.config.height as f32;
+        let view = Mat4::look_at(camera.eye, camera.target, camera.up);
+        let projection =
+            Mat4::perspective(camera.fov_y_rad, aspect, camera.near, camera.far);
+        let view_projection = projection.multiply(view);
+        let model = submission.model;
+        let texture = self
+            .bound_texture
+            .and_then(|i| self.textures_2d.get(i))
+            .filter(|t| !t.released)
+            .map(|t| t.texture)
+            .unwrap_or(
+                self.default_texture
+                    .and_then(|i| self.textures_2d.get(i))
+                    .filter(|t| !t.released)
+                    .map(|t| t.texture)
+                    .unwrap_or(0),
+            );
+        let post_framebuffer = self.targets[target_index].framebuffer;
+        let post_textures: Vec<u32> = self.targets[target_index]
+            .views
+            .iter()
+            .take(2)
+            .map(|v| v.texture)
+            .collect();
+        if post_textures.len() != 2 {
+            self.violations += 1;
+            return;
+        }
+        let depth_test_enabled = self.depth_test_enabled;
+        let clear_color = self.clear_color;
+        let clear_depth = self.clear_depth;
+        let clear_stencil = self.clear_stencil;
+        let mut mask = 0;
+        if self.config.clear_buffers.color {
+            mask |= GL_COLOR_BUFFER_BIT;
+        }
+        if self.config.clear_buffers.depth {
+            mask |= GL_DEPTH_BUFFER_BIT;
+        }
+        if self.config.clear_buffers.stencil {
+            mask |= GL_STENCIL_BUFFER_BIT;
+        }
+        // ---- Step one: the HDR geometry pass ----
+        unsafe {
+            (self.loader.gl_bind_framebuffer.unwrap())(
+                GL_FRAMEBUFFER,
+                post_framebuffer,
+            );
+            let colour_attachments = [
+                GL_COLOR_ATTACHMENT0,
+                GL_COLOR_ATTACHMENT1,
+            ];
+            (self.loader.gl_draw_buffers.unwrap())(
+                2,
+                colour_attachments.as_ptr(),
+            );
+            (self.loader.gl_clear_color.unwrap())(
+                clear_color.r as f32 / 255.0,
+                clear_color.g as f32 / 255.0,
+                clear_color.b as f32 / 255.0,
+                clear_color.a as f32 / 255.0,
+            );
+            (self.loader.gl_clear_depth.unwrap())(clear_depth as f64);
+            (self.loader.gl_clear_stencil.unwrap())(clear_stencil);
+            (self.loader.gl_clear.unwrap())(mask);
+            if depth_test_enabled {
+                (self.loader.gl_enable.unwrap())(GL_DEPTH_TEST);
+                (self.loader.gl_depth_func.unwrap())(GL_LESS);
+                (self.loader.gl_depth_mask.unwrap())(GL_TRUE);
+            } else {
+                (self.loader.gl_disable.unwrap())(GL_DEPTH_TEST);
+                (self.loader.gl_depth_mask.unwrap())(GL_FALSE);
+            }
+        }
+        {
+            let (vao, index_count) = match self.meshes.get(mesh_id) {
+                Some(Some(state)) => (state.vao, state.index_count),
+                _ => {
+                    self.violations += 1;
+                    return;
+                }
+            };
+            unsafe {
+                (self.loader.gl_use_program.unwrap())(self.post_gbuffer_program);
+                (self.loader.gl_uniform_matrix_4fv.unwrap())(
+                    self.post_gbuffer_uniform_view_projection,
+                    1,
+                    GL_FALSE,
+                    view_projection.m.as_ptr() as *const f32,
+                );
+                (self.loader.gl_uniform_matrix_4fv.unwrap())(
+                    self.post_gbuffer_uniform_model,
+                    1,
+                    GL_FALSE,
+                    model.m.as_ptr() as *const f32,
+                );
+                (self.loader.gl_uniform_4fv.unwrap())(
+                    self.post_gbuffer_uniform_sun_direction,
+                    1,
+                    block.sun_direction.as_ptr(),
+                );
+                (self.loader.gl_uniform_4fv.unwrap())(
+                    self.post_gbuffer_uniform_sun_color_intensity,
+                    1,
+                    block.sun_color_intensity.as_ptr(),
+                );
+                (self.loader.gl_uniform_4fv.unwrap())(
+                    self.post_gbuffer_uniform_point_position_radius,
+                    4,
+                    block.point_position_radius.as_ptr() as *const f32,
+                );
+                (self.loader.gl_uniform_4fv.unwrap())(
+                    self.post_gbuffer_uniform_point_color_intensity,
+                    4,
+                    block.point_color_intensity.as_ptr() as *const f32,
+                );
+                (self.loader.gl_uniform_4fv.unwrap())(
+                    self.post_gbuffer_uniform_params,
+                    1,
+                    block.params.as_ptr(),
+                );
+                (self.loader.gl_active_texture.unwrap())(GL_TEXTURE0);
+                (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_2D, texture);
+                (self.loader.gl_uniform_1i.unwrap())(
+                    self.post_gbuffer_uniform_sampler,
+                    0,
+                );
+                (self.loader.gl_bind_vertex_array.unwrap())(vao);
+                (self.loader.gl_draw_elements.unwrap())(
+                    GL_TRIANGLES,
+                    index_count as i32,
+                    GL_UNSIGNED_INT,
+                    std::ptr::null(),
+                );
+                (self.loader.gl_bind_vertex_array.unwrap())(0);
+            }
+        }
+        // ---- Step two: the composite pass ----
+        unsafe {
+            (self.loader.gl_bind_framebuffer.unwrap())(GL_FRAMEBUFFER, 0);
+            (self.loader.gl_draw_buffer.unwrap())(GL_COLOR_ATTACHMENT0);
+            (self.loader.gl_clear_color.unwrap())(
+                clear_color.r as f32 / 255.0,
+                clear_color.g as f32 / 255.0,
+                clear_color.b as f32 / 255.0,
+                clear_color.a as f32 / 255.0,
+            );
+            (self.loader.gl_clear_depth.unwrap())(clear_depth as f64);
+            (self.loader.gl_clear_stencil.unwrap())(clear_stencil);
+            (self.loader.gl_clear.unwrap())(mask);
+            // The depth test off: the fullscreen triangle covers the
+            // frame (the default framebuffer's depth stays at the clear
+            // value — the same rule the lighting pass follows).
+            (self.loader.gl_disable.unwrap())(GL_DEPTH_TEST);
+            (self.loader.gl_depth_mask.unwrap())(GL_FALSE);
+            (self.loader.gl_use_program.unwrap())(self.post_composite_program);
+            (self.loader.gl_uniform_4fv.unwrap())(
+                self.post_composite_uniform_params0,
+                1,
+                [
+                    if config.tonemapping { 1.0f32 } else { 0.0 },
+                    if config.bloom { 1.0 } else { 0.0 },
+                    if config.depth_of_field { 1.0 } else { 0.0 },
+                    if config.ssao { 1.0 } else { 0.0 },
+                ]
+                .as_ptr(),
+            );
+            (self.loader.gl_uniform_4fv.unwrap())(
+                self.post_composite_uniform_params1,
+                1,
+                [
+                    config.bloom_threshold,
+                    config.bloom_knee,
+                    config.bloom_intensity,
+                    config.ssao_radius,
+                ]
+                .as_ptr(),
+            );
+            (self.loader.gl_uniform_4fv.unwrap())(
+                self.post_composite_uniform_params2,
+                1,
+                [
+                    config.focal_distance,
+                    config.focus_near_range,
+                    config.focus_far_range,
+                    if config.anti_aliasing { 1.0 } else { 0.0 },
+                ]
+                .as_ptr(),
+            );
+            (self.loader.gl_active_texture.unwrap())(GL_TEXTURE0);
+            (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_2D, post_textures[0]);
+            (self.loader.gl_uniform_1i.unwrap())(
+                self.post_composite_uniform_radiance,
+                0,
+            );
+            (self.loader.gl_active_texture.unwrap())(GL_TEXTURE0 + 1);
+            (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_2D, post_textures[1]);
+            (self.loader.gl_uniform_1i.unwrap())(
+                self.post_composite_uniform_world,
+                1,
+            );
+            (self.loader.gl_bind_vertex_array.unwrap())(self.post_composite_vao);
+            (self.loader.gl_draw_arrays.unwrap())(GL_TRIANGLES, 0, 3);
+            (self.loader.gl_bind_vertex_array.unwrap())(0);
+            (self.loader.gl_active_texture.unwrap())(GL_TEXTURE0);
+            (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_2D, texture);
+            if depth_test_enabled {
+                (self.loader.gl_enable.unwrap())(GL_DEPTH_TEST);
+                (self.loader.gl_depth_func.unwrap())(GL_LESS);
+                (self.loader.gl_depth_mask.unwrap())(GL_TRUE);
+            }
+        }
+    }
     fn create_render_target(
         &mut self,
         desc: &RenderTargetDesc,

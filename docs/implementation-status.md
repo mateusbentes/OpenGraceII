@@ -18,7 +18,7 @@ The `.docx` files in this directory are generated from the `.md` sources with
 | 3 | The remaining backends: OpenGL (Windows/Linux), Metal (macOS/iOS), Direct3D 12 (Windows) | Done (OpenGL and Vulkan validated on Linux hardware, Metal on the macOS hardware run, Direct3D 12 under Wine with vkd3d; the Android Vulkan run stays open) |
 | 4 | Render foundation: math, mesh, shader, material | Done (the math and the mesh modules carry their unit tests; the textured cube runs through the real mesh path on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
 | 5 | Forward lighting: light types, shadow mapping | Done (the Blinn-Phong path with the sun and up to four point lights runs on all four backends; the shadow mapping follows in a later milestone) |
-| 6 | Deferred lighting: MRT G-buffer, the lighting pass | Planned |
+| 6 | Deferred lighting: MRT G-buffer, the lighting pass | Done (the three-attachment geometry pass and the fullscreen lighting pass run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
 | 7 | Post-processing chain: HDR, bloom, filmic tonemapping, depth of field, morphological anti-aliasing, SSAO-STF | Planned |
 | 8 | Global illumination by light volume propagation | Planned |
 | 9 | Platform layer: the engine's own windowing, input and events, replacing SDL2 | Planned |
@@ -414,6 +414,83 @@ The validation runs, all through the same contract:
 The lit smokes carry the same two-readback pattern the unlit smokes
 established, and the unlit smokes and the triangle smokes keep passing —
 nothing the milestone touched broke.
+
+---
+
+## Milestone 6: Deferred lighting
+
+Milestone 6 lands the engine's own deferred lighting — the G-buffer's
+three-attachment geometry pass, the fullscreen lighting pass that shades
+it, and the same Blinn-Phong reference the forward path carries on every
+backend.
+
+**The G-buffer contract**: one render target with three colour
+attachments plus the depth attachment. The albedo (Rgba8) carries the
+surface colour with its alpha at 0 marking geometry (any other value
+marks background, so the lighting pass copies the clear colour through
+unchanged); the normal (Rgba8) stores the world-space normal half-offset
+into the unsigned range; the world position (Rgba16F) stores the
+fragment's world-space position the point lights' falloff reads. Each
+backend maps the contract onto its own multi-render-target surface:
+Vulkan's per-target render pass with three colour attachment references,
+OpenGL's `glDrawBuffers` MRT draw on the G-buffer's framebuffer, D3D12's
+PSO with `NumRenderTargets = 3` and its own SRV heap for the lighting
+pass's reads, Metal's pipeline descriptor with three
+`colorAttachments` formats.
+
+**The lighting pass**: a full-frame triangle (no vertex buffer — the
+vertex shader generates the three corners from the vertex id) drawn
+into the default framebuffer with the depth test off. The fragment
+shader samples the three G-buffer attachments and runs the same
+Blinn-Phong the forward path carries — the sun plus up to four point
+lights with the windowed inverse-square falloff — reading the lights'
+block from the same 256-byte uniform contract the M5 draw path
+established.
+
+**The integration test** follows the M4/M5 rule: the deferred path must
+produce the same pixels the forward path produces from the same scene.
+The lit cube from M5 (the 180 grey, the sun at 0.5, one point light in
+front) reads 145 at the centre — the forward path's 90 plus the point
+light's 55 — a value neither the clear colour nor the unlit path can
+produce. The corner carries the clear colour, and the protocol stays
+clean (zero violations).
+
+The validation runs, all through the same contract:
+
+- **Vulkan** (`cube_deferred`, lavapipe in the sandbox, Iris Xe on the
+  LucDev hardware): centre 145, 145, 145, depth 1.0, corner clear, zero
+  violations. The colour images carry the Sampled usage bit (the
+  descriptor's combined image sampler reads them), and the geometry
+  pass's colour attachments hand off to the lighting pass's shader reads
+  through an explicit pipeline barrier.
+- **OpenGL** (`cube_deferred_gl`, EGL surfaceless + GL 3.3 core in the
+  sandbox, Mesa 26.0.8 GL 4.6 core on the LucDev): centre 145, 145, 145,
+  depth 1.0, corner clear, zero violations. The core profile forbids a
+  draw with vertex array object 0, so the lighting pass carries its own
+  VAO for the vertex-buffer-less fullscreen triangle.
+- **Direct3D 12** (`cube_deferred_d3d12`, Wine with vkd3d on both
+  machines): centre 145, 145, 145, depth 1.0, corner clear, zero
+  violations. The run's own findings, fixed in the same milestone: the
+  colour resources transition RENDER_TARGET to PIXEL_SHADER_RESOURCE
+  between the two passes (the barriers follow the OMSet so the
+  descriptor writes see the final state), and the lighting pass's SRV
+  heap carries its own four slots (the three attachments plus the
+  lights' CBV). The examples' Wine runs go through the new
+  `scripts/run-d3d12.sh` runner, which retries the lavapipe startup
+  crash (a device-enumeration segfault inside the lavapipe driver
+  itself, before the engine's own code runs — the sandbox's dmesg
+  traced it to the driver's instance enumeration, and the retry
+  absorbs it at the shell level without touching the engine).
+- **Metal** (`cube_deferred_mtl`, the A18 Pro's hardware run): centre
+  145, 145, 145, depth 1.0, corner clear, zero violations. The MSL
+  shaders follow the M5 lessons (the 3x3 normal matrix built from the
+  model's columns, no `distance` shadowing); the A18 Pro accepted the
+  Rgba16F world attachment and the three-attachment pipeline without
+  further adjustments.
+
+The deferred smokes carry the same two-readback pattern, and the lit,
+unlit and triangle smokes keep passing — nothing the milestone touched
+broke.
 
 ---
 

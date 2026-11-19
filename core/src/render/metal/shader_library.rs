@@ -467,7 +467,8 @@ struct Config
     float4 params1; // bloom_threshold, bloom_knee, bloom_intensity, ssao_radius
     float4 params2; // focal_distance, focus_near_range, focus_far_range, anti_aliasing
 };
-float3 sample_blurred(texture2d<float> tex, float2 uv, float2 texel)
+float3 sample_blurred(texture2d<float> tex, float2 uv, float2 texel,
+    sampler surface_sampler)
 {
     // The 5-tap gaussian: the centre plus the two symmetric pairs at
     // the 1.5-texel and 3.5-texel offsets (the weights the CPU
@@ -563,7 +564,7 @@ fragment float4 postCompositeFragmentMain(LightingVertexOut in [[stage_in]],
     // params carry scales it).
     if (config.params0.y > 0.5) {
         float3 blurred = sample_blurred(radiance_texture, in.uv,
-            float2(texel_x, texel_y));
+            float2(texel_x, texel_y), surface_sampler);
         float weight = bloom_weight(max(blurred.r, max(blurred.g, blurred.b)),
             config.params1.x, config.params1.y);
         colour += blurred * weight * config.params1.z;
@@ -573,7 +574,7 @@ fragment float4 postCompositeFragmentMain(LightingVertexOut in [[stage_in]],
     // chain blurs the scene's own geometry).
     if (config.params0.z > 0.5 && !background) {
         float3 blurred = sample_blurred(radiance_texture, in.uv,
-            float2(texel_x, texel_y));
+            float2(texel_x, texel_y), surface_sampler);
         float distance = length(world_sample.rgb);
         float share = 1.0 - focus_share(distance, config.params2.x,
             config.params2.y, config.params2.z);

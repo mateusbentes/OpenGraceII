@@ -561,28 +561,37 @@ clean (zero violations).
 
 The validation runs, all through the same contract:
 
-- **Vulkan** (`cube_post`, lavapipe in the sandbox): centre 211, 211,
-  211, depth 1.0, corner clear, edge pair 209/105, zero violations. The
-  run's own findings, fixed in the same milestone: the post render
-  pass's declared colour formats must match the framebuffer's image
-  views (the Rgba16F pair the HDR contract carries — the earlier
-  Rgba8 declaration segfaulted in `vkCmdBeginRenderPass`), and the
-  composite pass's own descriptor set reads the two HDR attachments
-  through the same combined image sampler the M6 lighting pass
-  establishes.
-- **OpenGL** (`cube_post_gl`, EGL surfaceless + GL 3.3 core in the
-  sandbox): centre 211, 211, 211, depth 1.0, corner clear, edge pair
-  209/105, zero violations.
-- **Direct3D 12** (`cube_post_d3d12`, Wine with vkd3d): centre 211,
-  211, 211, depth 1.0, corner clear, edge pair 209/105, zero
-  violations. The lights' CBV joins the post gbuffer pass's root
-  signature (the mesh srv_heap's third slot), and the composite pass
-  carries its own SRV heap for the two HDR attachments plus the
-  configuration CBV.
-- **Metal** (`cube_post_mtl`): implemented and building clean (the MSL
-  shaders, the `ensure_post_resources` and the `submit_post_chain` in
-  the same pattern the M6 deferred pass carries); the hardware run
-  awaits the A18 Pro's validation.
+- **Vulkan** (`cube_post`, Intel Iris Xe on the LucDev hardware run,
+  plus lavapipe in the sandbox): centre 211, 211, 211, depth 1.0,
+  corner clear, edge pair 209/105, zero violations. The run's own
+  findings, fixed in the same milestone: the post render pass's
+  declared colour formats must match the framebuffer's image views (the
+  Rgba16F pair the HDR contract carries — the earlier Rgba8 declaration
+  segfaulted in `vkCmdBeginRenderPass`), and the composite pass's own
+  descriptor set reads the two HDR attachments through the same
+  combined image sampler the M6 lighting pass establishes.
+- **OpenGL** (`cube_post_gl`, Intel Iris Xe, GL 4.6 core, on the
+  LucDev hardware run): centre 211, 211, 211, depth 1.0, corner clear,
+  edge pair 209/105, zero violations.
+- **Direct3D 12** (`cube_post_d3d12`, Wine with vkd3d on the LucDev
+  hardware run): centre 211, 211, 211, depth 1.0, corner clear, edge
+  pair 209/105, zero violations. The lights' CBV joins the post gbuffer
+  pass's root signature (the mesh srv_heap's third slot), and the
+  composite pass carries its own SRV heap for the two HDR attachments
+  plus the configuration CBV. The run's lesson: the Wine 10.0
+  `d3dcompiler_47`'s HLSL front end crashes on the composite shader's
+  locally indexed array (`float3 tonemapped[4]` read through the loop
+  variable) — the D3D12 composite shader carries the unrolled variant
+  (named temporaries, no dynamic indexing), and the deferred and lit
+  pipelines shared the composite's vertex stage so the fix covers the
+  whole post chain on the newer Wine.
+- **Metal** (`cube_post_mtl`, Apple A18 Pro on the hardware run):
+  centre 211, 211, 211, depth 1.0, corner clear, edge pair 209/105,
+  zero violations. The run's lesson: the composite shader's
+  `sample_blurred` helper must carry the sampler as a parameter — the
+  out-of-scope reference the build-only validation missed, and the A18
+  Pro's failure left the composite silent (the black frame with zero
+  violations) until the hardware run exposed it.
 
 The post smokes carry the same three-readback pattern (the centre, the
 corner and the edge pair), and the deferred, lit, unlit and triangle

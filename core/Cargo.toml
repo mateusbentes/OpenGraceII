@@ -12,6 +12,7 @@ default = []
 vulkan = ["dep:libc"]
 opengl = ["dep:libc"]
 metal = ["dep:libc"]
+x11 = ["dep:libc"]
 # The D3D12 loader resolves everything through LoadLibraryA/GetProcAddress
 # (kernel32 extern "system"), so it does not need the libc dlopen surface.
 d3d12 = []
@@ -29,6 +30,10 @@ libc = { version = "0.2", optional = true }
 [[example]]
 name = "vk_smoke"
 required-features = ["vulkan"]
+
+[[example]]
+name = "vk_window"
+required-features = ["vulkan", "x11"]
 
 [[example]]
 name = "gl_smoke"

@@ -5,6 +5,7 @@ fn main() {
     let config = VulkanBackendConfig {
         width: 320,
         height: 240,
+        surface: None,
         draw_triangle: true,
         triangle_color: ClearColor { r: 200, g: 40, b: 40, a: 255 },
         readback_center: true,

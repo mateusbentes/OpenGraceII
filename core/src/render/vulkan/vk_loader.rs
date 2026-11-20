@@ -85,6 +85,9 @@ pub enum ImageLayout {
     ShaderReadOnlyOptimal = 5,
     TransferSrcOptimal = 6,
     TransferDstOptimal = 7,
+    // The swapchain's present source (the M9 layout the swapchain's
+    // render pass's final layout carries).
+    PresentSrcKhr = 1000001002,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -214,6 +217,16 @@ pub enum StructureType {
     BufferMemoryBarrier = 44,
     ImageMemoryBarrier = 45,
     MemoryBarrier = 46,
+    // The KHR extension structures' own values (the spec's constants):
+    // the swapchain 1000001000, the present 1000001001, the Xlib surface
+    // 1000004000, the Xcb surface 1000005000 (the lesson: the spec's
+    // enum values are not contiguous; the earlier 1000002000/1000002001
+    // guess was wrong — the new loader's create-info validation rejects
+    // the unknown sType with VK_ERROR_EXTENSION_NOT_PRESENT).
+    SwapchainCreateInfoKhr = 1000001000,
+    PresentInfoKhr = 1000001001,
+    XlibSurfaceCreateInfoKhr = 1000004000,
+    XcbSurfaceCreateInfoKhr = 1000005000,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -440,6 +453,38 @@ pub enum QueueFlags {
     Transfer = 0x4,
 }
 
+// The present modes' own values (the spec's constants): Fifo is the one
+// present mode every implementation must support (the spec's own rule),
+// so the swapchain's creation asks for it and never rejects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PresentMode {
+    Fifo = 2,
+}
+
+// The composite alpha's own values (the spec's constants): Opaque is the
+// window's own surface (the platform's window has no transparency).
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum CompositeAlpha {
+    Opaque = 0x1,
+}
+
+// The surface transform's own values (the spec's constants): Identity is
+// the window's own orientation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum SurfaceTransform {
+    Identity = 0x1,
+}
+
+// The surface extension names (the NUL-terminated byte arrays the
+// instance creation's pp_enabled_extension_names carries).
+pub const KHR_SURFACE_NAME: &[u8] = b"VK_KHR_surface\0";
+pub const KHR_XLIB_SURFACE_NAME: &[u8] = b"VK_KHR_xlib_surface\0";
+pub const KHR_XCB_SURFACE_NAME: &[u8] = b"VK_KHR_xcb_surface\0";
+pub const KHR_SWAPCHAIN_NAME: &[u8] = b"VK_KHR_swapchain\0";
+
 // ---------------------------------------------------------------------------
 // Structures (the published API's field layout). Every struct is
 // #[repr(C)] and the field order is the published one, so the driver reads
@@ -533,6 +578,13 @@ pub struct VkMappedMemoryRange {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct VkFenceCreateInfo {
+    pub s_type: StructureType,
+    pub p_next: *const c_void,
+    pub flags: u32,
+}
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct VkSemaphoreCreateInfo {
     pub s_type: StructureType,
     pub p_next: *const c_void,
     pub flags: u32,
@@ -1419,6 +1471,14 @@ pub type FnFreeCommandBuffers = unsafe extern "system" fn(
     u32,
     *const VkCommandBuffer,
 );
+pub type FnCreateSemaphore = unsafe extern "system" fn(
+    VkDevice,
+    *const VkSemaphoreCreateInfo,
+    *const c_void,
+    *mut VkSemaphore,
+) -> Result;
+pub type FnDestroySemaphore =
+    unsafe extern "system" fn(VkDevice, VkSemaphore, *const c_void);
 pub type FnCreateFence = unsafe extern "system" fn(
     VkDevice,
     *const VkFenceCreateInfo,
@@ -1651,6 +1711,155 @@ pub type FnDestroySampler =
     unsafe extern "system" fn(VkDevice, VkSampler, *const c_void);
 
 // ---------------------------------------------------------------------------
+// The windowed surface's entry points (M9): the Xlib surface creation and
+// the swapchain's own paths. The surface functions are instance-level,
+// the swapchain's device-level.
+// ---------------------------------------------------------------------------
+
+pub type FnCreateXlibSurfaceKhr = unsafe extern "system" fn(
+    VkInstance,
+    *const VkXlibSurfaceCreateInfoKhr,
+    *const c_void,
+    *mut VkSurfaceKhr,
+) -> Result;
+pub type FnCreateXcbSurfaceKhr = unsafe extern "system" fn(
+    VkInstance,
+    *const VkXcbSurfaceCreateInfoKhr,
+    *const c_void,
+    *mut VkSurfaceKhr,
+) -> Result;
+pub type FnDestroySurfaceKhr =
+    unsafe extern "system" fn(VkInstance, VkSurfaceKhr, *const c_void);
+pub type FnGetPhysicalDeviceSurfaceSupportKhr = unsafe extern "system" fn(
+    VkPhysicalDevice,
+    u32,
+    VkSurfaceKhr,
+    *mut u32,
+) -> Result;
+pub type FnGetPhysicalDeviceSurfaceCapabilitiesKhr = unsafe extern "system" fn(
+    VkPhysicalDevice,
+    VkSurfaceKhr,
+    *mut VkSurfaceCapabilitiesKhr,
+) -> Result;
+pub type FnGetPhysicalDeviceSurfaceFormatsKhr = unsafe extern "system" fn(
+    VkPhysicalDevice,
+    VkSurfaceKhr,
+    *mut u32,
+    *mut VkSurfaceFormatKhr,
+) -> Result;
+pub type FnGetPhysicalDeviceSurfacePresentModesKhr = unsafe extern "system" fn(
+    VkPhysicalDevice,
+    VkSurfaceKhr,
+    *mut u32,
+    *mut u32,
+) -> Result;
+pub type FnCreateSwapchainKhr = unsafe extern "system" fn(
+    VkDevice,
+    *const VkSwapchainCreateInfoKhr,
+    *const c_void,
+    *mut VkSwapchainKhr,
+) -> Result;
+pub type FnDestroySwapchainKhr =
+    unsafe extern "system" fn(VkDevice, VkSwapchainKhr, *const c_void);
+pub type FnGetSwapchainImagesKhr = unsafe extern "system" fn(
+    VkDevice,
+    VkSwapchainKhr,
+    *mut u32,
+    *mut VkImage,
+) -> Result;
+pub type FnAcquireNextImageKhr = unsafe extern "system" fn(
+    VkDevice,
+    VkSwapchainKhr,
+    u64,
+    VkSemaphore,
+    VkFence,
+    *mut u32,
+) -> Result;
+pub type FnQueuePresentKhr = unsafe extern "system" fn(
+    VkQueue,
+    *const VkPresentInfoKhr,
+) -> Result;
+
+/// The Xlib surface's creation info (the M9 contract: the display
+/// pointer and the window XID the platform layer carries).
+#[repr(C)]
+pub struct VkXlibSurfaceCreateInfoKhr {
+    pub s_type: StructureType,
+    pub p_next: *const c_void,
+    pub flags: u32,
+    pub dpy: *mut c_void,
+    pub window: u64,
+}
+/// The Xcb surface's creation info (the xcb fallback's own contract: the
+/// xcb_connection_t pointer and the window XID the platform layer
+/// carries — the Xlib display's own connection, the same XID).
+#[repr(C)]
+pub struct VkXcbSurfaceCreateInfoKhr {
+    pub s_type: StructureType,
+    pub p_next: *const c_void,
+    pub flags: u32,
+    pub connection: *mut c_void,
+    pub window: u32,
+}
+
+#[repr(C)]
+pub struct VkSurfaceCapabilitiesKhr {
+    pub min_image_count: u32,
+    pub max_image_count: u32,
+    pub current_extent: VkExtent2D,
+    pub min_image_extent: VkExtent2D,
+    pub max_image_extent: VkExtent2D,
+    pub max_image_array_layers: u32,
+    pub supported_transforms: u32,
+    pub current_transform: u32,
+    pub supported_composite_alpha: u32,
+    pub supported_usage_flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkSurfaceFormatKhr {
+    pub format: Format,
+    pub color_space: i32,
+}
+
+#[repr(C)]
+pub struct VkSwapchainCreateInfoKhr {
+    pub s_type: StructureType,
+    pub p_next: *const c_void,
+    pub flags: u32,
+    pub surface: VkSurfaceKhr,
+    pub min_image_count: u32,
+    pub image_format: Format,
+    pub image_color_space: i32,
+    pub image_extent: VkExtent2D,
+    pub image_array_layers: u32,
+    pub image_usage: u32,
+    pub image_sharing_mode: u32,
+    pub queue_family_index_count: u32,
+    pub p_queue_family_indices: *const u32,
+    pub pre_transform: u32,
+    pub composite_alpha: u32,
+    pub present_mode: u32,
+    pub old_swapchain: VkSwapchainKhr,
+}
+
+#[repr(C)]
+pub struct VkPresentInfoKhr {
+    pub s_type: StructureType,
+    pub p_next: *const c_void,
+    pub wait_semaphore_count: u32,
+    pub p_wait_semaphores: *const VkSemaphore,
+    pub swapchain_count: u32,
+    pub p_swapchains: *const VkSwapchainKhr,
+    pub p_image_indices: *const u32,
+    pub p_results: *mut i32,
+}
+
+pub type VkSurfaceKhr = *mut c_void;
+pub type VkSwapchainKhr = *mut c_void;
+
+// ---------------------------------------------------------------------------
 // The loader
 // ---------------------------------------------------------------------------
 
@@ -1707,6 +1916,8 @@ pub struct VkLoader {
     pub vk_allocate_command_buffers: Option<FnAllocateCommandBuffers>,
     pub vk_free_command_buffers: Option<FnFreeCommandBuffers>,
     pub vk_create_fence: Option<FnCreateFence>,
+    pub vk_create_semaphore: Option<FnCreateSemaphore>,
+    pub vk_destroy_semaphore: Option<FnDestroySemaphore>,
     pub vk_destroy_fence: Option<FnDestroyFence>,
     pub vk_wait_for_fences: Option<FnWaitForFences>,
     pub vk_reset_fences: Option<FnResetFences>,
@@ -1754,6 +1965,25 @@ pub struct VkLoader {
     pub vk_update_descriptor_sets: Option<FnUpdateDescriptorSets>,
     pub vk_create_sampler: Option<FnCreateSampler>,
     pub vk_destroy_sampler: Option<FnDestroySampler>,
+    // The windowed surface's entry points (M9): the surface functions
+    // are instance-level (the load_instance resolves them), the
+    // swapchain's device-level (the load_device resolves them).
+    pub vk_create_xlib_surface_khr: Option<FnCreateXlibSurfaceKhr>,
+    pub vk_create_xcb_surface_khr: Option<FnCreateXcbSurfaceKhr>,
+    pub vk_destroy_surface_khr: Option<FnDestroySurfaceKhr>,
+    pub vk_get_physical_device_surface_support_khr:
+        Option<FnGetPhysicalDeviceSurfaceSupportKhr>,
+    pub vk_get_physical_device_surface_capabilities_khr:
+        Option<FnGetPhysicalDeviceSurfaceCapabilitiesKhr>,
+    pub vk_get_physical_device_surface_formats_khr:
+        Option<FnGetPhysicalDeviceSurfaceFormatsKhr>,
+    pub vk_get_physical_device_surface_present_modes_khr:
+        Option<FnGetPhysicalDeviceSurfacePresentModesKhr>,
+    pub vk_create_swapchain_khr: Option<FnCreateSwapchainKhr>,
+    pub vk_destroy_swapchain_khr: Option<FnDestroySwapchainKhr>,
+    pub vk_get_swapchain_images_khr: Option<FnGetSwapchainImagesKhr>,
+    pub vk_acquire_next_image_khr: Option<FnAcquireNextImageKhr>,
+    pub vk_queue_present_khr: Option<FnQueuePresentKhr>,
 }
 
 impl VkLoader {
@@ -1796,6 +2026,8 @@ impl VkLoader {
             vk_allocate_command_buffers: None,
             vk_free_command_buffers: None,
             vk_create_fence: None,
+            vk_create_semaphore: None,
+            vk_destroy_semaphore: None,
             vk_destroy_fence: None,
             vk_wait_for_fences: None,
             vk_reset_fences: None,
@@ -1840,6 +2072,18 @@ impl VkLoader {
             vk_update_descriptor_sets: None,
             vk_create_sampler: None,
             vk_destroy_sampler: None,
+            vk_create_xlib_surface_khr: None,
+            vk_create_xcb_surface_khr: None,
+            vk_destroy_surface_khr: None,
+            vk_get_physical_device_surface_support_khr: None,
+            vk_get_physical_device_surface_capabilities_khr: None,
+            vk_get_physical_device_surface_formats_khr: None,
+            vk_get_physical_device_surface_present_modes_khr: None,
+            vk_create_swapchain_khr: None,
+            vk_destroy_swapchain_khr: None,
+            vk_get_swapchain_images_khr: None,
+            vk_acquire_next_image_khr: None,
+            vk_queue_present_khr: None,
         }
     }
 
@@ -1932,6 +2176,47 @@ impl VkLoader {
         instance_fn!(vk_get_device_proc_addr, "vkGetDeviceProcAddr");
         instance_fn!(vk_destroy_device, "vkDestroyDevice");
         instance_fn!(vk_get_device_queue, "vkGetDeviceQueue");
+        // The windowed surface's instance-level entry points (M9). The
+        // resolution is best-effort: the platform's loader may not carry
+        // the VK_KHR_surface extension (the headless path's own rule), and
+        // the headless path never calls them. The windowed path checks
+        // them before the surface creation and reports the missing name.
+        macro_rules! instance_fn_optional {
+            ($field:ident, $name:literal) => {
+                let name = concat!($name, "\0");
+                let ptr = unsafe { get_proc(instance, name.as_ptr() as *const _) };
+                if !ptr.is_null() {
+                    self.$field = Some(unsafe {
+                        std::mem::transmute::<*mut c_void, _>(ptr)
+                    });
+                }
+            };
+        }
+        instance_fn_optional!(
+            vk_create_xlib_surface_khr,
+            "vkCreateXlibSurfaceKHR"
+        );
+        instance_fn_optional!(
+            vk_create_xcb_surface_khr,
+            "vkCreateXcbSurfaceKHR"
+        );
+        instance_fn_optional!(vk_destroy_surface_khr, "vkDestroySurfaceKHR");
+        instance_fn_optional!(
+            vk_get_physical_device_surface_support_khr,
+            "vkGetPhysicalDeviceSurfaceSupportKHR"
+        );
+        instance_fn_optional!(
+            vk_get_physical_device_surface_capabilities_khr,
+            "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"
+        );
+        instance_fn_optional!(
+            vk_get_physical_device_surface_formats_khr,
+            "vkGetPhysicalDeviceSurfaceFormatsKHR"
+        );
+        instance_fn_optional!(
+            vk_get_physical_device_surface_present_modes_khr,
+            "vkGetPhysicalDeviceSurfacePresentModesKHR"
+        );
         true
     }
 
@@ -1995,6 +2280,8 @@ impl VkLoader {
         );
         device!(vk_free_command_buffers, "vkFreeCommandBuffers");
         device!(vk_create_fence, "vkCreateFence");
+        device!(vk_create_semaphore, "vkCreateSemaphore");
+        device!(vk_destroy_semaphore, "vkDestroySemaphore");
         device!(vk_destroy_fence, "vkDestroyFence");
         device!(vk_wait_for_fences, "vkWaitForFences");
         device!(vk_reset_fences, "vkResetFences");
@@ -2063,6 +2350,36 @@ impl VkLoader {
         device!(vk_update_descriptor_sets, "vkUpdateDescriptorSets");
         device!(vk_create_sampler, "vkCreateSampler");
         device!(vk_destroy_sampler, "vkDestroySampler");
+        // The windowed swapchain's device-level entry points (M9). The
+        // resolution is best-effort like the surface's: the headless
+        // path never calls them.
+        macro_rules! device_fn_optional {
+            ($field:ident, $name:literal) => {
+                let name = concat!($name, "\0");
+                let ptr = unsafe {
+                    (self.vk_get_device_proc_addr.unwrap())(
+                        device,
+                        name.as_ptr() as *const _,
+                    )
+                };
+                if !ptr.is_null() {
+                    self.$field = Some(unsafe {
+                        std::mem::transmute::<*mut c_void, _>(ptr)
+                    });
+                }
+            };
+        }
+        device_fn_optional!(vk_create_swapchain_khr, "vkCreateSwapchainKHR");
+        device_fn_optional!(
+            vk_destroy_swapchain_khr,
+            "vkDestroySwapchainKHR"
+        );
+        device_fn_optional!(
+            vk_get_swapchain_images_khr,
+            "vkGetSwapchainImagesKHR"
+        );
+        device_fn_optional!(vk_acquire_next_image_khr, "vkAcquireNextImageKHR");
+        device_fn_optional!(vk_queue_present_khr, "vkQueuePresentKHR");
         true
     }
 }

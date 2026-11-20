@@ -136,6 +136,7 @@ fn vulkan_backend_smoke() {
     let config = VulkanBackendConfig {
         width: 320,
         height: 240,
+        surface: None,
         draw_triangle: true,
         triangle_color: TRIANGLE_COLOR,
         readback_center: true,

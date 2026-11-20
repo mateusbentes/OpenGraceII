@@ -133,6 +133,11 @@ struct VolumeUniform {
 pub struct VulkanBackendConfig {
     pub width: u32,
     pub height: u32,
+    /// The windowed surface the platform layer carries (M9): the None
+    /// config keeps the headless path (the off-screen target the
+    /// milestones validated), the Some(X11) config creates the swapchain
+    /// the window's surface carries and presents the frame into it.
+    pub surface: Option<crate::platform::NativeSurface>,
     /// Draw the diagnostic triangle each frame.
     pub draw_triangle: bool,
     pub triangle_color: ClearColor,
@@ -148,6 +153,7 @@ impl Default for VulkanBackendConfig {
         VulkanBackendConfig {
             width: 1280,
             height: 720,
+            surface: None,
             draw_triangle: false,
             triangle_color: ClearColor {
                 r: 200,
@@ -218,6 +224,34 @@ struct VulkanRenderTarget {
     render_pass: vk::VkRenderPass,
     framebuffer: vk::VkFramebuffer,
     released: bool,
+}
+
+/// The windowed swapchain's state (M9): the surface the platform layer
+/// carries, the swapchain and its images, the acquire/present semaphores
+/// and the frame's fence. The None surface keeps the headless path.
+#[allow(dead_code)]
+struct VulkanSwapchain {
+    surface: vk::VkSurfaceKhr,
+    swapchain: vk::VkSwapchainKhr,
+    images: Vec<vk::VkImage>,
+    image_views: Vec<vk::VkImageView>,
+    framebuffers: Vec<vk::VkFramebuffer>,
+    // The render pass the swapchain's framebuffers build against (the
+    // same colour + depth shape the off-screen pass carries).
+    render_pass: vk::VkRenderPass,
+    depth_image: vk::VkImage,
+    depth_memory: vk::VkDeviceMemory,
+    depth_view: vk::VkImageView,
+    // The acquire/present semaphores and the frame's fence: the one
+    // frame in flight the milestone's path carries.
+    acquire_semaphore: vk::VkSemaphore,
+    present_semaphore: vk::VkSemaphore,
+    frame_fence: vk::VkFence,
+    // The current image index the acquire returned (the present's
+    // argument; the first frame's acquire happens at the frame's start).
+    image_index: u32,
+    width: u32,
+    height: u32,
 }
 
 /// The headless Vulkan render backend.
@@ -366,6 +400,11 @@ pub struct VulkanBackend {
     // uniform block's values the gbuffer descriptor writes carry.
     light_volume: Option<VulkanTexture2D>,
     volume_uniform: VolumeUniform,
+    // The windowed swapchain's state (M9): the surface the platform
+    // layer carries, the swapchain and its images, the acquire/present
+    // semaphores and the frame's fence. The None surface keeps the
+    // headless path (no swapchain, the off-screen target's readback).
+    swapchain: Option<VulkanSwapchain>,
     readback_queue: Vec<(u32, u32)>,
     last_readback: Vec<ReadbackSample>,
     has_center: bool,
@@ -577,6 +616,7 @@ impl VulkanBackend {
                 dims: [0.0; 4],
                 params: [0.0; 4],
             },
+            swapchain: None,
             readback_queue: Vec::new(),
             last_readback: Vec::new(),
             has_center: false,
@@ -614,6 +654,23 @@ impl VulkanBackend {
             engine_version: 1,
             api_version: (1 << 22) | (0 << 12) | 0,
         };
+        // The windowed path's instance extensions (M9): the surface's
+        // platform extension must be enabled for the surface's creation
+        // to exist. The headless path enables nothing (the same rule the
+        // milestones 2-8's instance creation followed).
+        let windowed = matches!(
+            self.config.surface,
+            Some(crate::platform::NativeSurface::X11 { .. })
+        );
+        let surface_name = vk::KHR_SURFACE_NAME.as_ptr() as *const _;
+        let xlib_name = vk::KHR_XLIB_SURFACE_NAME.as_ptr() as *const _;
+        let xcb_name = vk::KHR_XCB_SURFACE_NAME.as_ptr() as *const _;
+        let extension_names = [surface_name, xlib_name, xcb_name];
+        let (extension_count, extension_pointers) = if windowed {
+            (3u32, extension_names.as_ptr())
+        } else {
+            (0u32, std::ptr::null())
+        };
         let create_info = vk::VkInstanceCreateInfo {
             s_type: vk::StructureType::InstanceCreateInfo,
             p_next: std::ptr::null(),
@@ -621,8 +678,8 @@ impl VulkanBackend {
             p_application_info: &app_info as *const _ as *const _,
             enabled_layer_count: 0,
             pp_enabled_layer_names: std::ptr::null(),
-            enabled_extension_count: 0,
-            pp_enabled_extension_names: std::ptr::null(),
+            enabled_extension_count: extension_count,
+            pp_enabled_extension_names: extension_pointers,
         };
         let mut instance = std::ptr::null_mut();
         let result = unsafe {
@@ -647,15 +704,148 @@ impl VulkanBackend {
                 missing
             )));
         }
+        // The windowed path's surface (M9): the X11 surface the platform
+        // layer's NativeSurface carries. The surface must exist before
+        // the device pick (the pick verifies the queue family's present
+        // support on it).
+        match self.config.surface {
+            Some(crate::platform::NativeSurface::X11 { display, window }) => {
+                self.create_surface_from_x11(display, window)?;
+            }
+            Some(crate::platform::NativeSurface::Headless) | None => {}
+        }
         self.pick_physical_device()?;
         self.create_device()?;
         self.create_command_pool()?;
         self.create_frame_resources()?;
+        if self.swapchain.is_some() {
+            self.create_swapchain()?;
+        }
         Ok(())
     }
 
     /// The device pick: the first physical device with a graphics queue
     /// family. Headless, no surface required.
+    /// Creates the X11 surface the platform layer's NativeSurface
+    /// carries (M9): the xcb path first (the driver's own stable path —
+    /// some drivers reject the Xlib surface creation with
+    /// VK_ERROR_EXTENSION_NOT_PRESENT even where the extension name
+    /// enumerates), the Xlib path as the fallback. The connection comes
+    /// from the display pointer the platform layer carries through the
+    /// libX11-xcb's XGetXCBConnection bridge (the same display's
+    /// connection, no second connection). The surface's handle lands on
+    /// the backend's own field; the destroy path releases it at shutdown.
+    fn create_surface_from_x11(
+        &mut self,
+        display: *mut std::os::raw::c_void,
+        window: u64,
+    ) -> Result<(), RenderError> {
+        let mut surface = std::ptr::null_mut();
+
+        // The xcb path's own failure reason (the final error reports it
+        // when the fallback fails too).
+        let mut xcb_reason = String::new();
+        // The xcb path first: the connection bridge resolves through
+        // the platform's libX11-xcb (the Xlib display's own connection).
+        if let Some(create_xcb) = self.loader.vk_create_xcb_surface_khr {
+            let bridge = unsafe { get_xcb_connection(display) };
+            if let Some(connection) = bridge {
+                let info = vk::VkXcbSurfaceCreateInfoKhr {
+                    s_type: vk::StructureType::XcbSurfaceCreateInfoKhr,
+                    p_next: std::ptr::null(),
+                    flags: 0,
+                    connection,
+                    window: window as u32,
+                };
+                let result = unsafe {
+                    create_xcb(
+                        self.instance,
+                        &info,
+                        std::ptr::null(),
+                        &mut surface,
+                    )
+                };
+                if result != vk::Result::Success {
+                    xcb_reason = format!(
+                        "vkCreateXcbSurfaceKHR failed (result {})",
+                        result as i32
+                    );
+                    surface = std::ptr::null_mut();
+                }
+            } else {
+                xcb_reason =
+                    "the libX11-xcb bridge did not resolve".to_string();
+            }
+        } else {
+            xcb_reason =
+                "the loader does not carry vkCreateXcbSurfaceKHR".to_string();
+        }
+        // The Xlib path as the fallback: the direct dpy/window handles
+        // the platform layer carries (the drivers that keep the Xlib
+        // surface's own creation).
+        if surface.is_null() {
+            let create = self.loader.vk_create_xlib_surface_khr.ok_or_else(
+                || {
+                    RenderError::from(
+                        "VulkanBackend: the platform's loader does not \
+                         carry vkCreateXlibSurfaceKHR or vkCreateXcbSurfaceKHR \
+                         (the VK_KHR_surface extension)",
+                    )
+                },
+            )?;
+            let info = vk::VkXlibSurfaceCreateInfoKhr {
+                s_type: vk::StructureType::XlibSurfaceCreateInfoKhr,
+                p_next: std::ptr::null(),
+                flags: 0,
+                dpy: display,
+                window,
+            };
+            let result = unsafe {
+                create(
+                    self.instance,
+                    &info,
+                    std::ptr::null(),
+                    &mut surface,
+                )
+            };
+            if result != vk::Result::Success {
+                return Err(RenderError::from(format!(
+                    "VulkanBackend: vkCreateXlibSurfaceKHR failed (result \
+                     {}); the xcb path: {}",
+                    result as i32,
+                    if xcb_reason.is_empty() {
+                        "not attempted"
+                    } else {
+                        xcb_reason.as_str()
+                    }
+                )));
+            }
+        }
+        // The swapchain's state starts here: the surface is set, the
+        // create_swapchain step fills the rest after the device pick.
+        self.swapchain = Some(VulkanSwapchain {
+            surface,
+            swapchain: std::ptr::null_mut(),
+            images: Vec::new(),
+            image_views: Vec::new(),
+            framebuffers: Vec::new(),
+            render_pass: std::ptr::null_mut(),
+            depth_image: std::ptr::null_mut(),
+            depth_memory: std::ptr::null_mut(),
+            depth_view: std::ptr::null_mut(),
+            acquire_semaphore: std::ptr::null_mut(),
+            present_semaphore: std::ptr::null_mut(),
+            frame_fence: std::ptr::null_mut(),
+            image_index: 0,
+            width: self.config.width,
+            height: self.config.height,
+        });
+        Ok(())
+    }
+
+    /// The device pick: the first physical device with a graphics queue
+    /// family. The windowed path also verifies the queue family's present
+    /// support on the surface (the swapchain's own rule).
     fn pick_physical_device(&mut self) -> Result<(), RenderError> {
         let mut count = 0u32;
         let result = unsafe {
@@ -708,6 +898,26 @@ impl VulkanBackend {
                 if family.queue_flags & (vk::QueueFlags::Graphics as u32)
                     != 0
                 {
+                    // The windowed path's present support: the queue
+                    // family must support presenting on the surface (the
+                    // swapchain's own rule; a graphics-only family that
+                    // cannot present leaves the device behind).
+                    if self.swapchain.is_some() {
+                        let mut supported = 0u32;
+                        let result = unsafe {
+                            (self.loader
+                                .vk_get_physical_device_surface_support_khr
+                                .unwrap())(
+                                device,
+                                index as u32,
+                                self.swapchain.as_ref().unwrap().surface,
+                                &mut supported,
+                            )
+                        };
+                        if result != vk::Result::Success || supported == 0 {
+                            continue;
+                        }
+                    }
                     self.physical_device = device;
                     self.queue_family = index as u32;
                     // The device's identity and the API version the
@@ -768,6 +978,17 @@ impl VulkanBackend {
             queue_count: 1,
             p_queue_priorities: &priority,
         };
+        // The windowed path's device extension (M9): the swapchain
+        // extension must be enabled for the swapchain's creation entry
+        // point to exist. The headless path enables nothing.
+        let windowed = self.swapchain.is_some();
+        let swapchain_name = vk::KHR_SWAPCHAIN_NAME.as_ptr() as *const _;
+        let extension_names = [swapchain_name];
+        let (extension_count, extension_pointers) = if windowed {
+            (1u32, extension_names.as_ptr())
+        } else {
+            (0u32, std::ptr::null())
+        };
         let device_info = vk::VkDeviceCreateInfo {
             s_type: vk::StructureType::DeviceCreateInfo,
             p_next: std::ptr::null(),
@@ -776,8 +997,8 @@ impl VulkanBackend {
             p_queue_create_infos: &queue_info,
             enabled_layer_count: 0,
             pp_enabled_layer_names: std::ptr::null(),
-            enabled_extension_count: 0,
-            pp_enabled_extension_names: std::ptr::null(),
+            enabled_extension_count: extension_count,
+            pp_enabled_extension_names: extension_pointers,
             p_enabled_features: std::ptr::null(),
         };
         let mut device = std::ptr::null_mut();
@@ -877,6 +1098,389 @@ impl VulkanBackend {
         }
         self.readback_command = readback_command;
         Ok(())
+    }
+
+    /// The windowed path's swapchain (M9): the surface's capabilities
+    /// query, the render pass the swapchain's framebuffers build against,
+    /// the images' views and framebuffers, the depth attachment and the
+    /// semaphores/fence. The None surface keeps the headless path.
+    fn create_swapchain(&mut self) -> Result<(), RenderError> {
+        // The state's own borrow ends here: the queries and the
+        // creations below call self's own helpers, so the fill reads the
+        // state again at the end (the second borrow the fill carries).
+        if self.swapchain.is_none() {
+            return Ok(());
+        }
+        let surface = self.swapchain.as_ref().unwrap().surface;
+        let mut capabilities = vk::VkSurfaceCapabilitiesKhr {
+            min_image_count: 0,
+            max_image_count: 0,
+            current_extent: vk::VkExtent2D { width: 0, height: 0 },
+            min_image_extent: vk::VkExtent2D { width: 0, height: 0 },
+            max_image_extent: vk::VkExtent2D { width: 0, height: 0 },
+            max_image_array_layers: 0,
+            supported_transforms: 0,
+            current_transform: 0,
+            supported_composite_alpha: 0,
+            supported_usage_flags: 0,
+        };
+        let result = unsafe {
+            (self.loader
+                .vk_get_physical_device_surface_capabilities_khr
+                .unwrap())(
+                self.physical_device,
+                surface,
+                &mut capabilities,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: vkGetPhysicalDeviceSurfaceCapabilitiesKHR \
+                 failed",
+            ));
+        }
+        // The surface format: the first one the surface carries (the
+        // Rgba8 format the default framebuffer's clear contract carries).
+        let mut format_count = 0u32;
+        let result = unsafe {
+            (self.loader
+                .vk_get_physical_device_surface_formats_khr
+                .unwrap())(
+                self.physical_device,
+                surface,
+                &mut format_count,
+                std::ptr::null_mut(),
+            )
+        };
+        if result != vk::Result::Success || format_count == 0 {
+            return Err(RenderError::from(
+                "VulkanBackend: the surface carries no format",
+            ));
+        }
+        let mut formats = vec![
+            vk::VkSurfaceFormatKhr {
+                format: vk::Format::R8g8b8a8Unorm,
+                color_space: 0,
+            };
+            format_count as usize
+        ];
+        let result = unsafe {
+            (self.loader
+                .vk_get_physical_device_surface_formats_khr
+                .unwrap())(
+                self.physical_device,
+                surface,
+                &mut format_count,
+                formats.as_mut_ptr(),
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: the surface formats' query failed",
+            ));
+        }
+        let image_format = formats[0].format;
+        // The image count: the capability's minimum (the spec's own
+        // rule; the present mode's FIFO the default carries needs at
+        // least two).
+        let image_count = capabilities.min_image_count.max(2);
+        let extent = if capabilities.current_extent.width == 0 {
+            vk::VkExtent2D {
+                width: self.config.width,
+                height: self.config.height,
+            }
+        } else {
+            capabilities.current_extent
+        };
+        // The render pass the swapchain's framebuffers build against:
+        // the same colour + depth shape the off-screen pass carries,
+        // with the colour attachment's final layout the present source.
+        let pass = self.create_swapchain_render_pass(image_format)?;
+        // The depth attachment the swapchain's images share.
+        let (depth_image, depth_memory, depth_view) = self
+            .create_offscreen_image(
+                extent.width,
+                extent.height,
+                self.depth_format,
+                vk::ImageUsage::DepthStencilAttachment as u32,
+            )?;
+        let create_info = vk::VkSwapchainCreateInfoKhr {
+            s_type: vk::StructureType::SwapchainCreateInfoKhr,
+            p_next: std::ptr::null(),
+            flags: 0,
+            surface,
+            min_image_count: image_count,
+            image_format,
+            image_color_space: 0,
+            image_extent: extent,
+            image_array_layers: 1,
+            image_usage: vk::ImageUsage::ColorAttachment as u32,
+            image_sharing_mode: vk::SharingMode::Exclusive as u32,
+            queue_family_index_count: 0,
+            p_queue_family_indices: std::ptr::null(),
+            pre_transform: capabilities.current_transform,
+            composite_alpha: 0,
+            present_mode: vk::PresentMode::Fifo as u32,
+            old_swapchain: std::ptr::null_mut(),
+        };
+        let mut swapchain_handle = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_swapchain_khr.unwrap())(
+                self.device,
+                &create_info,
+                std::ptr::null(),
+                &mut swapchain_handle,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(format!(
+                "VulkanBackend: vkCreateSwapchainKHR failed (result {})",
+                result as i32
+            )));
+        }
+        let mut image_count_actual = 0u32;
+        let result = unsafe {
+            (self.loader.vk_get_swapchain_images_khr.unwrap())(
+                self.device,
+                swapchain_handle,
+                &mut image_count_actual,
+                std::ptr::null_mut(),
+            )
+        };
+        if result != vk::Result::Success || image_count_actual == 0 {
+            return Err(RenderError::from(
+                "VulkanBackend: the swapchain carries no images",
+            ));
+        }
+        let mut images = vec![std::ptr::null_mut(); image_count_actual as usize];
+        let result = unsafe {
+            (self.loader.vk_get_swapchain_images_khr.unwrap())(
+                self.device,
+                swapchain_handle,
+                &mut image_count_actual,
+                images.as_mut_ptr(),
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: the swapchain images' query failed",
+            ));
+        }
+        // The views and the framebuffers: one per swapchain image.
+        let mut views = Vec::with_capacity(images.len());
+        let mut framebuffers = Vec::with_capacity(images.len());
+        for image in &images {
+            let view_info = vk::VkImageViewCreateInfo {
+                s_type: vk::StructureType::ImageViewCreateInfo,
+                p_next: std::ptr::null(),
+                flags: 0,
+                image: *image,
+                view_type: vk::ImageType::Type2D,
+                format: image_format as u32,
+                components: vk::VkComponentMapping {
+                    r: vk::ComponentSwizzle::Identity,
+                    g: vk::ComponentSwizzle::Identity,
+                    b: vk::ComponentSwizzle::Identity,
+                    a: vk::ComponentSwizzle::Identity,
+                },
+                subresource_range: vk::VkImageSubresourceRange {
+                    aspect_mask: vk::ImageAspect::Color as u32,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+            };
+            let mut view = std::ptr::null_mut();
+            let result = unsafe {
+                (self.loader.vk_create_image_view.unwrap())(
+                    self.device,
+                    &view_info,
+                    std::ptr::null(),
+                    &mut view,
+                )
+            };
+            if result != vk::Result::Success {
+                return Err(RenderError::from(
+                    "VulkanBackend: the swapchain image's view failed",
+                ));
+            }
+            views.push(view);
+            let attachments = [view, depth_view];
+            let framebuffer_info = vk::VkFramebufferCreateInfo {
+                s_type: vk::StructureType::FramebufferCreateInfo,
+                p_next: std::ptr::null(),
+                flags: 0,
+                render_pass: pass,
+                attachment_count: 2,
+                p_attachments: attachments.as_ptr(),
+                width: extent.width,
+                height: extent.height,
+                layers: 1,
+            };
+            let mut framebuffer = std::ptr::null_mut();
+            let result = unsafe {
+                (self.loader.vk_create_framebuffer.unwrap())(
+                    self.device,
+                    &framebuffer_info,
+                    std::ptr::null(),
+                    &mut framebuffer,
+                )
+            };
+            if result != vk::Result::Success {
+                return Err(RenderError::from(
+                    "VulkanBackend: the swapchain's framebuffer failed",
+                ));
+            }
+            framebuffers.push(framebuffer);
+        }
+        // The acquire/present semaphores and the frame's fence.
+        let semaphore_info = vk::VkSemaphoreCreateInfo {
+            s_type: vk::StructureType::SemaphoreCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+        };
+        let mut acquire_semaphore = std::ptr::null_mut();
+        let mut present_semaphore = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_semaphore.unwrap())(
+                self.device,
+                &semaphore_info,
+                std::ptr::null(),
+                &mut acquire_semaphore,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: the acquire semaphore failed",
+            ));
+        }
+        let result = unsafe {
+            (self.loader.vk_create_semaphore.unwrap())(
+                self.device,
+                &semaphore_info,
+                std::ptr::null(),
+                &mut present_semaphore,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: the present semaphore failed",
+            ));
+        }
+        let fence_info = vk::VkFenceCreateInfo {
+            s_type: vk::StructureType::FenceCreateInfo,
+            p_next: std::ptr::null(),
+            flags: vk::FenceCreate::Signaled as u32,
+        };
+        let mut frame_fence = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_fence.unwrap())(
+                self.device,
+                &fence_info,
+                std::ptr::null(),
+                &mut frame_fence,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: the frame fence failed",
+            ));
+        }
+        let swapchain = self.swapchain.as_mut().unwrap();
+        swapchain.render_pass = pass;
+        swapchain.swapchain = swapchain_handle;
+        swapchain.images = images;
+        swapchain.image_views = views;
+        swapchain.framebuffers = framebuffers;
+        swapchain.depth_image = depth_image;
+        swapchain.depth_memory = depth_memory;
+        swapchain.depth_view = depth_view;
+        swapchain.acquire_semaphore = acquire_semaphore;
+        swapchain.present_semaphore = present_semaphore;
+        swapchain.frame_fence = frame_fence;
+        swapchain.image_index = 0;
+        swapchain.width = extent.width;
+        swapchain.height = extent.height;
+        Ok(())
+    }
+
+    /// The swapchain's render pass: the colour attachment's final layout
+    /// the present source carries.
+    fn create_swapchain_render_pass(
+        &mut self,
+        format: vk::Format,
+    ) -> Result<vk::VkRenderPass, RenderError> {
+        let attachments = [
+            vk::VkAttachmentDescription {
+                flags: 0,
+                format: format as u32,
+                samples: vk::SampleCount::One,
+                load_op: vk::AttachmentLoadOp::Clear,
+                store_op: vk::AttachmentStoreOp::Store,
+                stencil_load_op: vk::AttachmentLoadOp::DontCare,
+                stencil_store_op: vk::AttachmentStoreOp::DontCare,
+                initial_layout: vk::ImageLayout::Undefined,
+                final_layout: vk::ImageLayout::PresentSrcKhr,
+            },
+            vk::VkAttachmentDescription {
+                flags: 0,
+                format: self.depth_format as u32,
+                samples: vk::SampleCount::One,
+                load_op: vk::AttachmentLoadOp::Clear,
+                store_op: vk::AttachmentStoreOp::DontCare,
+                stencil_load_op: vk::AttachmentLoadOp::Clear,
+                stencil_store_op: vk::AttachmentStoreOp::DontCare,
+                initial_layout: vk::ImageLayout::Undefined,
+                final_layout: vk::ImageLayout::DepthStencilAttachmentOptimal,
+            },
+        ];
+        let colour_ref = vk::VkAttachmentReference {
+            attachment: 0,
+            layout: vk::ImageLayout::ColorAttachmentOptimal,
+        };
+        let depth_ref = vk::VkAttachmentReference {
+            attachment: 1,
+            layout: vk::ImageLayout::DepthStencilAttachmentOptimal,
+        };
+        let subpass = vk::VkSubpassDescription {
+            flags: 0,
+            pipeline_bind_point: vk::PipelineBindPoint::Graphics,
+            input_attachment_count: 0,
+            p_input_attachments: std::ptr::null(),
+            color_attachment_count: 1,
+            p_color_attachments: &colour_ref,
+            p_resolve_attachments: std::ptr::null(),
+            p_depth_stencil_attachment: &depth_ref,
+            preserve_attachment_count: 0,
+            p_preserve_attachments: std::ptr::null(),
+        };
+        let pass_info = vk::VkRenderPassCreateInfo {
+            s_type: vk::StructureType::RenderPassCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            attachment_count: 2,
+            p_attachments: attachments.as_ptr(),
+            subpass_count: 1,
+            p_subpasses: &subpass,
+            dependency_count: 0,
+            p_dependencies: std::ptr::null(),
+        };
+        let mut pass = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_render_pass.unwrap())(
+                self.device,
+                &pass_info,
+                std::ptr::null(),
+                &mut pass,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: the swapchain's render pass failed",
+            ));
+        }
+        Ok(pass)
     }
 
     /// The frame resources: the off-screen target's depth attachment, the
@@ -1097,6 +1701,31 @@ impl VulkanBackend {
         if self.command_buffer.is_null() || self.frame_open {
             return;
         }
+        // The windowed path's acquire (M9): the next image's index arrives
+        // through the acquire semaphore the frame's submit waits on. The
+        // headless path carries no swapchain and skips the acquire.
+        let swapchain_index = if self.swapchain.is_some() {
+            let mut index = 0u32;
+            let swapchain = self.swapchain.as_ref().unwrap().swapchain;
+            let semaphore = self.swapchain.as_ref().unwrap().acquire_semaphore;
+            let result = unsafe {
+                (self.loader.vk_acquire_next_image_khr.unwrap())(
+                    self.device,
+                    swapchain,
+                    u64::MAX,
+                    semaphore,
+                    std::ptr::null_mut(),
+                    &mut index,
+                )
+            };
+            if result != vk::Result::Success {
+                return;
+            }
+            self.swapchain.as_mut().unwrap().image_index = index;
+            Some(index)
+        } else {
+            None
+        };
         let begin_info = vk::VkCommandBufferBeginInfo {
             s_type: vk::StructureType::CommandBufferBeginInfo,
             p_next: std::ptr::null(),
@@ -1141,12 +1770,32 @@ impl VulkanBackend {
                 height: self.config.height,
             },
         };
+        // The windowed path's frame target: the swapchain's render pass
+        // and the acquired image's framebuffer (the swapchain's own depth
+        // attachment the second slot carries). The headless path keeps
+        // the off-screen target's default framebuffer.
+        let (render_pass, framebuffer, render_area) = if let Some(index) =
+            swapchain_index
+        {
+            let state = self.swapchain.as_ref().unwrap();
+            let framebuffer = state.framebuffers[index as usize];
+            let area = vk::VkRect2D {
+                offset: vk::VkOffset2D { x: 0, y: 0 },
+                extent: vk::VkExtent2D {
+                    width: state.width,
+                    height: state.height,
+                },
+            };
+            (state.render_pass, framebuffer, area)
+        } else {
+            (self.render_pass, self.framebuffer, area)
+        };
         let pass_begin = vk::VkRenderPassBeginInfo {
             s_type: vk::StructureType::RenderPassBeginInfo,
             p_next: std::ptr::null(),
-            render_pass: self.render_pass,
-            framebuffer: self.framebuffer,
-            render_area: area,
+            render_pass,
+            framebuffer,
+            render_area: render_area,
             clear_value_count: 2,
             p_clear_values: clear_values.as_ptr(),
         };
@@ -1184,16 +1833,40 @@ impl VulkanBackend {
         if result != vk::Result::Success {
             return;
         }
+        // The windowed path's submission: the wait on the acquire
+        // semaphore (the frame's draw must not run before the image's
+        // ownership arrives) and the signal on the present semaphore (the
+        // present waits on the frame's completion). The headless path
+        // keeps the bare submission (the queue's wait idle closes it).
+        let (wait_semaphore, wait_stage, signal_semaphore) =
+            if self.swapchain.is_some() {
+                let state = self.swapchain.as_ref().unwrap();
+                (
+                    state.acquire_semaphore,
+                    vk::PipelineStage::ColorAttachmentOutput as u32,
+                    state.present_semaphore,
+                )
+            } else {
+                (
+                    std::ptr::null_mut(),
+                    0u32,
+                    std::ptr::null_mut(),
+                )
+            };
+        let wait_semaphores = [wait_semaphore];
+        let wait_stages = [wait_stage];
+        let signal_semaphores = [signal_semaphore];
+        let semaphore_count = if self.swapchain.is_some() { 1u32 } else { 0u32 };
         let submit = vk::VkSubmitInfo {
             s_type: vk::StructureType::SubmitInfo,
             p_next: std::ptr::null(),
-            wait_semaphore_count: 0,
-            p_wait_semaphores: std::ptr::null(),
-            p_wait_dst_stage_mask: std::ptr::null(),
+            wait_semaphore_count: semaphore_count,
+            p_wait_semaphores: wait_semaphores.as_ptr(),
+            p_wait_dst_stage_mask: wait_stages.as_ptr(),
             command_buffer_count: 1,
             p_command_buffers: &self.command_buffer,
-            signal_semaphore_count: 0,
-            p_signal_semaphores: std::ptr::null(),
+            signal_semaphore_count: semaphore_count,
+            p_signal_semaphores: signal_semaphores.as_ptr(),
         };
         unsafe {
             (self.loader.vk_queue_submit.unwrap())(
@@ -5928,6 +6601,73 @@ impl RenderBackend for VulkanBackend {
         unsafe {
             (self.loader.vk_device_wait_idle.unwrap())(self.device);
         }
+        // The swapchain's teardown (M9): the framebuffers, the image
+        // views, the semaphores, the fence, the depth attachment, the
+        // render pass, the swapchain and the surface — the creation
+        // order's reverse. The headless path carries none of them.
+        if let Some(state) = self.swapchain.take() {
+            unsafe {
+                for framebuffer in &state.framebuffers {
+                    (self.loader.vk_destroy_framebuffer.unwrap())(
+                        self.device,
+                        *framebuffer,
+                        std::ptr::null(),
+                    );
+                }
+                for view in &state.image_views {
+                    (self.loader.vk_destroy_image_view.unwrap())(
+                        self.device,
+                        *view,
+                        std::ptr::null(),
+                    );
+                }
+                (self.loader.vk_destroy_semaphore.unwrap())(
+                    self.device,
+                    state.acquire_semaphore,
+                    std::ptr::null(),
+                );
+                (self.loader.vk_destroy_semaphore.unwrap())(
+                    self.device,
+                    state.present_semaphore,
+                    std::ptr::null(),
+                );
+                (self.loader.vk_destroy_fence.unwrap())(
+                    self.device,
+                    state.frame_fence,
+                    std::ptr::null(),
+                );
+                (self.loader.vk_destroy_image_view.unwrap())(
+                    self.device,
+                    state.depth_view,
+                    std::ptr::null(),
+                );
+                (self.loader.vk_free_memory.unwrap())(
+                    self.device,
+                    state.depth_memory,
+                    std::ptr::null(),
+                );
+                (self.loader.vk_destroy_image.unwrap())(
+                    self.device,
+                    state.depth_image,
+                    std::ptr::null(),
+                );
+                (self.loader.vk_destroy_render_pass.unwrap())(
+                    self.device,
+                    state.render_pass,
+                    std::ptr::null(),
+                );
+                (self.loader.vk_destroy_swapchain_khr.unwrap())(
+                    self.device,
+                    state.swapchain,
+                    std::ptr::null(),
+                );
+                (self.loader.vk_destroy_surface_khr.unwrap())(
+                    self.instance,
+                    state.surface,
+                    std::ptr::null(),
+                );
+            }
+        }
     }
 
     fn violation_count(&self) -> u64 {
@@ -7987,10 +8727,44 @@ impl RenderBackend for VulkanBackend {
         // frame inside the clear — the generic draw path needs the pass
         // open across the contract's calls).
         self.submit_frame();
-        // The readback happens before the present (the same pre-present
-        // rule the OpenGL backend follows). The off-screen frame is not
-        // presented: its command buffer already ran at the frame's end.
-        self.readback();
+        // The windowed path's present (M9): the queue's present call
+        // hands the frame's image to the window's surface. The present
+        // waits on the frame's completion semaphore. The headless path
+        // carries no swapchain and skips the present.
+        if self.swapchain.is_some() {
+            let state = self.swapchain.as_ref().unwrap();
+            let swapchain = state.swapchain;
+            let index = state.image_index;
+            let semaphore = state.present_semaphore;
+            let swapchains = [swapchain];
+            let image_indices = [index];
+            let present = vk::VkPresentInfoKhr {
+                s_type: vk::StructureType::PresentInfoKhr,
+                p_next: std::ptr::null(),
+                wait_semaphore_count: 1,
+                p_wait_semaphores: &semaphore,
+                swapchain_count: 1,
+                p_swapchains: swapchains.as_ptr(),
+                p_image_indices: image_indices.as_ptr(),
+                p_results: std::ptr::null_mut(),
+            };
+            unsafe {
+                (self.loader.vk_queue_present_khr.unwrap())(
+                    self.queue,
+                    &present,
+                );
+            }
+            // The windowed frame skips the readback: the off-screen
+            // colour attachment the readback copies does not receive the
+            // frame's clear (the swapchain's image does), so the readback
+            // would report the previous frame's stale pixels.
+        } else {
+            // The off-screen frame is not presented: its command buffer
+            // already ran at the frame's end, and the readback copies the
+            // colour attachment's pixels (the same pre-present rule the
+            // OpenGL backend follows).
+            self.readback();
+        }
     }
 
     fn queue_readback(&mut self, x: u32, y: u32) {
@@ -8125,6 +8899,58 @@ unsafe fn get_library_proc(
     {
         libc::dlsym(library, bytes.as_ptr() as *const _)
     }
+}
+
+/// The Xlib display's xcb connection (the Xlib-to-xcb bridge the
+/// platform's libX11-xcb carries). The bridge dlopen()s the library and
+/// resolves XGetXCBConnection once; the returned handle never closes
+/// (the connection stays owned by the display itself).
+#[cfg(not(windows))]
+unsafe fn get_xcb_connection(
+    display: *mut std::os::raw::c_void,
+) -> Option<*mut std::os::raw::c_void> {
+    type FnGetXCBConnection = unsafe extern "C" fn(
+        *mut std::os::raw::c_void,
+    ) -> *mut std::os::raw::c_void;
+    let names = [
+        b"libX11-xcb.so.1\0".as_ref(),
+        b"libX11-xcb.so\0".as_ref(),
+    ];
+    let mut library = std::ptr::null_mut();
+    for name in &names {
+        library = libc::dlopen(name.as_ptr() as *const _, libc::RTLD_NOW);
+        if !library.is_null() {
+            break;
+        }
+    }
+    if library.is_null() {
+        return None;
+    }
+    let symbol = libc::dlsym(library, b"XGetXCBConnection\0".as_ptr() as *const _);
+    if symbol.is_null() {
+        libc::dlclose(library);
+        return None;
+    }
+    let get: FnGetXCBConnection = std::mem::transmute::<
+        *mut std::os::raw::c_void,
+        FnGetXCBConnection,
+    >(symbol);
+    let connection = get(display);
+    libc::dlclose(library);
+    if connection.is_null() {
+        None
+    } else {
+        Some(connection)
+    }
+}
+
+/// The Windows stub: the X11 surface's own path never runs on Windows
+/// (the platform's windowed path carries no X11 surface there).
+#[cfg(windows)]
+unsafe fn get_xcb_connection(
+    _display: *mut std::os::raw::c_void,
+) -> Option<*mut std::os::raw::c_void> {
+    None
 }
 
 // The non-Windows stubs for the kernel32 imports keep the module

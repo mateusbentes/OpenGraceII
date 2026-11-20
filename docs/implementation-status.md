@@ -21,7 +21,7 @@ The `.docx` files in this directory are generated from the `.md` sources with
 | 6 | Deferred lighting: MRT G-buffer, the lighting pass | Done (the three-attachment geometry pass and the fullscreen lighting pass run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
 | 7 | Post-processing chain: HDR, bloom, filmic tonemapping, depth of field, morphological anti-aliasing, SSAO-STF | Done (the HDR geometry pass and the five-effect composite pass run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
 | 8 | Global illumination by light volume propagation | Done (the radiance volume, the indirect term in the post chain and the set_light_volume texture cache run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
-| 9 | Platform layer: the engine's own windowing, input and events, replacing SDL2 | Planned |
+| 9 | Platform layer: the engine's own windowing, input and events, replacing SDL2 | Done (the X11 platform backend runs on Linux hardware — the Xvfb validation and the windowed Vulkan swapchain's acquire/present cycle confirmed; the Win32 and the Cocoa backends follow in a later milestone) |
 | 10 | Audio: the engine's own backend per platform, the WAV and Ogg Vorbis decoders | Planned |
 | 11 | Physics: the classical layer and the extra layer, in the engine's own code | Planned |
 | 12 | Scripting: the engine's own scripting language and VM | Planned |
@@ -706,6 +706,80 @@ runs, and the passing runs render the identical pixels. The
 level; the direct `wine` invocations the examples' commands carried
 until now are the ones that surface it. The D3D12 backend's own
 validation stands on the passing runs.
+
+---
+
+## Milestone 9: The platform layer and the windowed render path
+
+Milestone 9 lands the engine's own platform layer — the windowing, the
+input and the event queue, replacing SDL2 — and the render contract's
+windowed path that consumes the platform layer's native surface.
+
+**The platform layer's contract**: one trait (`PlatformBackend`) with
+the API-neutral surface the app logic consumes: the window's creation
+description, the event queue's poll, the resize, the native surface the
+render backends bind to, and the shutdown. The shared module carries
+only the trait and the pure-Rust types (the `WindowDesc`, the `Event`,
+the `Key`, the `MouseButton`, the `NativeSurface`); the per-platform
+implementations live in their own files gated behind their own
+features, the same rule the render backends' loaders carry.
+
+**The X11 backend**: the engine's own Xlib loader (dlopen of the
+platform's libX11.so.6, no third-party binding), the display
+connection, the window's creation, the WM_DELETE_WINDOW protocol
+registration, the event queue's XPending/XNextEvent translation into
+the contract's events (the keymap normalises the layout's keysyms onto
+the contract's Key names), and the shutdown's display close. The
+backend's `native_surface()` carries the X11 display pointer and the
+window's XID the render backends match on.
+
+**The windowed render path (Vulkan)**: the backend's config gains the
+optional `surface` field; the None surface keeps the headless path the
+milestones 2-8 validated. The Some(X11) path creates the Xlib surface
+through the loader's `vkCreateXlibSurfaceKHR`, enables the surface and
+swapchain extensions at the instance and device creation, verifies the
+queue family's present support on the surface during the device pick,
+creates the swapchain (the surface's capabilities query, the first
+surface format, the FIFO present mode, the current transform, the
+shared depth attachment), builds the per-image views and framebuffers
+against the swapchain's own render pass (the colour attachment's final
+layout is the present source), and creates the acquire/present
+semaphores and the frame's fence. The frame loop's acquire presents
+through the same semaphores: the submit waits on the acquire
+semaphore, signals the present semaphore, and the present hands the
+frame's image to the window's surface. The shutdown tears the
+swapchain state down in reverse (the framebuffers, the views, the
+semaphores, the fence, the depth attachment, the render pass, the
+swapchain, the surface).
+
+**The integration test** (`vk_window`): the platform layer creates the
+window, the backend binds the surface and runs the frame loop — the
+acquire/present cycle the swapchain carries — five times on the Xvfb
+display, and the shutdown tears the platform and the render resources
+down cleanly. The headless path's smokes keep passing unchanged (the
+None surface keeps the off-screen target's readback path).
+
+The validation runs, all through the same contract:
+
+- **X11 platform backend** (Linux x86_64, Xvfb display :0): the window
+  creates, the surface carries the display pointer and the XID, the
+  event queue's poll runs, and the shutdown closes the display.
+- **Windowed Vulkan path** (`vk_window`, lavapipe over the Xvfb
+  surface): the swapchain creates, the frame loop presents five frames,
+  and the shutdown tears the swapchain down cleanly. Ten repeated runs
+  confirm the path's stability.
+- **The headless regression**: the Vulkan, the OpenGL, the Direct3D 12
+  and the Metal backends' smokes keep passing (the None surface keeps
+  the off-screen target's readback path); the og2-core suite (56 tests)
+  and the og2-tests suite (7 render tests + 3 docs suites) pass.
+
+**The run's own finding, fixed in the same milestone**: the
+`XSetWMProtocols` loader's signature declared the protocols parameter
+as a value (`Atom`) where the API's header declares a pointer
+(`Atom *`); the mismatch segfaulted the protocol registration on the
+platform's libX11 (the `_XData32` dereference the backtrace pinned).
+The loader now carries the pointer form and the call passes the atom's
+address.
 
 ---
 

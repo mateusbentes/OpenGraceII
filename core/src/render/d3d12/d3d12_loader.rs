@@ -743,6 +743,9 @@ pub const IID_ID3D12_DEBUG_WORDS: [u32; 4] = [
 pub const IID_IDXGI_FACTORY1_WORDS: [u32; 4] = [
     0x770aae78, 0x4dbaf26f, 0x3c2529a8, 0x87b3d183,
 ];
+pub const IID_IDXGI_FACTORY4_WORDS: [u32; 4] = [
+    0x1bc6ea02, 0x464fef36, 0xca210cbf, 0x8a16e539,
+];
 pub const IID_IDXGI_ADAPTER1_WORDS: [u32; 4] = [
     0x29038f61, 0x46263839, 0x6808fd91, 0x051a0179,
 ];

@@ -90,6 +90,7 @@ use super::d3d12_loader::{
     IID_ID3D12_DESCRIPTOR_HEAP_WORDS, IID_ID3D12_DEVICE_WORDS, IID_ID3D12_FENCE_WORDS,
     IID_ID3D12_GRAPHICS_COMMAND_LIST_WORDS, IID_ID3D12_PIPELINE_STATE_WORDS,
     IID_ID3D12_RESOURCE_WORDS, IID_ID3D12_ROOT_SIGNATURE_WORDS, IID_IDXGI_FACTORY1_WORDS,
+    IID_IDXGI_ADAPTER1_WORDS, IID_IDXGI_FACTORY4_WORDS,
 };
 use crate::math::{Mat4, Vec3};
 use crate::lightvolume::LightVolume;
@@ -155,6 +156,13 @@ const HEAP_GET_GPU_DESCRIPTOR_HANDLE: usize = 10;
 // before GetPrivateData, the opposite of the D3D12 side).
 const FACTORY_ENUM_ADAPTERS1: usize = 12;
 const ADAPTER_GET_DESC1: usize = 10;
+// The IDXGIFactory4's EnumWarpAdapter (the WARP fallback's own slot: the
+// IUnknown's 0-2, the IDXGIObject's 3-6, the IDXGIFactory's 7-11, the
+// IDXGIFactory1's 12-13, the IDXGIFactory2's 14-24, the IDXGIFactory3's
+// 25, the IDXGIFactory4's EnumAdapterByLuid 26 and EnumWarpAdapter 27).
+const FACTORY4_ENUM_WARP_ADAPTER: usize = 27;
+// The IUnknown's QueryInterface (the factory's own slot 0).
+const UNKNOWN_QUERY_INTERFACE: usize = 0;
 // ID3D10Blob (the d3dcompiler's blob).
 const BLOB_GET_BUFFER_POINTER: usize = 3;
 const BLOB_GET_BUFFER_SIZE: usize = 4;
@@ -540,6 +548,81 @@ unsafe fn self_read_adapter(
         )));
     }
     // The WCHAR[128] description: the UTF-16 units up to the zero.
+    let units: Vec<u16> = desc
+        .description
+        .iter()
+        .take_while(|u| **u != 0)
+        .copied()
+        .collect();
+    let name = String::from_utf16_lossy(&units);
+    Ok((adapter, name, desc.vendor_id))
+}
+
+/// Queries the factory's IDXGIFactory4 interface (the QueryInterface
+/// slot 0): the WARP fallback's own entry. The Windows 10's factory
+/// carries the interface; the Wine's factory may not (the query
+/// returns a null pointer then).
+unsafe fn self_query_factory4(
+    factory: DxgiFactoryHandle,
+) -> Option<DxgiFactoryHandle> {
+    let mut factory4: *mut c_void = std::ptr::null_mut();
+    let hr = call_slot_i32_2(
+        factory as ComObject,
+        UNKNOWN_QUERY_INTERFACE,
+        IID_IDXGI_FACTORY4_WORDS.as_ptr() as *const c_void as *mut c_void,
+        &mut factory4 as *mut *mut c_void as *mut c_void,
+    );
+    if hr != S_OK || factory4.is_null() {
+        return None;
+    }
+    Some(factory4)
+}
+
+/// Reads the WARP adapter through the factory4's EnumWarpAdapter and
+/// its description: the describe() report's vendor and renderer
+/// strings when the hardware path fails (the same DXGK description
+/// string the real adapters carry — the WARP's own is the "Microsoft
+/// Basic Render Driver").
+unsafe fn self_read_warp_adapter(
+    factory4: DxgiFactoryHandle,
+) -> Result<(DxgiAdapterHandle, String, u32), RenderError> {
+    let mut adapter: *mut c_void = std::ptr::null_mut();
+    let hr = call_slot_i32_2(
+        factory4 as ComObject,
+        FACTORY4_ENUM_WARP_ADAPTER,
+        IID_IDXGI_ADAPTER1_WORDS.as_ptr() as *const c_void as *mut c_void,
+        &mut adapter as *mut *mut c_void as *mut c_void,
+    );
+    if hr != S_OK || adapter.is_null() {
+        return Err(RenderError::from(format!(
+            "D3d12Backend: the WARP adapter could not be enumerated \
+             (hr=0x{:08x})",
+            hr
+        )));
+    }
+    let mut desc = DxgiAdapterDesc1 {
+        description: [0; 128],
+        vendor_id: 0,
+        device_id: 0,
+        sub_sys_id: 0,
+        revision: 0,
+        dedicated_video_memory: 0,
+        dedicated_system_memory: 0,
+        shared_system_memory: 0,
+        adapter_luid_low: 0,
+        adapter_luid_high: 0,
+        flags: 0,
+    };
+    let f: unsafe extern "system" fn(ComObject, *mut DxgiAdapterDesc1) -> i32 =
+        std::mem::transmute(*vtable_of(adapter as ComObject).add(ADAPTER_GET_DESC1));
+    let hr = f(adapter as ComObject, &mut desc);
+    if hr != S_OK {
+        return Err(RenderError::from(format!(
+            "D3d12Backend: the WARP adapter's description could not be \
+             read (hr=0x{:08x})",
+            hr
+        )));
+    }
     let units: Vec<u16> = desc
         .description
         .iter()
@@ -1050,10 +1133,38 @@ impl D3d12Backend {
         // The adapter and the device: the factory enumerates the first
         // adapter, the device is created at feature level 11.0 (the
         // probes' minimum), and the adapter's description is the
-        // describe() report.
+        // describe() report. The machine without a D3D12-capable GPU
+        // falls back to the WARP adapter: the Microsoft Basic Render
+        // Driver's own software rasterizer, the D3D12 runtime's
+        // guaranteed path.
         let factory = unsafe { self_create_factory(&loader)? };
-        let (adapter, adapter_desc, adapter_vendor) = unsafe { self_read_adapter(factory)? };
-        let device = unsafe { self_create_device(&loader, adapter)? };
+        let (_adapter, adapter_desc, adapter_vendor, device) = {
+            let (adapter, adapter_desc, adapter_vendor) =
+                unsafe { self_read_adapter(factory)? };
+            if let Ok(device) = unsafe { self_create_device(&loader, adapter) } {
+                (adapter, adapter_desc, adapter_vendor, device)
+            } else {
+                // The WARP fallback: the factory4's own EnumWarpAdapter
+                // (the query may return None where the factory does not
+                // carry the interface, the same rule the loader's
+                // optional entry points carry).
+                let factory4 = match unsafe { self_query_factory4(factory) } {
+                    Some(f) => f,
+                    None => {
+                        return Err(RenderError::from(
+                            "D3d12Backend: the first adapter does not \
+                             carry the D3D12 device and the factory does \
+                             not carry the IDXGIFactory4 (the WARP \
+                             fallback)",
+                        ));
+                    }
+                };
+                let (warp_adapter, warp_desc, warp_vendor) =
+                    unsafe { self_read_warp_adapter(factory4)? };
+                let device = unsafe { self_create_device(&loader, warp_adapter)? };
+                (warp_adapter, warp_desc, warp_vendor, device)
+            }
+        };
         let feature_level = unsafe { self_check_feature_level(device) };
         let queue = unsafe { self_create_queue(device)? };
         let allocator = unsafe { self_create_allocator(device)? };

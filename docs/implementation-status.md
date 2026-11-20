@@ -19,8 +19,8 @@ The `.docx` files in this directory are generated from the `.md` sources with
 | 4 | Render foundation: math, mesh, shader, material | Done (the math and the mesh modules carry their unit tests; the textured cube runs through the real mesh path on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
 | 5 | Forward lighting: light types, shadow mapping | Done (the Blinn-Phong path with the sun and up to four point lights runs on all four backends; the shadow mapping follows in a later milestone) |
 | 6 | Deferred lighting: MRT G-buffer, the lighting pass | Done (the three-attachment geometry pass and the fullscreen lighting pass run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
-| 7 | Post-processing chain: HDR, bloom, filmic tonemapping, depth of field, morphological anti-aliasing, SSAO-STF | Done (the HDR geometry pass and the five-effect composite pass run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d; the Metal run awaits the A18 Pro's hardware validation) |
-| 8 | Global illumination by light volume propagation | Planned |
+| 7 | Post-processing chain: HDR, bloom, filmic tonemapping, depth of field, morphological anti-aliasing, SSAO-STF | Done (the HDR geometry pass and the five-effect composite pass run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
+| 8 | Global illumination by light volume propagation | Done (the radiance volume, the indirect term in the post chain and the set_light_volume texture cache run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
 | 9 | Platform layer: the engine's own windowing, input and events, replacing SDL2 | Planned |
 | 10 | Audio: the engine's own backend per platform, the WAV and Ogg Vorbis decoders | Planned |
 | 11 | Physics: the classical layer and the extra layer, in the engine's own code | Planned |
@@ -598,6 +598,114 @@ corner and the edge pair), and the deferred, lit, unlit and triangle
 smokes keep passing — nothing the milestone touched broke. The Vulkan
 backend's committed SPIR-V fallback carries the two post shaders' byte
 arrays, so the macOS build compiles the chain without the validator.
+
+---
+
+## Milestone 8: Global illumination by light volume propagation
+
+Milestone 8 lands the engine's own global illumination — the
+`lightvolume` module's radiance volume, the post chain's indirect term
+that samples it, and the texture cache the render contract's
+`set_light_volume` carries on every backend.
+
+**The volume's contract**: a 3D grid of cells, each cell storing six
+face radiance values (one per axis direction) packed into the 3D
+texture's depth layers (`z * 6 + face`). The CPU-side module builds the
+volume from the scene's lights: the point lights inject the windowed
+falloff the direct path carries, the directional light fills the grid
+along its direction, and the propagation steps move half of each face's
+radiance to the neighbour the face points at, so light bleeds around
+corners in discrete steps. The module's unit tests pin the packing, the
+injection, the propagation's energy conservation (the total energy
+never grows) and the trilinear sampling the shader-side read mirrors.
+
+**The shader-side read**: the post chain's gbuffer pass gains the
+volume's 3D texture and its config uniform; the fragment adds the
+indirect term — the albedo multiplied by the face the normal faces'
+trilinear sample, scaled by the config's indirect intensity. The three
+shader languages carry the same read with their own rules pinned:
+GLSL's `textureLod` (the position-dependent loop flow makes the
+implicit-derivative sampling undefined), MSL's `level(0)` (the same
+rule), and HLSL's explicit LOD through the component-vector corner
+loop (the arrays would lose the component swizzle the loop reads).
+
+**The `set_light_volume` contract**: the render trait's new method
+carries the volume's dims, origin, cell size, and the packed texture
+bytes; each backend caches the 3D texture (the creation path the M8
+code establishes per backend) and re-uploads only when the contents
+change. The gbuffer pass binds the volume texture and the config
+uniform beside the lights' block, and the composite reads the
+lit-through-volume radiance the geometry pass produced.
+
+**The integration test** follows the M6/M7 rule: the post chain's
+indirect term must produce the pixels the volume's own reference
+produces from the same scene. The cube from M7 (the 180 grey, the sun
+at 0.5, one point light in front) with the volume's indirect intensity
+at 0.5 reads 221 at the centre — a value neither the direct-only 211
+nor the clear colour can produce. The corner carries the chain's clear
+colour, and the protocol stays clean (zero violations).
+
+The validation runs, all through the same contract:
+- **Vulkan** (`cube_volume`, lavapipe in the sandbox, Iris Xe on the
+  LucDev hardware): centre 221, 221, 221, depth 1.0, corner clear, zero
+  violations. The run's own finding, fixed in the same milestone: the
+  3D image's `imageType` is `VK_IMAGE_TYPE_3D` (the spec's value 2, not
+  the sequential guess 3), and the volume's 3D texture joins the
+  gbuffer pass's descriptor set as a combined image sampler.
+- **OpenGL** (`cube_volume_gl`, EGL surfaceless + GL 3.3 core in the
+  sandbox, Mesa 26.0.8 GL 4.6 core on the LucDev): centre 221, 221,
+  221, depth 1.0, corner clear, zero violations. The run's own
+  findings, fixed in the same milestone: the volume sample carries the
+  explicit `textureLod`, and the Rgba16F 3D uploads (both the creation
+  and the fill paths) name `GL_HALF_FLOAT` for the half-float data —
+  the readback mirrors it through a `glGetTexImage` call the loader
+  gained.
+- **Direct3D 12** (`cube_volume_d3d12`, Wine with vkd3d on both
+  machines): centre 221, 221, 221, depth 1.0, corner clear, zero
+  violations. The run's own findings, fixed in the same milestone: the
+  3D texture fill copies per row at the 256-byte row pitch (a
+  contiguous per-layer copy leaves the rows 1..n in the pitch's
+  padding — the C-side ground truth with the real d3d12.dll headers
+  isolated the Rust-side bug), and the readback is a real one (the
+  COPY_SOURCE transition, the readback buffer's copy, the fence wait
+  and the per-row unmap). The gbuffer pass binds the mesh srv_heap's
+  five slots (the camera CBV, the texture SRV, the lights CBV, the
+  volume SRV and the volume CBV), and the composite keeps its own
+  three-slot heap.
+- **Metal** (`cube_volume_mtl`, the A18 Pro's hardware run): centre
+  221, 221, 221, depth 1.0, corner clear, zero violations. The runs'
+  own findings, fixed in the same milestone: the 2D device texture's
+  creation path builds its own descriptor (the depth and the type stay
+  at the descriptor's defaults), the 3D upload's selector is the
+  `replaceRegion:mipmapLevel:slice:...` form the API declares, the
+  `MTLTextureType` values match the header's enum (2D=2, 3D=7), and
+  the volume sample's corner loop uses component vectors (`int3`/
+  `float3` — the arrays would lose the swizzle the loop reads) with
+  the explicit `level(0)` and the cell base renamed off the albedo's
+  `base` shadowing.
+
+The volume smokes carry the same three-readback pattern, and the post,
+deferred, lit, unlit and triangle smokes keep passing — nothing the
+milestone touched broke.
+
+**The Wine flake, recorded**: the D3D12 runs under Wine with vkd3d
+show an intermittent startup crash that the M6 record already traced
+to the lavapipe driver's instance enumeration (a device-enumeration
+segfault inside the driver, before the engine's own code runs). The
+repeated runs confirm the shape: the same binary passes and fails
+alternating runs on both machines (the LucDev's smoke passed three of
+three after a failed run; the deferred example failed three of three
+in one batch and passed in the sandbox's batches), the failing runs
+die before the engine prints its first readback line, and the Wine
+trace shows `RPC_S_SERVER_UNAVAILABLE` plus the vkd3d message
+`Could not find Vulkan physical device for DXGI adapter` — the Vulkan
+device the lavapipe ICD serves is gone by the time the engine's D3D12
+loader asks for it. The engine's own code does not run in the failing
+runs, and the passing runs render the identical pixels. The
+`scripts/run-d3d12.sh` runner's retry absorbs the crash at the shell
+level; the direct `wine` invocations the examples' commands carried
+until now are the ones that surface it. The D3D12 backend's own
+validation stands on the passing runs.
 
 ---
 

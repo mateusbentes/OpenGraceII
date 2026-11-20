@@ -18,31 +18,20 @@ null backend and the Vulkan backend (the engine's own loader, no third-
 party Vulkan binding), validated on Linux with lavapipe; the Android
 hardware run follows. The running record is docs/implementation-status.md.
 
-Milestone 3 is in progress: the OpenGL backend is done (the engine's own
-EGL + GL 3.3 core loader, validated on Linux with llvmpipe through an EGL
-surfaceless context), and the Metal backend is implemented (the engine's
-own Objective-C runtime loader, no Apple SDK headers; the module compiles
-on any platform and the hardware run needs a Mac). The Direct3D 12
-backend is implemented and validated under Wine with vkd3d over lavapipe:
-the smoke run creates the device, clears, draws the diagnostic triangle,
-copies the three planes and reads the centre pixel back (the colour and
-the depth planes match; the stencil plane's copy is undefined under
-vkd3d and its value is reported, not asserted).
-The Metal backend's hardware run on macOS (Apple A18 Pro) completed: the
-smoke renders the diagnostic triangle, clears and reads the centre pixel
-back as the triangle's colour with the clear depth and stencil values.
-The run found and fixed seven real defects the Linux-only validation
-could not see: two pipeline descriptor selectors that do not exist on
-the Metal API (the runtime raises Objective-C exceptions the Rust
-process cannot catch), a frame path whose clear and draw were stubs,
-the combined depth/stencil pass descriptors' own stencil attachment and
-load/store actions, the pipeline descriptor's stencil pixel format
-match (a mismatch nils the pipeline state and silently drops the draw),
-the 64-bit-per-pixel Depth32Float_Stencil8 readback layout, and the
-Metal shading language's vertex input rule (the position input uses the
-[[stage_in]] struct form, one compiled library per stage). The shader
-stages' setup records the first failure's stage and the API's own error
-text, which the smoke example prints.
+Milestones 3 through 8 are done: the four graphics backends (the engine's
+own OpenGL, Vulkan, Metal and Direct3D 12 loaders) plus the render
+foundation (the engine's own math, mesh and shader material paths), the
+forward lighting (the Blinn-Phong path with the sun and up to four point
+lights), the deferred lighting (the three-attachment G-buffer and the
+fullscreen lighting pass), the post-processing chain (the HDR geometry
+pass and the five-effect composite) and the global illumination by light
+volume propagation (the radiance volume, the post chain's indirect term
+and the set_light_volume texture cache) all run on all four backends —
+Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d,
+Metal on the A18 Pro's hardware run. The engine's own lighting module,
+the post chain's reference math and the light volume's packing,
+injection, propagation and sampling carry their unit tests, and every
+milestone's integration test pins the pixels its own reference produces.
 
 ## The lessons from OpenGrace
 

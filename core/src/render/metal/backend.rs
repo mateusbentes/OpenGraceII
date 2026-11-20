@@ -37,7 +37,7 @@ use super::mtl_loader::{
     MTLSMF_NEAREST, MTLSAM_CLAMP_TO_EDGE, MTLLA_LOAD,
     MTLIT_UINT32, MTLCF_LESS,
     MTLBLOPT_DEPTH_FROM_DEPTH_STENCIL, MTLBLOPT_STENCIL_FROM_DEPTH_STENCIL,
-    MTLCU_SHADER_READ,
+    MTLCU_RENDER_TARGET, MTLCU_SHADER_READ,
 };
 use super::super::{
     bytes_per_pixel, CameraParams, ClearBuffer, ClearColor,
@@ -499,7 +499,58 @@ impl MetalBackend {
         height: u32,
         format: super::mtl_loader::NsUInteger,
     ) -> Result<super::mtl_loader::MtlTextureHandle, RenderError> {
-        self.create_device_texture_3d(width, height, 1, format)
+        let descriptor = unsafe {
+            self.loader.alloc_init(self.loader.cls_mtl_texture_descriptor)
+        };
+        if descriptor.is_null() {
+            return Err(RenderError::from(
+                "MetalBackend: the texture descriptor could not be created",
+            ));
+        }
+        // The 2D type never reaches the descriptor: the texture type
+        // property's own default is the 2D type (the M8 rule: the depth
+        // and the type stay at the defaults, and the depth/stencil
+        // attachments' 2D requirement is the descriptor's own).
+        unsafe {
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setWidth:"),
+                width as super::mtl_loader::NsUInteger,
+            );
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setHeight:"),
+                height as super::mtl_loader::NsUInteger,
+            );
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setPixelFormat:"),
+                format,
+            );
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setStorageMode:"),
+                MTLSM_PRIVATE,
+            );
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setUsage:"),
+                MTLCU_RENDER_TARGET | MTLCU_SHADER_READ,
+            );
+        }
+        let texture = unsafe {
+            self.loader.send_ptr_arg(
+                self.device,
+                self.loader.sel("newTextureWithDescriptor:"),
+                descriptor,
+            )
+        };
+        if texture.is_null() {
+            return Err(RenderError::from(
+                "MetalBackend: the device texture could not be allocated",
+            ));
+        }
+        Ok(texture)
     }
 
     /// The 3D texture's creation path: the same descriptor the 2D path
@@ -3912,6 +3963,7 @@ impl RenderBackend for MetalBackend {
                 *mut c_void,
                 MtlRegion,
                 super::mtl_loader::NsUInteger,
+                super::mtl_loader::NsUInteger,
                 *const c_void,
                 super::mtl_loader::NsUInteger,
                 super::mtl_loader::NsUInteger,
@@ -3919,10 +3971,11 @@ impl RenderBackend for MetalBackend {
             f(
                 texture,
                 self.loader.sel(
-                    "replaceRegion:mipmapLevel:withBytes:bytesPerRow:\
-                     bytesPerImage:",
+                    "replaceRegion:mipmapLevel:slice:withBytes:\
+                     bytesPerRow:bytesPerImage:",
                 ),
                 region,
+                0,
                 0,
                 data.as_ptr() as *const c_void,
                 bytes_per_row as super::mtl_loader::NsUInteger,

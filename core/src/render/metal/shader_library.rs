@@ -478,27 +478,31 @@ fragment PostGbufferOut postGbufferFragmentMain(GbufferVertexOut in [[stage_in]]
         int cells_z = int(volume.dims.z / 6.0);
         float3 continuous = (in.world - volume.origin.xyz)
             / volume.params.x - 0.5;
-        int base[3];
-        float fracs[3];
+        // The component vectors (the arrays would lose the .x/.y/.z
+        // swizzle the corner loop reads; the MSL's vectors carry it).
+        // The cell base cannot reuse the `base` name — the albedo
+        // variable above shadows it with a different type.
+        int3 cell_base = int3(0);
+        float3 fracs = float3(0.0);
         for (int axis = 0; axis < 3; axis++) {
             float limit = axis == 0 ? volume.dims.x
                 : (axis == 1 ? volume.dims.y : float(cells_z));
             if (continuous[axis] <= 0.0) {
-                base[axis] = 0;
+                cell_base[axis] = 0;
                 fracs[axis] = 0.0;
             } else if (continuous[axis] >= limit - 1.0) {
-                base[axis] = int(limit) - 1;
+                cell_base[axis] = int(limit) - 1;
                 fracs[axis] = 0.0;
             } else {
-                base[axis] = int(floor(continuous[axis]));
+                cell_base[axis] = int(floor(continuous[axis]));
                 fracs[axis] = continuous[axis] - floor(continuous[axis]);
             }
         }
         float3 result = float3(0.0);
         for (int corner = 0; corner < 8; corner++) {
-            int cx = base.x + ((corner & 1) != 0 ? 1 : 0);
-            int cy = base.y + ((corner & 2) != 0 ? 1 : 0);
-            int cz = base.z + ((corner & 4) != 0 ? 1 : 0);
+            int cx = cell_base.x + ((corner & 1) != 0 ? 1 : 0);
+            int cy = cell_base.y + ((corner & 2) != 0 ? 1 : 0);
+            int cz = cell_base.z + ((corner & 4) != 0 ? 1 : 0);
             float wx = cx >= int(volume.dims.x) ? 0.0
                 : ((corner & 1) != 0 ? fracs.x : 1.0 - fracs.x);
             float wy = cy >= int(volume.dims.y) ? 0.0
@@ -513,14 +517,18 @@ fragment PostGbufferOut postGbufferFragmentMain(GbufferVertexOut in [[stage_in]]
             int clamped_y = min(cy, int(volume.dims.y) - 1);
             int clamped_z = min(cz, cells_z - 1);
             // The face the normal faces' layer: the depth layer
-            // `z * 6 + face` (the same pack the upload carries).
+            // `z * 6 + face` (the same pack the upload carries). The
+            // explicit level(0) keeps the fetch defined — the loop's
+            // control flow depends on the fragment's position (the
+            // implicit-derivative sampling would be undefined, the
+            // same rule the GLSL's textureLod carries).
             float3 texel = float3(
                 float(clamped_x) + 0.5,
                 float(clamped_y) + 0.5,
                 float(clamped_z * 6 + face) + 0.5
             ) / float3(volume.dims.x, volume.dims.y, volume.dims.z);
             result += weight * volume_texture.sample(
-                surface_sampler, texel).rgb;
+                surface_sampler, texel, level(0)).rgb;
         }
         colour += base * result * volume.params.y;
     }

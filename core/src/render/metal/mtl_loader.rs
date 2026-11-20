@@ -116,11 +116,14 @@ pub const MTLSAM_CLAMP_TO_EDGE: NsUInteger = 0;
 // first step records).
 pub const MTLWINDING_COUNTER_CLOCKWISE: NsUInteger = 0;
 pub const MTLCULL_NONE: NsUInteger = 0;
-// The published texture type (MTLTextureType's own values: the 2D type is
-// 0, the type-3D is 4). The M8's light-volume path allocates the 3D
-// textures the volume grid uploads through.
-pub const MTLT_2D: NsUInteger = 0;
-pub const MTLT_3D: NsUInteger = 4;
+// The published texture type (MTLTextureType's own values: 1D=0,
+// 1DArray=1, 2D=2, 2DArray=3, 2DMultisample=4, Cube=5, CubeArray=6,
+// 3D=7). The M8's light-volume path allocates the 3D textures the
+// volume grid uploads through; the 2D value never reaches a descriptor
+// (the descriptor's own default is the 2D type) but the constant
+// matches the header's enum for consistency.
+pub const MTLT_2D: NsUInteger = 2;
+pub const MTLT_3D: NsUInteger = 7;
 
 // ---------------------------------------------------------------------------
 // Fixed-size structures (the published C layouts)

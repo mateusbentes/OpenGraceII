@@ -411,7 +411,13 @@ pub enum ImageTiling {
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ImageType {
+    // The spec's values (the VK_IMAGE_TYPE_* constants): 1D is 0, 2D
+    // is 1 and 3D is 2. The earlier Type3D = 3 was invalid — the
+    // driver clamped the unknown type to 2D and the 3D texture carried
+    // a single layer (the M8 debug's every-copy-lands-in-slice-0 bug).
+    Type1D = 0,
     Type2D = 1,
+    Type3D = 2,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

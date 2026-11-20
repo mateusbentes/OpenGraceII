@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 // Re-exported so the backend modules (and the engine's other modules) reach
 // the contract's math types through the contract.
 pub use crate::math::{Mat4, Vec3};
+use crate::lightvolume::LightVolume;
 
 /// Straight (non-premultiplied) RGBA colour, 8 bits per channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -566,6 +567,38 @@ pub trait RenderBackend {
     fn read_texture_2d(&self, view: &TextureView, data: &mut [u8])
         -> Result<bool, RenderError>;
 
+    // -- 3D textures ----------------------------------------------------------
+    /// Creates a standalone 3D texture and returns its view for
+    /// sampling. The light volume's cells fill the texture's depth
+    /// layers (the volume's x-major, then y, then z byte order the
+    /// upload carries).
+    fn create_texture_3d(&mut self, desc: &Texture3DDesc)
+        -> Result<TextureView, RenderError>;
+
+    /// Releases a 3D texture created by create_texture_3d.
+    fn release_texture_3d(&mut self, view: &TextureView);
+
+    /// Writes the 3D texture's full volume: width * height * depth *
+    /// bytesPerPixel(format) bytes, the layers in the x-major, then
+    /// y, then z order (the same order a 3D texture's data carries).
+    fn fill_texture_3d(&mut self, view: &TextureView, data: &[u8])
+        -> Result<(), RenderError>;
+
+    /// Reads the 3D texture's full volume back into data, in the same
+    /// order as fill_texture_3d.
+    fn read_texture_3d(&mut self, view: &TextureView, data: &mut [u8])
+        -> Result<bool, RenderError>;
+
+    /// Uploads the scene's light volume (M8): the backend (re)creates
+    /// and fills its own 3D texture from the volume's cells — the
+    /// width `dims[0]`, the height `dims[1]`, the depth `dims[2] * 6`
+    /// (the face `f` of the cell `(x, y, z)` sits at the depth layer
+    /// `z * 6 + f`), the `Rgba16F` voxels carrying the radiance in RGB
+    /// and the alpha 1.0. The `submit_post_chain` binds the volume's
+    /// sampler when the config's `indirect_light` toggle is on; with
+    /// no volume set, the toggle is a protocol violation.
+    fn set_light_volume(&mut self, volume: &LightVolume);
+
     // -- Camera and path selection -------------------------------------------
     /// Sets the camera used by submit()/draw() (view-projection).
     fn set_camera(&mut self, camera: CameraParams);
@@ -682,6 +715,14 @@ pub struct PostChainConfig {
     pub ssao: bool,
     /// The SSAO's world-space radius (the occlusion's reach).
     pub ssao_radius: f32,
+    /// The indirect light's toggle (M8): the light volume's radiance
+    /// field shades the surface's albedo (the `albedo * irradiance`
+    /// rule the direct lighting's diffuse carries) before the
+    /// tonemapping.
+    pub indirect_light: bool,
+    /// The indirect light's intensity (the volume's irradiance
+    /// multiplies the albedo by this scale).
+    pub indirect_intensity: f32,
 }
 
 impl Default for PostChainConfig {
@@ -699,6 +740,8 @@ impl Default for PostChainConfig {
             anti_aliasing: false,
             ssao: false,
             ssao_radius: 1.0,
+            indirect_light: false,
+            indirect_intensity: 1.0,
         }
     }
 }

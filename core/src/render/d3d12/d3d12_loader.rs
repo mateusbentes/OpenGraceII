@@ -81,6 +81,7 @@ pub const D3D12_COMMAND_QUEUE_FLAG_NONE: u32 = 0;
 
 pub const D3D12_RESOURCE_DIMENSION_BUFFER: u32 = 1;
 pub const D3D12_RESOURCE_DIMENSION_TEXTURE2D: u32 = 3;
+pub const D3D12_RESOURCE_DIMENSION_TEXTURE3D: u32 = 4;
 
 pub const D3D12_TEXTURE_LAYOUT_ROW_MAJOR: u32 = 1;
 
@@ -115,6 +116,7 @@ pub const D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER: u32 = 3;
 pub const D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE: u32 = 0;
 
 pub const D3D12_SRV_DIMENSION_TEXTURE2D: u32 = 4;
+pub const D3D12_SRV_DIMENSION_TEXTURE3D: u32 = 5;
 pub const D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING: u32 = 0x1688;
 
 pub const D3D12_FILTER_MIN_MAG_MIP_POINT: u32 = 0x0;
@@ -661,6 +663,16 @@ pub struct D3d12Tex2DSrv {
     pub most_detailed_mip: u32,
     pub mip_levels: u32,
     pub plane_slice: u32,
+    pub resource_min_lod_clamp: f32,
+}
+
+/// The published struct: the tex3D SRV member (the header's three
+/// fields: the mip slice, the mip levels and the minimum LOD clamp).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3d12Tex3DSrv {
+    pub most_detailed_mip: u32,
+    pub mip_levels: u32,
     pub resource_min_lod_clamp: f32,
 }
 

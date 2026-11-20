@@ -18,7 +18,7 @@ use super::super::{
     DirectionalLight, DynamicLight, GpuMesh, GpuMeshInner, PixelFormat,
     ReadbackSample, RenderBackend, RenderError, RenderTarget,
     RenderTargetDesc, RenderTargetInner, ShaderProgram, ShaderProgramInner,
-    Texture2DDesc, TextureView, TextureViewInner, VertexLayout,
+    Texture2DDesc, Texture3DDesc, TextureView, TextureViewInner, VertexLayout,
     DEPTH_ATTACHMENT,
 };
 use super::gl_loader::{GlLoader, *};
@@ -33,6 +33,7 @@ use super::shader_library::{
     POST_COMPOSITE_FRAGMENT_SHADER, POST_GBUFFER_FRAGMENT_SHADER,
 };
 use crate::math::{Mat4, Vec3};
+use crate::lightvolume::LightVolume;
 use std::sync::{Arc, Mutex};
 use std::os::raw::{c_char, c_void};
 
@@ -261,6 +262,10 @@ pub struct OpenGlBackend {
     post_gbuffer_uniform_point_position_radius: i32,
     post_gbuffer_uniform_point_color_intensity: i32,
     post_gbuffer_uniform_params: i32,
+    post_gbuffer_uniform_volume_origin: i32,
+    post_gbuffer_uniform_volume_dims: i32,
+    post_gbuffer_uniform_volume_params: i32,
+    post_gbuffer_uniform_volume_sampler: i32,
     post_gbuffer_ready: bool,
     post_composite_program: u32,
     post_composite_uniform_radiance: i32,
@@ -296,6 +301,9 @@ pub struct OpenGlBackend {
     violations: u64,
     targets: Vec<OpenGlRenderTarget>,
     textures_2d: Vec<OpenGlTexture2D>,
+    textures_3d: Vec<OpenGlTexture2D>,
+    light_volume: Option<OpenGlTexture2D>,
+    volume_uniform: [f32; 12],
     next_mesh_id: usize,
     readback_queue: Vec<(u32, u32)>,
     last_readback: Vec<ReadbackSample>,
@@ -383,6 +391,10 @@ impl OpenGlBackend {
             post_gbuffer_uniform_point_position_radius: -1,
             post_gbuffer_uniform_point_color_intensity: -1,
             post_gbuffer_uniform_params: -1,
+            post_gbuffer_uniform_volume_origin: -1,
+            post_gbuffer_uniform_volume_dims: -1,
+            post_gbuffer_uniform_volume_params: -1,
+            post_gbuffer_uniform_volume_sampler: -1,
             post_gbuffer_ready: false,
             post_composite_program: 0,
             post_composite_uniform_radiance: -1,
@@ -414,6 +426,9 @@ impl OpenGlBackend {
             violations: 0,
             targets: Vec::new(),
             textures_2d: Vec::new(),
+            textures_3d: Vec::new(),
+            light_volume: None,
+            volume_uniform: [0.0; 12],
             next_mesh_id: 0,
             readback_queue: Vec::new(),
             last_readback: Vec::new(),
@@ -1441,6 +1456,30 @@ impl OpenGlBackend {
                 b"params\0".as_ptr() as *const c_char,
             )
         };
+        self.post_gbuffer_uniform_volume_origin = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"volume_origin\0".as_ptr() as *const c_char,
+            )
+        };
+        self.post_gbuffer_uniform_volume_dims = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"volume_dims\0".as_ptr() as *const c_char,
+            )
+        };
+        self.post_gbuffer_uniform_volume_params = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"volume_params\0".as_ptr() as *const c_char,
+            )
+        };
+        self.post_gbuffer_uniform_volume_sampler = unsafe {
+            (self.loader.gl_get_uniform_location.unwrap())(
+                program,
+                b"volume_texture\0".as_ptr() as *const c_char,
+            )
+        };
         self.post_gbuffer_ready = true;
         true
     }
@@ -2401,11 +2440,58 @@ impl RenderBackend for OpenGlBackend {
                     1,
                     block.params.as_ptr(),
                 );
+                // The volume's uniforms: the origin, the dims and the
+                // params (the cell size, the indirect intensity and the
+                // toggle) the POST_GBUFFER fragment's volume_sample
+                // reads. The toggle's violation when the config asks for
+                // the indirect light with no volume set.
+                let volume_params = [
+                    self.volume_uniform[8],
+                    config.indirect_intensity,
+                    if config.indirect_light { 1.0f32 } else { 0.0 },
+                    0.0,
+                ];
+                if config.indirect_light {
+                    match self.light_volume.as_ref() {
+                        Some(_) => {}
+                        None => {
+                            self.violations += 1;
+                        }
+                    }
+                }
+                (self.loader.gl_uniform_4fv.unwrap())(
+                    self.post_gbuffer_uniform_volume_origin,
+                    1,
+                    self.volume_uniform[0..4].as_ptr(),
+                );
+                (self.loader.gl_uniform_4fv.unwrap())(
+                    self.post_gbuffer_uniform_volume_dims,
+                    1,
+                    self.volume_uniform[4..8].as_ptr(),
+                );
+                (self.loader.gl_uniform_4fv.unwrap())(
+                    self.post_gbuffer_uniform_volume_params,
+                    1,
+                    volume_params.as_ptr(),
+                );
                 (self.loader.gl_active_texture.unwrap())(GL_TEXTURE0);
                 (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_2D, texture);
                 (self.loader.gl_uniform_1i.unwrap())(
                     self.post_gbuffer_uniform_sampler,
                     0,
+                );
+                // The volume's sampler: the 3D texture at unit 1 (the
+                // POST_GBUFFER fragment's sampler3D declaration).
+                let volume_texture = self
+                    .light_volume
+                    .as_ref()
+                    .map(|t| t.texture)
+                    .unwrap_or(0);
+                (self.loader.gl_active_texture.unwrap())(GL_TEXTURE0 + 1);
+                (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_3D, volume_texture);
+                (self.loader.gl_uniform_1i.unwrap())(
+                    self.post_gbuffer_uniform_volume_sampler,
+                    1,
                 );
                 (self.loader.gl_bind_vertex_array.unwrap())(vao);
                 (self.loader.gl_draw_elements.unwrap())(
@@ -2415,6 +2501,9 @@ impl RenderBackend for OpenGlBackend {
                     std::ptr::null(),
                 );
                 (self.loader.gl_bind_vertex_array.unwrap())(0);
+                // The sampler unit 0's restore (the composite pass's
+                // radiance binding follows the same unit).
+                (self.loader.gl_active_texture.unwrap())(GL_TEXTURE0);
             }
         }
         // ---- Step two: the composite pass ----
@@ -2990,6 +3079,295 @@ impl RenderBackend for OpenGlBackend {
             )));
         }
         Ok(true)
+    }
+
+    fn create_texture_3d(&mut self, desc: &Texture3DDesc) -> Result<TextureView, RenderError> {
+        if self.shutdown {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "create_texture_3d: the backend is shut down",
+            ));
+        }
+        if desc.width == 0 || desc.height == 0 || desc.depth == 0 {
+            return Err(RenderError::from(
+                "create_texture_3d: width, height and depth must be positive",
+            ));
+        }
+        if desc.format == PixelFormat::Depth24Stencil8 {
+            return Err(RenderError::from(
+                "create_texture_3d: the depth/stencil format is not a colour texture",
+            ));
+        }
+        let (internal, storage) = self.to_gl_format(desc.format);
+        let mut texture: u32 = 0;
+        unsafe {
+            (self.loader.gl_gen_textures.unwrap())(1, &mut texture);
+            (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_3D, texture);
+            // The image's type follows the format: the Rgba16F texture's
+            // half-float pixels (the unsigned-byte type would be an
+            // invalid type/format pair for the RGBA16F internal format).
+            let upload_type = match desc.format {
+                PixelFormat::Rgba16F => GL_HALF_FLOAT,
+                _ => GL_UNSIGNED_BYTE,
+            };
+            (self.loader.gl_tex_image_3d.unwrap())(
+                GL_TEXTURE_3D,
+                0,
+                internal,
+                desc.width as i32,
+                desc.height as i32,
+                desc.depth as i32,
+                0,
+                storage,
+                upload_type,
+                std::ptr::null(),
+            );
+            (self.loader.gl_tex_parameter_i.unwrap())(
+                GL_TEXTURE_3D,
+                GL_TEXTURE_MIN_FILTER,
+                GL_NEAREST as i32,
+            );
+            (self.loader.gl_tex_parameter_i.unwrap())(
+                GL_TEXTURE_3D,
+                GL_TEXTURE_MAG_FILTER,
+                GL_NEAREST as i32,
+            );
+            (self.loader.gl_tex_parameter_i.unwrap())(
+                GL_TEXTURE_3D,
+                GL_TEXTURE_WRAP_R,
+                GL_REPEAT as i32,
+            );
+            (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_3D, 0);
+        }
+        let texture_obj = OpenGlTexture2D {
+            inner: Arc::new(Mutex::new(TextureViewInner {
+                width: desc.width,
+                height: desc.height,
+                depth: desc.depth,
+                format: desc.format,
+                is_depth: false,
+                released: false,
+            })),
+            texture,
+            released: false,
+        };
+        let handle = TextureView {
+            inner: texture_obj.inner.clone(),
+        };
+        self.textures_3d.push(texture_obj);
+        Ok(handle)
+    }
+
+    fn release_texture_3d(&mut self, view: &TextureView) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        match self
+            .textures_3d
+            .iter()
+            .position(|x| Arc::ptr_eq(&x.inner, &view.inner))
+        {
+            Some(index) => {
+                if self.textures_3d[index].released {
+                    self.violations += 1;
+                } else {
+                    self.textures_3d[index].released = true;
+                    view.inner.lock().unwrap().released = true;
+                }
+            }
+            None => {
+                self.violations += 1;
+            }
+        }
+    }
+
+    fn fill_texture_3d(&mut self, view: &TextureView, data: &[u8]) -> Result<(), RenderError> {
+        if self.shutdown {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "fill_texture_3d: the backend is shut down",
+            ));
+        }
+        let index = match self
+            .textures_3d
+            .iter()
+            .position(|x| Arc::ptr_eq(&x.inner, &view.inner))
+        {
+            Some(index) => index,
+            None => {
+                self.violations += 1;
+                return Err(RenderError::from(
+                    "fill_texture_3d: the texture is not owned by this backend",
+                ));
+            }
+        };
+        if self.textures_3d[index].released {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "fill_texture_3d: the texture is released",
+            ));
+        }
+        let inner = view.inner.lock().unwrap();
+        let expected = (inner.width as usize)
+            * (inner.height as usize)
+            * (inner.depth as usize)
+            * bytes_per_pixel(inner.format) as usize;
+        let format = inner.format;
+        let (internal, storage) = self.to_gl_format(format);
+        let (width, height, depth) = (inner.width, inner.height, inner.depth);
+        drop(inner);
+        if data.len() != expected {
+            return Err(RenderError::from(format!(
+                "fill_texture_3d: the byte count is {} but the texture is {}",
+                data.len(),
+                expected
+            )));
+        }
+        unsafe {
+            (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_3D, self.textures_3d[index].texture);
+            (self.loader.gl_pixel_store_i.unwrap())(GL_UNPACK_ALIGNMENT, 1);
+            // The upload's type follows the format: the Rgba16F pack's
+            // binary16 half floats (the same data the Vulkan path's
+            // staging buffer carries). The unsigned-byte type would be
+            // an invalid type/format pair for the RGBA16F internal
+            // format (the driver would reject the upload).
+            let upload_type = match format {
+                PixelFormat::Rgba16F => GL_HALF_FLOAT,
+                _ => GL_UNSIGNED_BYTE,
+            };
+            (self.loader.gl_tex_image_3d.unwrap())(
+                GL_TEXTURE_3D,
+                0,
+                internal,
+                width as i32,
+                height as i32,
+                depth as i32,
+                0,
+                storage,
+                upload_type,
+                data.as_ptr() as *const c_void,
+            );
+            (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_3D, 0);
+        }
+        Ok(())
+    }
+
+    fn read_texture_3d(&mut self, view: &TextureView, data: &mut [u8]) -> Result<bool, RenderError> {
+        let index = match self
+            .textures_3d
+            .iter()
+            .position(|x| Arc::ptr_eq(&x.inner, &view.inner))
+        {
+            Some(index) => index,
+            None => {
+                return Err(RenderError::from(
+                    "read_texture_3d: the texture is not owned by this backend",
+                ));
+            }
+        };
+        if self.textures_3d[index].released {
+            return Ok(false);
+        }
+        let inner = view.inner.lock().unwrap();
+        let expected = (inner.width as usize)
+            * (inner.height as usize)
+            * (inner.depth as usize)
+            * bytes_per_pixel(inner.format) as usize;
+        drop(inner);
+        if data.len() != expected {
+            return Err(RenderError::from(format!(
+                "read_texture_3d: the byte count is {} but the texture is {}",
+                data.len(),
+                expected
+            )));
+        }
+        unsafe {
+            (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_3D, self.textures_3d[index].texture);
+            (self.loader.gl_pixel_store_i.unwrap())(GL_UNPACK_ALIGNMENT, 1);
+            // The Rgba16F texture's readback type: the pack's binary16
+            // half floats (the same type the upload carries; the float
+            // type would return 4x the byte count the contract carries).
+            let read_type = if view.inner.lock().unwrap().format
+                == PixelFormat::Rgba16F
+            {
+                GL_HALF_FLOAT
+            } else {
+                GL_UNSIGNED_BYTE
+            };
+            (self.loader.gl_get_tex_image.unwrap())(
+                GL_TEXTURE_3D,
+                0,
+                GL_RGBA,
+                read_type,
+                data.as_mut_ptr() as *mut c_void,
+            );
+            (self.loader.gl_bind_texture.unwrap())(GL_TEXTURE_3D, 0);
+        }
+        Ok(true)
+    }
+
+    fn set_light_volume(&mut self, volume: &LightVolume) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        // The volume's 3D texture: the same Rgba16F path the standalone
+        // 3D textures carry (the dims z * 6 layers, the face `f` of the
+        // cell `(x, y, z)` at the layer `z * 6 + f`).
+        let desc = Texture3DDesc {
+            width: volume.dims[0],
+            height: volume.dims[1],
+            depth: volume.dims[2] * 6,
+            format: PixelFormat::Rgba16F,
+        };
+        let view = match self.create_texture_3d(&desc) {
+            Ok(view) => view,
+            Err(_) => {
+                self.violations += 1;
+                return;
+            }
+        };
+        let packed = volume.pack_texture_3d();
+        if self.fill_texture_3d(&view, &packed).is_err() {
+            self.violations += 1;
+            return;
+        }
+        // The uniform block's values: the origin, the dims (the depth
+        // carrying the z * 6 layers) and the cell size (the indirect
+        // intensity and the toggle the submit writes).
+        self.volume_uniform = [
+            volume.origin[0],
+            volume.origin[1],
+            volume.origin[2],
+            0.0,
+            volume.dims[0] as f32,
+            volume.dims[1] as f32,
+            (volume.dims[2] * 6) as f32,
+            0.0,
+            volume.cell_size,
+            0.0,
+            0.0,
+            0.0,
+        ];
+        // The old volume's texture releases (the one-volume rule the
+        // contract's set_light_volume carries).
+        if let Some(old) = self.light_volume.take() {
+            let handle = TextureView {
+                inner: old.inner.clone(),
+            };
+            self.release_texture_3d(&handle);
+        }
+        let index = self
+            .textures_3d
+            .iter()
+            .position(|t| Arc::ptr_eq(&t.inner, &view.inner))
+            .unwrap_or(self.textures_3d.len());
+        self.light_volume = Some(OpenGlTexture2D {
+            inner: view.inner,
+            texture: self.textures_3d[index].texture,
+            released: false,
+        });
     }
 
     fn set_camera(&mut self, camera: CameraParams) {

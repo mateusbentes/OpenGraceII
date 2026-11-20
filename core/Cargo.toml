@@ -105,3 +105,19 @@ required-features = ["metal"]
 [[example]]
 name = "d3d12_smoke"
 required-features = ["d3d12"]
+
+[[example]]
+name = "cube_volume"
+required-features = ["vulkan"]
+
+[[example]]
+name = "cube_volume_gl"
+required-features = ["opengl"]
+
+[[example]]
+name = "cube_volume_d3d12"
+required-features = ["d3d12"]
+
+[[example]]
+name = "cube_volume_mtl"
+required-features = ["metal"]

@@ -46,7 +46,7 @@ use super::super::{
     bytes_per_pixel, CameraParams, ClearBuffer, ClearColor, DirectionalLight, DrawSubmission,
     DynamicLight, GpuMesh, GpuMeshInner, PixelFormat, ReadbackSample, RenderBackend, RenderError,
     RenderTarget, RenderTargetDesc, RenderTargetInner, ShaderProgram, ShaderProgramInner,
-    Texture2DDesc, TextureView, TextureViewInner, VertexLayout, DEPTH_ATTACHMENT,
+    Texture2DDesc, Texture3DDesc, TextureView, TextureViewInner, VertexLayout, DEPTH_ATTACHMENT,
 };
 use super::d3d12_loader::{
     self as d3d, call_slot_i32_0, call_slot_i32_2, call_slot_i32_3, call_slot_i32_4,
@@ -74,6 +74,7 @@ use super::d3d12_loader::{
     D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
     D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
     D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+    D3D12_RESOURCE_DIMENSION_TEXTURE3D,
     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
     D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_GENERIC_READ,
@@ -91,6 +92,7 @@ use super::d3d12_loader::{
     IID_ID3D12_RESOURCE_WORDS, IID_ID3D12_ROOT_SIGNATURE_WORDS, IID_IDXGI_FACTORY1_WORDS,
 };
 use crate::math::{Mat4, Vec3};
+use crate::lightvolume::LightVolume;
 use std::os::raw::{c_char, c_void};
 use std::sync::{Arc, Mutex};
 
@@ -206,6 +208,19 @@ struct LightsUniform {
     // declared fields land at 176, the pad completes the buffer — the
     // copies' 256-byte reads stay in bounds).
     _pad: [f32; 20],
+}
+
+/// The light volume's uniform block (M8): the origin (xyz + pad), the
+/// dims (xyz + pad; the depth carries the z * 6 layers) and the params
+/// (x = the cell size, y = the indirect intensity, z = the toggle).
+/// The same three vec4s the POST_GBUFFER pixel shader's Volume block
+/// declares (the 48-byte std140 layout).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VolumeUniform {
+    origin: [f32; 4],
+    dims: [f32; 4],
+    params: [f32; 4],
 }
 
 impl LightsUniform {
@@ -389,6 +404,7 @@ pub struct D3d12Backend {
     violations: u64,
     targets: Vec<D3d12RenderTarget>,
     textures_2d: Vec<D3d12Texture2D>,
+    textures_3d: Vec<D3d12Texture2D>,
     next_mesh_id: usize,
     meshes: Vec<Option<D3d12MeshState>>,
     mesh_ready: bool,
@@ -429,7 +445,13 @@ pub struct D3d12Backend {
     post_composite_pipeline: d3d::D3d12PipelineStateHandle,
     post_lights_buffer: d3d::D3d12ResourceHandle,
     post_config_buffer: d3d::D3d12ResourceHandle,
+    post_volume_buffer: d3d::D3d12ResourceHandle,
     post_srv_heap: d3d::D3d12DescriptorHeapHandle,
+    /// The M8 light volume's state: the 3D texture the set_light_volume
+    /// call owns and the uniform block's values the gbuffer pass's
+    /// Volume block reads (the origin, the dims z * 6 and the cell size).
+    light_volume: Option<TextureView>,
+    volume_uniform: [f32; 12],
     bound_texture: Option<usize>,
     default_texture: Option<usize>,
     readback_queue: Vec<(u32, u32)>,
@@ -763,6 +785,60 @@ unsafe fn self_create_texture(
     Ok(resource)
 }
 
+unsafe fn self_create_texture_3d(
+    device: D3d12DeviceHandle,
+    format: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    flags: u32,
+    initial_state: u32,
+) -> Result<d3d::D3d12ResourceHandle, RenderError> {
+    let heap = D3d12HeapProperties {
+        type_: D3D12_HEAP_TYPE_DEFAULT,
+        cpu_page_property: 0,
+        memory_pool_preference: 0,
+        creation_node_mask: 0,
+        visible_node_mask: 0,
+    };
+    let desc = D3d12ResourceDesc {
+        dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+        alignment: 0,
+        width: width as u64,
+        height,
+        depth_or_array_size: depth as u16,
+        mip_levels: 1,
+        format,
+        sample_desc: D3d12SampleDesc {
+            count: 1,
+            quality: 0,
+        },
+        layout: 0,
+        flags,
+    };
+    let mut resource: *mut c_void = std::ptr::null_mut();
+    let hr = call_slot_i32_8(
+        device as ComObject,
+        DEVICE_CREATE_COMMITTED_RESOURCE,
+        &heap as *const D3d12HeapProperties as *mut c_void,
+        D3D12_HEAP_FLAG_NONE as *mut c_void,
+        &desc as *const D3d12ResourceDesc as *mut c_void,
+        initial_state as *mut c_void,
+        std::ptr::null_mut(),
+        IID_ID3D12_RESOURCE_WORDS.as_ptr() as *mut c_void,
+        &mut resource as *mut _ as *mut c_void,
+        std::ptr::null_mut(),
+    );
+    if hr != S_OK || resource.is_null() {
+        return Err(RenderError::from(format!(
+            "D3d12Backend: the 3D texture resource could not be created \
+             (hr=0x{:08x})",
+            hr
+        )));
+    }
+    Ok(resource)
+}
+
 /// Calls the device's CreateCommittedResource (slot 27) for one buffer:
 /// the READBACK heap's staging buffer or the UPLOAD heap's vertex buffer.
 unsafe fn self_create_buffer(
@@ -1026,6 +1102,7 @@ impl D3d12Backend {
             violations: 0,
             targets: Vec::new(),
             textures_2d: Vec::new(),
+            textures_3d: Vec::new(),
             next_mesh_id: 0,
             meshes: Vec::new(),
             mesh_ready: false,
@@ -1052,7 +1129,10 @@ impl D3d12Backend {
             post_composite_pipeline: std::ptr::null_mut(),
             post_lights_buffer: std::ptr::null_mut(),
             post_config_buffer: std::ptr::null_mut(),
+            post_volume_buffer: std::ptr::null_mut(),
             post_srv_heap: std::ptr::null_mut(),
+            light_volume: None,
+            volume_uniform: [0.0; 12],
             bound_texture: None,
             default_texture: None,
             readback_queue: Vec::new(),
@@ -2782,7 +2862,8 @@ impl D3d12Backend {
                 unsafe { call_slot_u64_0(ps_blob as ComObject, BLOB_GET_BUFFER_SIZE) };
             // The root signature: the same table the gbuffer PSO carries
             // (the frame's CBV at b0, the SRV at t0, the lights' CBV at
-            // b1), one static sampler at s0.
+            // b1, the volume's SRV at t1 and the volume's CBV at b2, M8),
+            // one static sampler at s0.
             let ranges = [
                 d3d::D3d12DescriptorRange {
                     range_type: d3d::D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
@@ -2805,9 +2886,23 @@ impl D3d12Backend {
                     register_space: 0,
                     offset_in_descriptors_from_table_start: 2,
                 },
+                d3d::D3d12DescriptorRange {
+                    range_type: d3d::D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                    num_descriptors: 1,
+                    base_shader_register: 1,
+                    register_space: 0,
+                    offset_in_descriptors_from_table_start: 3,
+                },
+                d3d::D3d12DescriptorRange {
+                    range_type: d3d::D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+                    num_descriptors: 1,
+                    base_shader_register: 2,
+                    register_space: 0,
+                    offset_in_descriptors_from_table_start: 4,
+                },
             ];
             let table = d3d::D3d12RootDescriptorTable {
-                num_descriptor_ranges: 3,
+                num_descriptor_ranges: 5,
                 descriptor_ranges: ranges.as_ptr(),
             };
             let parameter = D3d12RootParameter {
@@ -4429,12 +4524,14 @@ impl RenderBackend for D3d12Backend {
         // The mesh's SRV heap: one CBV_SRV_UAV descriptor heap with two
         // descriptors the draw's root table reads (the CBV at slot 0,
         // the SRV at slot 1) — three when the lit path draws (the
-        // lights' CBV at slot 2, M5).
+        // lights' CBV at slot 2, M5) — five when the post chain's
+        // gbuffer pass draws (the volume's SRV at slot 3 and the
+        // volume's CBV at slot 4, M8).
         let srv_heap = unsafe {
             self_create_descriptor_heap(
                 self.device,
                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                3,
+                5,
                 D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             )?
         };
@@ -5267,6 +5364,29 @@ impl RenderBackend for D3d12Backend {
         config_block[32..48].copy_from_slice(unsafe {
             std::slice::from_raw_parts(params2.as_ptr() as *const u8, 16)
         });
+        // The volume's block: the origin, the dims, the cell size and
+        // the indirect light's toggle and intensity the POST_GBUFFER
+        // pixel shader's Volume block reads (the 48-byte std140 block).
+        let volume_block = VolumeUniform {
+            origin: [
+                self.volume_uniform[0],
+                self.volume_uniform[1],
+                self.volume_uniform[2],
+                0.0,
+            ],
+            dims: [
+                self.volume_uniform[4],
+                self.volume_uniform[5],
+                self.volume_uniform[6],
+                0.0,
+            ],
+            params: [
+                self.volume_uniform[8],
+                config.indirect_intensity,
+                if config.indirect_light { 1.0f32 } else { 0.0 },
+                0.0,
+            ],
+        };
         let (vertex_buffer, index_buffer, index_count, srv_heap, uniform_buffer) = {
             let state = self.meshes[mesh_id].as_ref().unwrap();
             (
@@ -5696,6 +5816,125 @@ impl RenderBackend for D3d12Backend {
                     2,
                 )
                 .ptr as *mut c_void,
+            );
+            // The volume's SRV (the 3D texture) at slot 3 and the
+            // volume's CBV (the 256-byte uniform block) at slot 4: the
+            // writes happen only when the volume texture exists (the
+            // toggle-off path leaves the default descriptors).
+            if let Some(volume) = self
+                .light_volume
+                .as_ref()
+                .filter(|v| !v.inner.lock().unwrap().released)
+            {
+                let volume_index = self
+                    .textures_3d
+                    .iter()
+                    .position(|t| Arc::ptr_eq(&t.inner, &volume.inner))
+                    .unwrap();
+                let volume_resource = self.textures_3d[volume_index].resource;
+                let volume_srv = d3d::D3d12ShaderResourceViewDesc {
+                    format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    view_dimension: d3d::D3D12_SRV_DIMENSION_TEXTURE3D,
+                    shader_4_component_mapping:
+                        d3d::D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    header_padding: [0],
+                    // The union's storage: the tex3d member's three
+                    // fields ride the tex2d member's layout (the mip
+                    // slice, the mip levels, the minimum LOD clamp —
+                    // the same 12 bytes the TEXTURE3D dimension reads).
+                    texture_2d: d3d::D3d12Tex2DSrv {
+                        most_detailed_mip: 0,
+                        mip_levels: 1,
+                        plane_slice: 0,
+                        resource_min_lod_clamp: 0.0,
+                    },
+                    union_tail_padding: [0, 0],
+                };
+                call_slot_i32_3(
+                    self.device as ComObject,
+                    DEVICE_CREATE_SHADER_RESOURCE_VIEW,
+                    volume_resource,
+                    &volume_srv as *const d3d::D3d12ShaderResourceViewDesc
+                        as *mut c_void,
+                    self_heap_cpu_handle_offset(
+                        srv_heap,
+                        self.device,
+                        d3d::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        3,
+                    )
+                    .ptr as *mut c_void,
+                );
+            }
+            if self.post_volume_buffer.is_null() {
+                match {
+                    self_create_buffer(
+                        self.device,
+                        256,
+                        D3D12_HEAP_TYPE_UPLOAD,
+                        D3D12_RESOURCE_STATE_GENERIC_READ,
+                    )
+                } {
+                    Ok(buffer) => self.post_volume_buffer = buffer,
+                    Err(_) => {
+                        self.violations += 1;
+                        return;
+                    }
+                }
+            }
+            let volume_address = call_slot_u64_0(
+                self.post_volume_buffer as ComObject,
+                RESOURCE_GET_GPU_VIRTUAL_ADDRESS,
+            );
+            {
+                let mut map: *mut c_void = std::ptr::null_mut();
+                let hr = call_slot_i32_4(
+                    self.post_volume_buffer as ComObject,
+                    RESOURCE_MAP,
+                    0 as *mut c_void,
+                    &D3d12Range { begin: 0, end: 0 } as *const D3d12Range
+                        as *mut c_void,
+                    &mut map as *mut _ as *mut c_void,
+                    std::ptr::null_mut(),
+                );
+                if hr == S_OK && !map.is_null() {
+                    std::ptr::copy_nonoverlapping(
+                        &volume_block as *const VolumeUniform as *const u8,
+                        map as *mut u8,
+                        std::mem::size_of::<VolumeUniform>(),
+                    );
+                    call_slot_i32_2(
+                        self.post_volume_buffer as ComObject,
+                        RESOURCE_UNMAP,
+                        0 as *mut c_void,
+                        std::ptr::null_mut(),
+                    );
+                }
+            }
+            let volume_cbv_desc = d3d::D3d12ConstantBufferViewDesc {
+                buffer_location: volume_address,
+                size_in_bytes: 256,
+                union_tail_padding: [0],
+            };
+            call_slot_i32_2(
+                self.device as ComObject,
+                DEVICE_CREATE_CONSTANT_BUFFER_VIEW,
+                &volume_cbv_desc as *const d3d::D3d12ConstantBufferViewDesc
+                    as *mut c_void,
+                self_heap_cpu_handle_offset(
+                    srv_heap,
+                    self.device,
+                    d3d::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    4,
+                )
+                .ptr as *mut c_void,
+            );
+            let heaps = [srv_heap];
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_SET_DESCRIPTOR_HEAPS,
+                1 as *mut c_void,
+                heaps.as_ptr() as *const c_void as *mut c_void,
+                std::ptr::null_mut(),
             );
             let heaps = [srv_heap];
             call_slot_i32_3(
@@ -6425,6 +6664,596 @@ impl RenderBackend for D3d12Backend {
             return;
         }
         self.camera = camera;
+    }
+
+    fn create_texture_3d(&mut self, desc: &Texture3DDesc) -> Result<TextureView, RenderError> {
+        if self.shutdown {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "create_texture_3d: the backend is shut down",
+            ));
+        }
+        desc.validate()?;
+        let resource = unsafe {
+            self_create_texture_3d(
+                self.device,
+                self.to_d3d_format(desc.format),
+                desc.width,
+                desc.height,
+                desc.depth,
+                0,
+                D3D12_RESOURCE_STATE_COMMON,
+            )?
+        };
+        let view = D3d12Texture2D {
+            inner: Arc::new(Mutex::new(TextureViewInner {
+                width: desc.width,
+                height: desc.height,
+                depth: desc.depth,
+                format: desc.format,
+                is_depth: false,
+                released: false,
+            })),
+            resource,
+            released: false,
+            state: D3D12_RESOURCE_STATE_COMMON,
+        };
+        let handle = TextureView {
+            inner: Arc::clone(&view.inner),
+        };
+        self.textures_3d.push(view);
+        Ok(handle)
+    }
+
+    fn release_texture_3d(&mut self, view: &TextureView) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        match self
+            .textures_3d
+            .iter_mut()
+            .find(|t| Arc::ptr_eq(&t.inner, &view.inner))
+        {
+            Some(t) => {
+                if t.released {
+                    self.violations += 1;
+                } else {
+                    t.released = true;
+                    view.inner.lock().unwrap().released = true;
+                }
+            }
+            None => {
+                self.violations += 1;
+            }
+        }
+    }
+
+    fn fill_texture_3d(&mut self, view: &TextureView, data: &[u8]) -> Result<(), RenderError> {
+        if self.shutdown {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "fill_texture_3d: the backend is shut down",
+            ));
+        }
+        let index = self
+            .textures_3d
+            .iter()
+            .position(|t| Arc::ptr_eq(&t.inner, &view.inner))
+            .ok_or_else(|| {
+                RenderError::from(
+                    "fill_texture_3d: the texture is not owned by this \
+                     backend",
+                )
+            })?;
+        if self.textures_3d[index].released {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "fill_texture_3d: the texture is released",
+            ));
+        }
+        let inner = view.inner.lock().unwrap();
+        let expected = (inner.width as usize)
+            * (inner.height as usize)
+            * (inner.depth as usize)
+            * bytes_per_pixel(inner.format) as usize;
+        let (width, height, depth, format) =
+            (inner.width, inner.height, inner.depth, inner.format);
+        drop(inner);
+        if data.len() != expected {
+            return Err(RenderError::from(format!(
+                "fill_texture_3d: expected {} bytes, got {}",
+                expected,
+                data.len()
+            )));
+        }
+        // The upload path: the same one-off staging copy the 2D fill
+        // follows, with the footprint's depth carrying the volume's
+        // layers (the row pitch covers one layer's slice).
+        let bytes = bytes_per_pixel(format);
+        let row_pitch = d3d::texture_row_pitch(width, bytes);
+        let slice_pitch = row_pitch as u64 * height as u64;
+        let buffer_size = slice_pitch * depth as u64;
+        let staging = unsafe {
+            self_create_buffer(
+                self.device,
+                buffer_size,
+                D3D12_HEAP_TYPE_UPLOAD,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            )?
+        };
+        unsafe {
+            let mut map: *mut c_void = std::ptr::null_mut();
+            let hr = call_slot_i32_4(
+                staging as ComObject,
+                RESOURCE_MAP,
+                0 as *mut c_void,
+                &D3d12Range { begin: 0, end: 0 } as *const D3d12Range as *mut c_void,
+                &mut map as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if hr != S_OK || map.is_null() {
+                return Err(RenderError::from(
+                    "fill_texture_3d: the staging buffer's map failed",
+                ));
+            }
+            let map = map as *mut u8;
+            let slice = width as usize * height as usize * bytes as usize;
+            for layer in 0..depth as usize {
+                // The copy per row: the staging buffer's rows sit at the
+                // 256-byte pitch (the same per-row rule the 2D fill
+                // follows), never contiguously.
+                let packed = width as usize * bytes as usize;
+                for row in 0..height as usize {
+                    let src = data
+                        .as_ptr()
+                        .add(layer * slice + row * packed);
+                    let dst = map
+                        .add(layer as usize * slice_pitch as usize + row * row_pitch as usize);
+                    std::ptr::copy_nonoverlapping(src, dst, packed);
+                }
+            }
+            call_slot_i32_2(
+                staging as ComObject,
+                RESOURCE_UNMAP,
+                0 as *mut c_void,
+                std::ptr::null_mut(),
+            );
+        }
+        let resource = self.textures_3d[index].resource;
+        let current_state = self.textures_3d[index].state;
+        let to_copy_dest = D3d12ResourceBarrier {
+            type_: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            transition: D3d12ResourceTransitionBarrier {
+                resource,
+                subresource: 0,
+                state_before: current_state,
+                state_after: D3D12_RESOURCE_STATE_COPY_DEST,
+            },
+        };
+        let to_shader_read = D3d12ResourceBarrier {
+            type_: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            transition: D3d12ResourceTransitionBarrier {
+                resource,
+                subresource: 0,
+                state_before: D3D12_RESOURCE_STATE_COPY_DEST,
+                state_after: D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            },
+        };
+        let dst = D3d12TextureCopyLocation {
+            resource,
+            type_: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            placed_footprint: D3d12PlacedFootprint {
+                offset: 0,
+                footprint: D3d12SubresourceFootprint {
+                    format: 0,
+                    width: 0,
+                    height: 0,
+                    depth: 0,
+                    row_pitch: 0,
+                },
+            },
+        };
+        let src = D3d12TextureCopyLocation {
+            resource: staging,
+            type_: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            placed_footprint: D3d12PlacedFootprint {
+                offset: 0,
+                footprint: D3d12SubresourceFootprint {
+                    format: self.to_d3d_format(format),
+                    width,
+                    height,
+                    depth,
+                    row_pitch,
+                },
+            },
+        };
+        unsafe {
+            if !self.frame_open {
+                // The frame's command list opens: the allocator and the
+                // list reset (the same rule the 2D fill records).
+                let hr = call_slot_i32_0(self.allocator as ComObject, ALLOCATOR_RESET);
+                if hr != S_OK {
+                    return Err(RenderError::from(
+                        "fill_texture_3d: the allocator's reset failed",
+                    ));
+                }
+                let hr = call_slot_i32_2(
+                    self.command_list as ComObject,
+                    COMMAND_LIST_RESET,
+                    self.allocator,
+                    self.tri_pipeline,
+                );
+                if hr != S_OK {
+                    return Err(RenderError::from(
+                        "fill_texture_3d: the command list's reset failed",
+                    ));
+                }
+            }
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_RESOURCE_BARRIER,
+                1 as *mut c_void,
+                &to_copy_dest as *const D3d12ResourceBarrier as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_6(
+                self.command_list as ComObject,
+                COMMAND_LIST_COPY_TEXTURE_REGION,
+                &dst as *const D3d12TextureCopyLocation as *mut c_void,
+                0 as *mut c_void,
+                0 as *mut c_void,
+                0 as *mut c_void,
+                &src as *const D3d12TextureCopyLocation as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_RESOURCE_BARRIER,
+                1 as *mut c_void,
+                &to_shader_read as *const D3d12ResourceBarrier as *mut c_void,
+                std::ptr::null_mut(),
+            );
+        }
+        self.textures_3d[index].state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        if self.frame_open {
+            // The open frame's execution submits the fill's commands; the
+            // bookkeeping stays (the same rule the 2D fill records).
+            return Ok(());
+        }
+        // The one-off frame executes: the Close, the ExecuteCommandLists,
+        // the queue's Signal and the wait (the same sequence the 2D fill
+        // records).
+        let hr = unsafe { call_slot_i32_0(self.command_list as ComObject, COMMAND_LIST_CLOSE) };
+        if hr != S_OK {
+            return Err(RenderError::from(
+                "fill_texture_3d: the command list's close failed",
+            ));
+        }
+        let lists = [self.command_list];
+        unsafe {
+            call_slot_i32_3(
+                self.queue as ComObject,
+                QUEUE_EXECUTE_COMMAND_LISTS,
+                1 as *mut c_void,
+                lists.as_ptr() as *const c_void as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            self.fence_value += 1;
+            call_slot_i32_4(
+                self.queue as ComObject,
+                QUEUE_SIGNAL,
+                self.fence,
+                self.fence_value as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_3(
+                self.fence as ComObject,
+                FENCE_SET_EVENT_ON_COMPLETION,
+                self.fence_value as *mut c_void,
+                self.fence_event,
+                std::ptr::null_mut(),
+            );
+            self.loader
+                .wait_for_single_object
+                .expect("the loader resolved WaitForSingleObject")(
+                self.fence_event, 5000
+            );
+        }
+        self.frame_open = false;
+        Ok(())
+    }
+
+    fn read_texture_3d(&mut self, view: &TextureView, data: &mut [u8]) -> Result<bool, RenderError> {
+        let index = self
+            .textures_3d
+            .iter()
+            .position(|t| Arc::ptr_eq(&t.inner, &view.inner));
+        let index = match index {
+            Some(index) => index,
+            None => {
+                return Err(RenderError::from(
+                    "read_texture_3d: the texture is not owned by this \
+                     backend",
+                ));
+            }
+        };
+        if self.textures_3d[index].released {
+            return Ok(false);
+        }
+        let inner = view.inner.lock().unwrap();
+        let expected = (inner.width as usize)
+            * (inner.height as usize)
+            * (inner.depth as usize)
+            * bytes_per_pixel(inner.format) as usize;
+        drop(inner);
+        if data.len() != expected {
+            return Err(RenderError::from(format!(
+                "read_texture_3d: expected {} bytes, got {}",
+                expected,
+                data.len()
+            )));
+        }
+        // The readback: the resource's pixels copy into a one-off
+        // READBACK buffer (the same one-off command list the fill's
+        // copies follow), with the footprint's depth carrying the
+        // volume's layers (the row pitch covers one layer's slice).
+        let bytes = bytes_per_pixel(view.inner.lock().unwrap().format) as usize;
+        let (width, height, depth, format) = {
+            let inner = view.inner.lock().unwrap();
+            (inner.width, inner.height, inner.depth, inner.format)
+        };
+        let row_pitch = d3d::texture_row_pitch(width, bytes as u32);
+        let slice_pitch = row_pitch as u64 * height as u64;
+        let buffer_size = slice_pitch * depth as u64;
+        let readback = unsafe {
+            self_create_buffer(
+                self.device,
+                buffer_size,
+                D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )?
+        };
+        let resource = self.textures_3d[index].resource;
+        let current_state = self.textures_3d[index].state;
+        let to_copy_source = D3d12ResourceBarrier {
+            type_: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            transition: D3d12ResourceTransitionBarrier {
+                resource,
+                subresource: 0,
+                state_before: current_state,
+                state_after: D3D12_RESOURCE_STATE_COPY_SOURCE,
+            },
+        };
+        let to_shader_read = D3d12ResourceBarrier {
+            type_: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            transition: D3d12ResourceTransitionBarrier {
+                resource,
+                subresource: 0,
+                state_before: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                state_after: D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            },
+        };
+        let src = D3d12TextureCopyLocation {
+            resource,
+            type_: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            placed_footprint: D3d12PlacedFootprint {
+                offset: 0,
+                footprint: D3d12SubresourceFootprint {
+                    format: 0,
+                    width: 0,
+                    height: 0,
+                    depth: 0,
+                    row_pitch: 0,
+                },
+            },
+        };
+        let dst = D3d12TextureCopyLocation {
+            resource: readback,
+            type_: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            placed_footprint: D3d12PlacedFootprint {
+                offset: 0,
+                footprint: D3d12SubresourceFootprint {
+                    format: self.to_d3d_format(format),
+                    width,
+                    height,
+                    depth,
+                    row_pitch,
+                },
+            },
+        };
+        let hr = unsafe { call_slot_i32_0(self.allocator as ComObject, ALLOCATOR_RESET) };
+        if hr != S_OK {
+            return Err(RenderError::from(
+                "read_texture_3d: the allocator's reset failed",
+            ));
+        }
+        let hr = unsafe {
+            call_slot_i32_2(
+                self.command_list as ComObject,
+                COMMAND_LIST_RESET,
+                self.allocator,
+                self.tri_pipeline,
+            )
+        };
+        if hr != S_OK {
+            return Err(RenderError::from(
+                "read_texture_3d: the command list's reset failed",
+            ));
+        }
+        unsafe {
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_RESOURCE_BARRIER,
+                1 as *mut c_void,
+                &to_copy_source as *const D3d12ResourceBarrier as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_6(
+                self.command_list as ComObject,
+                COMMAND_LIST_COPY_TEXTURE_REGION,
+                &dst as *const D3d12TextureCopyLocation as *mut c_void,
+                0 as *mut c_void,
+                0 as *mut c_void,
+                0 as *mut c_void,
+                &src as *const D3d12TextureCopyLocation as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_3(
+                self.command_list as ComObject,
+                COMMAND_LIST_RESOURCE_BARRIER,
+                1 as *mut c_void,
+                &to_shader_read as *const D3d12ResourceBarrier as *mut c_void,
+                std::ptr::null_mut(),
+            );
+        }
+        self.textures_3d[index].state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        let hr = unsafe { call_slot_i32_0(self.command_list as ComObject, COMMAND_LIST_CLOSE) };
+        if hr != S_OK {
+            return Err(RenderError::from(
+                "read_texture_3d: the command list's close failed",
+            ));
+        }
+        let lists = [self.command_list];
+        unsafe {
+            call_slot_i32_3(
+                self.queue as ComObject,
+                QUEUE_EXECUTE_COMMAND_LISTS,
+                1 as *mut c_void,
+                lists.as_ptr() as *const c_void as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            self.fence_value += 1;
+            call_slot_i32_4(
+                self.queue as ComObject,
+                QUEUE_SIGNAL,
+                self.fence,
+                self.fence_value as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            call_slot_i32_3(
+                self.fence as ComObject,
+                FENCE_SET_EVENT_ON_COMPLETION,
+                self.fence_value as *mut c_void,
+                self.fence_event,
+                std::ptr::null_mut(),
+            );
+            self.loader
+                .wait_for_single_object
+                .expect("the loader resolved WaitForSingleObject")(
+                self.fence_event, 5000
+            );
+        }
+        // The mapped READBACK buffer carries the volume's layers (the
+        // same row-pitch slice the upload's staging carries).
+        let mut map: *mut c_void = std::ptr::null_mut();
+        let mapped = unsafe {
+            call_slot_i32_4(
+                readback as ComObject,
+                RESOURCE_MAP,
+                0 as *mut c_void,
+                &D3d12Range {
+                    begin: 0,
+                    end: buffer_size,
+                } as *const D3d12Range as *mut c_void,
+                &mut map as *mut _ as *mut c_void,
+                std::ptr::null_mut(),
+            )
+        };
+        if mapped != S_OK || map.is_null() {
+            return Err(RenderError::from(
+                "read_texture_3d: the readback buffer's map failed",
+            ));
+        }
+        let map = map as *const u8;
+        let slice = width as usize * height as usize * bytes;
+        let packed = width as usize * bytes;
+        unsafe {
+            for layer in 0..depth as usize {
+                let dst = data.as_mut_ptr().add(layer * slice);
+                let src = map.add(layer * slice_pitch as usize);
+                for row in 0..height as usize {
+                    std::ptr::copy_nonoverlapping(
+                        src.add(row * row_pitch as usize),
+                        dst.add(row * packed),
+                        packed,
+                    );
+                }
+            }
+        }
+        unsafe {
+            call_slot_i32_3(
+                readback as ComObject,
+                RESOURCE_UNMAP,
+                0 as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+        }
+        Ok(true)
+    }
+
+    /// The M8 light volume: the backend (re)creates the 3D texture the
+    /// volume's packed radiance fills (the dims z * 6 layers, the face
+    /// `f` of the cell `(x, y, z)` at the layer `z * 6 + f`) and keeps
+    /// the uniform block's values the gbuffer pass's Volume block reads.
+
+    fn set_light_volume(&mut self, volume: &LightVolume) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        if volume.dims[0] == 0 || volume.dims[1] == 0 || volume.dims[2] == 0 {
+            self.violations += 1;
+            return;
+        }
+        // The volume's 3D texture: the same Rgba16F path the standalone
+        // 3D textures carry (the dims z * 6 layers, the face `f` of the
+        // cell `(x, y, z)` at the layer `z * 6 + f`).
+        let desc = Texture3DDesc {
+            width: volume.dims[0],
+            height: volume.dims[1],
+            depth: volume.dims[2] * 6,
+            format: PixelFormat::Rgba16F,
+        };
+        let view = match self.create_texture_3d(&desc) {
+            Ok(view) => view,
+            Err(_) => {
+                self.violations += 1;
+                return;
+            }
+        };
+        let packed = volume.pack_texture_3d();
+        if self.fill_texture_3d(&view, &packed).is_err() {
+            self.violations += 1;
+            return;
+        }
+        // The old volume's texture releases (the one-volume rule the
+        // contract's set_light_volume carries).
+        if let Some(old) = self.light_volume.take() {
+            self.release_texture_3d(&old);
+        }
+        self.light_volume = Some(view);
+        self.volume_uniform = [
+            volume.origin[0],
+            volume.origin[1],
+            volume.origin[2],
+            0.0,
+            volume.dims[0] as f32,
+            volume.dims[1] as f32,
+            (volume.dims[2] * 6) as f32,
+            0.0,
+            volume.cell_size,
+            0.0,
+            0.0,
+            0.0,
+        ];
     }
 
     fn camera(&self) -> CameraParams {

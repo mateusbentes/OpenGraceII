@@ -44,6 +44,7 @@ pub const GL_STENCIL_ATTACHMENT: u32 = 0x8D20;
 pub const GL_FRAMEBUFFER: u32 = 0x8D40;
 pub const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
 pub const GL_TEXTURE_2D: u32 = 0x0DE1;
+pub const GL_TEXTURE_3D: u32 = 0x806F;
 pub const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
 pub const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
 pub const GL_NEAREST: u32 = 0x2600;
@@ -51,6 +52,7 @@ pub const GL_LINEAR: u32 = 0x2601;
 pub const GL_REPEAT: u32 = 0x2901;
 pub const GL_TEXTURE_WRAP_S: u32 = 0x2802;
 pub const GL_TEXTURE_WRAP_T: u32 = 0x2803;
+pub const GL_TEXTURE_WRAP_R: u32 = 0x8072;
 pub const GL_RGB: u32 = 0x1907;
 pub const GL_RED: u32 = 0x1903;
 pub const GL_R8: u32 = 0x8229;
@@ -242,6 +244,25 @@ pub type PfnGlTexImage2D = unsafe extern "C" fn(
     typ: u32,
     data: *const c_void,
 );
+pub type PfnGlTexImage3D = unsafe extern "C" fn(
+    target: u32,
+    level: i32,
+    internal_format: i32,
+    w: i32,
+    h: i32,
+    d: i32,
+    border: i32,
+    format: u32,
+    typ: u32,
+    data: *const c_void,
+);
+pub type PfnGlGetTexImage = unsafe extern "C" fn(
+    target: u32,
+    level: i32,
+    format: u32,
+    typ: u32,
+    data: *mut c_void,
+);
 pub type PfnGlPixelStorei = unsafe extern "C" fn(pname: u32, param: i32);
 pub type PfnGlTexParameteri =
     unsafe extern "C" fn(target: u32, pname: u32, param: i32);
@@ -368,6 +389,8 @@ pub struct GlLoader {
     pub gl_bind_texture: Option<PfnGlBindTexture>,
     pub gl_delete_textures: Option<PfnGlDeleteTextures>,
     pub gl_tex_image_2d: Option<PfnGlTexImage2D>,
+    pub gl_tex_image_3d: Option<PfnGlTexImage3D>,
+    pub gl_get_tex_image: Option<PfnGlGetTexImage>,
     pub gl_pixel_store_i: Option<PfnGlPixelStorei>,
     pub gl_tex_parameter_i: Option<PfnGlTexParameteri>,
     pub gl_active_texture: Option<PfnGlActiveTexture>,
@@ -445,6 +468,8 @@ impl GlLoader {
             gl_bind_texture: None,
             gl_delete_textures: None,
             gl_tex_image_2d: None,
+            gl_tex_image_3d: None,
+            gl_get_tex_image: None,
             gl_pixel_store_i: None,
             gl_tex_parameter_i: None,
             gl_active_texture: None,
@@ -663,6 +688,8 @@ impl GlLoader {
         load_gl!(gl_bind_texture, "glBindTexture");
         load_gl!(gl_delete_textures, "glDeleteTextures");
         load_gl!(gl_tex_image_2d, "glTexImage2D");
+        load_gl!(gl_tex_image_3d, "glTexImage3D");
+        load_gl!(gl_get_tex_image, "glGetTexImage");
         load_gl!(gl_pixel_store_i, "glPixelStorei");
         load_gl!(gl_tex_parameter_i, "glTexParameteri");
         load_gl!(gl_active_texture, "glActiveTexture");

@@ -29,6 +29,11 @@ pub enum NullEvent {
     ReleaseTexture2D,
     FillTexture2D,
     ReadTexture2D,
+    CreateTexture3D,
+    ReleaseTexture3D,
+    FillTexture3D,
+    ReadTexture3D,
+    SetLightVolume,
     SetCamera,
     Shutdown,
     Violation(&'static str),
@@ -38,6 +43,14 @@ pub enum NullEvent {
 /// texture, so a fill and a read round-trip the same values with no graphics
 /// API.
 pub struct NullTexture2D {
+    pub inner: Arc<Mutex<TextureViewInner>>,
+    pub bytes: Vec<u8>,
+    pub released: bool,
+}
+
+/// The null backend's own 3D texture view: plain data, one byte vector
+/// per texture, the same rule the 2D textures carry.
+pub struct NullTexture3D {
     pub inner: Arc<Mutex<TextureViewInner>>,
     pub bytes: Vec<u8>,
     pub released: bool,
@@ -64,6 +77,8 @@ pub struct NullRenderBackend {
     events: Vec<NullEvent>,
     targets: Vec<NullRenderTarget>,
     textures_2d: Vec<NullTexture2D>,
+    textures_3d: Vec<NullTexture3D>,
+    light_volume: Option<NullTexture3D>,
     next_mesh_id: usize,
     readback_queue: Vec<(u32, u32)>,
     last_readback: Vec<ReadbackSample>,
@@ -106,6 +121,8 @@ impl NullRenderBackend {
             events: Vec::new(),
             targets: Vec::new(),
             textures_2d: Vec::new(),
+            textures_3d: Vec::new(),
+            light_volume: None,
             next_mesh_id: 0,
             readback_queue: Vec::new(),
             last_readback: Vec::new(),
@@ -148,6 +165,12 @@ impl NullRenderBackend {
 
     fn find_texture_index(&self, view: &TextureView) -> Option<usize> {
         self.textures_2d
+            .iter()
+            .position(|t| Arc::ptr_eq(&t.inner, &view.inner))
+    }
+
+    fn find_texture3d_index(&self, view: &TextureView) -> Option<usize> {
+        self.textures_3d
             .iter()
             .position(|t| Arc::ptr_eq(&t.inner, &view.inner))
     }
@@ -685,6 +708,153 @@ impl RenderBackend for NullRenderBackend {
         }
         data.copy_from_slice(&self.textures_2d[index].bytes);
         Ok(true)
+    }
+
+    fn create_texture_3d(&mut self, desc: &Texture3DDesc)
+        -> Result<TextureView, RenderError> {
+        self.record(NullEvent::CreateTexture3D);
+        if let Err(_error) = desc.validate() {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "create_texture_3d: the desc is invalid",
+            ));
+        }
+        let count = (desc.width as usize) * (desc.height as usize)
+            * (desc.depth as usize) * bytes_per_pixel(desc.format) as usize;
+        let inner = Arc::new(Mutex::new(TextureViewInner {
+            width: desc.width,
+            height: desc.height,
+            depth: desc.depth,
+            format: desc.format,
+            is_depth: false,
+            released: false,
+        }));
+        let texture = NullTexture3D {
+            inner: inner.clone(),
+            bytes: vec![0u8; count],
+            released: false,
+        };
+        self.textures_3d.push(texture);
+        Ok(TextureView { inner })
+    }
+
+    fn release_texture_3d(&mut self, view: &TextureView) {
+        self.record(NullEvent::ReleaseTexture3D);
+        let index = match self.find_texture3d_index(view) {
+            Some(i) => i,
+            None => {
+                self.violations += 1;
+                return;
+            }
+        };
+        if self.textures_3d[index].released {
+            self.violations += 1;
+            return;
+        }
+        self.textures_3d[index].released = true;
+        view.inner.lock().unwrap().released = true;
+    }
+
+    fn fill_texture_3d(&mut self, view: &TextureView, data: &[u8])
+        -> Result<(), RenderError> {
+        self.record(NullEvent::FillTexture3D);
+        let index = match self.find_texture3d_index(view) {
+            Some(i) => i,
+            None => {
+                return Err(RenderError::from(
+                    "fill_texture_3d: the texture is not owned by this backend",
+                ));
+            }
+        };
+        if self.textures_3d[index].released {
+            return Err(RenderError::from(
+                "fill_texture_3d: the texture is released",
+            ));
+        }
+        let inner = view.inner.lock().unwrap();
+        let expected = (inner.width as usize) * (inner.height as usize)
+            * (inner.depth as usize) * bytes_per_pixel(inner.format) as usize;
+        drop(inner);
+        if data.len() != expected {
+            return Err(RenderError::from(format!(
+                "fill_texture_3d: the byte count is {} but the texture is {}",
+                data.len(),
+                expected
+            )));
+        }
+        self.textures_3d[index].bytes = data.to_vec();
+        Ok(())
+    }
+
+    fn read_texture_3d(
+        &mut self,
+        view: &TextureView,
+        data: &mut [u8],
+    ) -> Result<bool, RenderError> {
+        let index = match self.find_texture3d_index(view) {
+            Some(i) => i,
+            None => {
+                return Err(RenderError::from(
+                    "read_texture_3d: the texture is not owned by this backend",
+                ));
+            }
+        };
+        if self.textures_3d[index].released {
+            return Err(RenderError::from(
+                "read_texture_3d: the texture is released",
+            ));
+        }
+        let inner = view.inner.lock().unwrap();
+        let expected = (inner.width as usize) * (inner.height as usize)
+            * (inner.depth as usize) * bytes_per_pixel(inner.format) as usize;
+        drop(inner);
+        if data.len() != expected {
+            return Err(RenderError::from(format!(
+                "read_texture_3d: the byte count is {} but the texture is {}",
+                data.len(),
+                expected
+            )));
+        }
+        data.copy_from_slice(&self.textures_3d[index].bytes);
+        Ok(true)
+    }
+
+    fn set_light_volume(&mut self, volume: &LightVolume) {
+        self.record(NullEvent::SetLightVolume);
+        if self.require_ready("set_light_volume") {
+            if volume.dims[0] == 0
+                || volume.dims[1] == 0
+                || volume.dims[2] == 0
+                || volume.cell_size <= 0.0
+            {
+                self.violations += 1;
+                return;
+            }
+            // The volume's own 3D texture: the same plain-data path the
+            // 2D textures carry (the bytes carry the voxels' RGBA16F
+            // halves, the depth layers `z * 6 + f`).
+            let width = volume.dims[0];
+            let height = volume.dims[1];
+            let depth = volume.dims[2] * 6;
+            let bytes = width as usize
+                * height as usize
+                * depth as usize
+                * bytes_per_pixel(PixelFormat::Rgba16F) as usize;
+            let texture = NullTexture3D {
+                inner: Arc::new(Mutex::new(TextureViewInner {
+                    width,
+                    height,
+                    depth,
+                    format: PixelFormat::Rgba16F,
+                    is_depth: false,
+                    released: false,
+                })),
+                bytes: volume.pack_texture_3d(),
+                released: false,
+            };
+            let _ = bytes;
+            self.light_volume = Some(texture);
+        }
     }
 
     fn set_camera(&mut self, camera: CameraParams) {

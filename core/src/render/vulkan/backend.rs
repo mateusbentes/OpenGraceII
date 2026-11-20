@@ -115,6 +115,19 @@ impl LightsUniform {
     }
 }
 
+/// The light volume's uniform block (std140, 48 bytes): the grid's
+/// origin (xyz + pad), the grid's dims (x, y, z * 6 the depth layers,
+/// pad) and the params (x = the cell size, y = the indirect intensity,
+/// z = the toggle). The same three vec4s the POST_GBUFFER fragment's
+/// Volume block declares.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VolumeUniform {
+    origin: [f32; 4],
+    dims: [f32; 4],
+    params: [f32; 4],
+}
+
 /// The Vulkan backend's configuration.
 #[derive(Clone, Debug)]
 pub struct VulkanBackendConfig {
@@ -312,6 +325,8 @@ pub struct VulkanBackend {
     post_camera_map: *mut std::os::raw::c_void,
     post_lights_buffer: Option<VulkanResource>,
     post_lights_map: *mut std::os::raw::c_void,
+    post_volume_buffer: Option<VulkanResource>,
+    post_volume_map: *mut std::os::raw::c_void,
     post_config_buffer: Option<VulkanResource>,
     post_config_map: *mut std::os::raw::c_void,
     post_gbuffer_descriptor_set: vk::VkDescriptorSet,
@@ -345,6 +360,12 @@ pub struct VulkanBackend {
     violations: u64,
     targets: Vec<VulkanRenderTarget>,
     textures_2d: Vec<VulkanTexture2D>,
+    textures_3d: Vec<VulkanTexture2D>,
+    // The light volume's 3D texture (M8): the backend-owned image the
+    // set_light_volume call (re)creates and fills, and the volume
+    // uniform block's values the gbuffer descriptor writes carry.
+    light_volume: Option<VulkanTexture2D>,
+    volume_uniform: VolumeUniform,
     readback_queue: Vec<(u32, u32)>,
     last_readback: Vec<ReadbackSample>,
     has_center: bool,
@@ -354,6 +375,33 @@ pub struct VulkanBackend {
 }
 
 impl VulkanBackend {
+    /// DEBUG: the created image's device memory requirements (the
+    /// depth's memory proof — 3072 bytes for 4x4x24 Rgba16F, 128 for a
+    /// dropped depth). The debug example's helper only.
+    pub fn debug_texture_3d_memory_size(&self, view: &TextureView) -> u64 {
+        let index = match self
+            .textures_3d
+            .iter()
+            .position(|x| Arc::ptr_eq(&x.inner, &view.inner))
+        {
+            Some(index) => index,
+            None => return 0,
+        };
+        let mut requirements = vk::VkMemoryRequirements {
+            size: 0,
+            alignment: 0,
+            memory_type_bits: 0,
+        };
+        unsafe {
+            (self.loader.vk_get_image_memory_requirements.unwrap())(
+                self.device,
+                self.textures_3d[index].image,
+                &mut requirements,
+            );
+        }
+        requirements.size
+    }
+
     /// The device's name: the NUL-terminated C string the properties
     /// report.
     fn device_name_string(&self) -> String {
@@ -478,6 +526,8 @@ impl VulkanBackend {
             post_camera_map: std::ptr::null_mut(),
             post_lights_buffer: None,
             post_lights_map: std::ptr::null_mut(),
+            post_volume_buffer: None,
+            post_volume_map: std::ptr::null_mut(),
             post_config_buffer: None,
             post_config_map: std::ptr::null_mut(),
             post_gbuffer_descriptor_set: std::ptr::null_mut(),
@@ -520,6 +570,13 @@ impl VulkanBackend {
             violations: 0,
             targets: Vec::new(),
             textures_2d: Vec::new(),
+            textures_3d: Vec::new(),
+            light_volume: None,
+            volume_uniform: VolumeUniform {
+                origin: [0.0; 4],
+                dims: [0.0; 4],
+                params: [0.0; 4],
+            },
             readback_queue: Vec::new(),
             last_readback: Vec::new(),
             has_center: false,
@@ -924,6 +981,14 @@ impl VulkanBackend {
              vk::ImageLayout::ShaderReadOnlyOptimal) => (vk::Access::ColorAttachmentWrite as u32, vk::Access::ShaderRead as u32),
             (vk::ImageLayout::ShaderReadOnlyOptimal,
              vk::ImageLayout::ColorAttachmentOptimal) => (vk::Access::ShaderRead as u32, vk::Access::ColorAttachmentWrite as u32),
+            // The 3D texture's readback handoff (M8): the shader-read
+            // state the fill's last transition left, into the copy's
+            // source state, and back to Undefined (the next fill's
+            // Undefined -> TransferDst entry expects it).
+            (vk::ImageLayout::ShaderReadOnlyOptimal,
+             vk::ImageLayout::TransferSrcOptimal) => (vk::Access::ShaderRead as u32, vk::Access::TransferRead as u32),
+            (vk::ImageLayout::TransferSrcOptimal,
+             vk::ImageLayout::Undefined) => (vk::Access::TransferRead as u32, 0),
             _ => (0, 0),
         };
         let (src_stage, dst_stage) = match (old_layout, new_layout) {
@@ -941,6 +1006,16 @@ impl VulkanBackend {
              vk::ImageLayout::ColorAttachmentOptimal) => {
                 (vk::PipelineStage::FragmentShader,
                  vk::PipelineStage::ColorAttachmentOutput)
+            }
+            (vk::ImageLayout::ShaderReadOnlyOptimal,
+             vk::ImageLayout::TransferSrcOptimal) => {
+                (vk::PipelineStage::FragmentShader,
+                 vk::PipelineStage::Transfer)
+            }
+            (vk::ImageLayout::TransferSrcOptimal,
+             vk::ImageLayout::Undefined) => {
+                (vk::PipelineStage::Transfer,
+                 vk::PipelineStage::TopOfPipe)
             }
             (vk::ImageLayout::Undefined,
              vk::ImageLayout::DepthStencilAttachmentOptimal) => {
@@ -1539,6 +1614,140 @@ impl VulkanBackend {
             flags: 0,
             image,
             view_type: vk::ImageType::Type2D,
+            format: format as u32,
+            components: vk::VkComponentMapping {
+                r: vk::ComponentSwizzle::Identity,
+                g: vk::ComponentSwizzle::Identity,
+                b: vk::ComponentSwizzle::Identity,
+                a: vk::ComponentSwizzle::Identity,
+            },
+            subresource_range: aspect,
+        };
+        let mut view = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_image_view.unwrap())(
+                self.device,
+                &view_info,
+                std::ptr::null(),
+                &mut view,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: vkCreateImageView failed",
+            ));
+        }
+        Ok((image, memory, view))
+    }
+
+    /// The 3D texture's off-screen image: the same creation path the
+    /// 2D image follows, with the Type3D image type and the 3D view.
+    /// The depth layers the volume's cells fill; the usage pair
+    /// (TransferDst | Sampled) the fill and the shader read need.
+    fn create_offscreen_image_3d(
+        &mut self,
+        width: u32,
+        height: u32,
+        depth: u32,
+        format: vk::Format,
+        usage: u32,
+    ) -> Result<(vk::VkImage, vk::VkDeviceMemory, vk::VkImageView),
+                RenderError> {
+        let image_info = vk::VkImageCreateInfo {
+            s_type: vk::StructureType::ImageCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            image_type: vk::ImageType::Type3D,
+            format: format as u32,
+            width,
+            height,
+            depth,
+            mip_levels: 1,
+            array_layers: 1,
+            samples: vk::SampleCount::One,
+            tiling: vk::ImageTiling::Optimal,
+            usage: usage as u32,
+            sharing_mode: vk::SharingMode::Exclusive,
+            queue_family_index_count: 0,
+            p_queue_family_indices: std::ptr::null(),
+            initial_layout: vk::ImageLayout::Undefined,
+        };
+        let mut image = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_create_image.unwrap())(
+                self.device,
+                &image_info,
+                std::ptr::null(),
+                &mut image,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: vkCreateImage failed",
+            ));
+        }
+        let mut requirements = vk::VkMemoryRequirements {
+            size: 0,
+            alignment: 0,
+            memory_type_bits: 0,
+        };
+        unsafe {
+            (self.loader.vk_get_image_memory_requirements.unwrap())(
+                self.device,
+                image,
+                &mut requirements,
+            );
+        }
+        let memory_type_index = self.find_memory_type(
+            requirements.memory_type_bits,
+            vk::MemoryProperty::DeviceLocal as u32,
+        )?;
+        let alloc_info = vk::VkMemoryAllocateInfo {
+            s_type: vk::StructureType::MemoryAllocateInfo,
+            p_next: std::ptr::null(),
+            allocation_size: requirements.size,
+            memory_type_index,
+        };
+        let mut memory = std::ptr::null_mut();
+        let result = unsafe {
+            (self.loader.vk_allocate_memory.unwrap())(
+                self.device,
+                &alloc_info,
+                std::ptr::null(),
+                &mut memory,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: vkAllocateMemory failed",
+            ));
+        }
+        let result = unsafe {
+            (self.loader.vk_bind_image_memory.unwrap())(
+                self.device,
+                image,
+                memory,
+                0,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "VulkanBackend: vkBindImageMemory failed",
+            ));
+        }
+        let aspect = vk::VkImageSubresourceRange {
+            aspect_mask: vk::ImageAspect::Color as u32,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let view_info = vk::VkImageViewCreateInfo {
+            s_type: vk::StructureType::ImageViewCreateInfo,
+            p_next: std::ptr::null(),
+            flags: 0,
+            image,
+            view_type: vk::ImageType::Type3D,
             format: format as u32,
             components: vk::VkComponentMapping {
                 r: vk::ComponentSwizzle::Identity,
@@ -3489,6 +3698,20 @@ impl VulkanBackend {
                 stage_flags: vk::ShaderStage::Fragment as u32,
                 p_immutable_samplers: std::ptr::null(),
             },
+            vk::VkDescriptorSetLayoutBinding {
+                binding: 3,
+                descriptor_type: vk::DescriptorType::UniformBuffer,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStage::Fragment as u32,
+                p_immutable_samplers: std::ptr::null(),
+            },
+            vk::VkDescriptorSetLayoutBinding {
+                binding: 4,
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStage::Fragment as u32,
+                p_immutable_samplers: std::ptr::null(),
+            },
         ];
         let layout_info = vk::VkDescriptorSetLayoutCreateInfo {
             s_type: vk::StructureType::DescriptorSetLayoutCreateInfo,
@@ -4831,6 +5054,25 @@ impl VulkanBackend {
             released: false,
         });
         self.post_lights_map = lights_map;
+        // The geometry pass's volume buffer (the 48-byte std140 block
+        // the POST_GBUFFER fragment's Volume block reads).
+        let (volume_buffer, volume_memory) = match self.create_host_buffer(
+            std::mem::size_of::<VolumeUniform>(),
+            vk::BufferUsage::UniformBuffer,
+        ) {
+            Ok(pair) => pair,
+            Err(_) => return false,
+        };
+        let volume_map = match self.map_memory(volume_memory) {
+            Ok(map) => map,
+            Err(_) => return false,
+        };
+        self.post_volume_buffer = Some(VulkanResource {
+            handle: volume_buffer,
+            memory: volume_memory,
+            released: false,
+        });
+        self.post_volume_map = volume_map;
         // The composite pass's config buffer (the three vec4 params the
         // POST_COMPOSITE shader's Config block carries — 48 bytes).
         let (config_buffer, config_memory) = match self.create_host_buffer(
@@ -4855,11 +5097,11 @@ impl VulkanBackend {
         let pool_sizes = [
             vk::VkDescriptorPoolSize {
                 descriptor_type: vk::DescriptorType::UniformBuffer,
-                descriptor_count: 2,
+                descriptor_count: 3,
             },
             vk::VkDescriptorPoolSize {
                 descriptor_type: vk::DescriptorType::CombinedImageSampler,
-                descriptor_count: 1,
+                descriptor_count: 2,
             },
         ];
         let pool_info = vk::VkDescriptorPoolCreateInfo {
@@ -4904,11 +5146,20 @@ impl VulkanBackend {
         }
         self.post_gbuffer_descriptor_set = set;
         let default_view = self.default_texture.as_ref().map(|t| t.view);
+        let default_volume_view = self
+            .light_volume
+            .as_ref()
+            .map(|t| t.view);
         self.write_post_gbuffer_descriptors(
             set,
             camera_buffer,
             lights_buffer,
+            self.post_volume_buffer
+                .as_ref()
+                .map(|r| r.handle)
+                .unwrap_or(std::ptr::null_mut()),
             default_view,
+            default_volume_view,
         );
         // The composite pass's descriptor set: the config at binding 0,
         // the radiance and the world attachments at bindings 1-2 (the
@@ -4978,7 +5229,9 @@ impl VulkanBackend {
         set: vk::VkDescriptorSet,
         camera_buffer: vk::VkBuffer,
         lights_buffer: vk::VkBuffer,
+        volume_buffer: vk::VkBuffer,
         image_view: Option<vk::VkImageView>,
+        volume_view: Option<vk::VkImageView>,
     ) {
         let camera_info = vk::VkDescriptorBufferInfo {
             buffer: camera_buffer,
@@ -4990,9 +5243,19 @@ impl VulkanBackend {
             offset: 0,
             range: LightsUniform::SIZE as u64,
         };
+        let volume_info = vk::VkDescriptorBufferInfo {
+            buffer: volume_buffer,
+            offset: 0,
+            range: std::mem::size_of::<VolumeUniform>() as u64,
+        };
         let image_info = vk::VkDescriptorImageInfo {
             sampler: self.mesh_sampler,
             image_view: image_view.unwrap_or(std::ptr::null_mut()),
+            image_layout: vk::ImageLayout::ShaderReadOnlyOptimal,
+        };
+        let volume_image_info = vk::VkDescriptorImageInfo {
+            sampler: self.mesh_sampler,
+            image_view: volume_view.unwrap_or(std::ptr::null_mut()),
             image_layout: vk::ImageLayout::ShaderReadOnlyOptimal,
         };
         let writes = [
@@ -5032,11 +5295,35 @@ impl VulkanBackend {
                 p_buffer_info: std::ptr::null(),
                 p_texel_buffer_view: std::ptr::null(),
             },
+            vk::VkWriteDescriptorSet {
+                s_type: vk::StructureType::WriteDescriptorSet,
+                p_next: std::ptr::null(),
+                dst_set: set,
+                dst_binding: 3,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::UniformBuffer,
+                p_image_info: std::ptr::null(),
+                p_buffer_info: &volume_info,
+                p_texel_buffer_view: std::ptr::null(),
+            },
+            vk::VkWriteDescriptorSet {
+                s_type: vk::StructureType::WriteDescriptorSet,
+                p_next: std::ptr::null(),
+                dst_set: set,
+                dst_binding: 4,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::CombinedImageSampler,
+                p_image_info: &volume_image_info,
+                p_buffer_info: std::ptr::null(),
+                p_texel_buffer_view: std::ptr::null(),
+            },
         ];
         unsafe {
             (self.loader.vk_update_descriptor_sets.unwrap())(
                 self.device,
-                3,
+                5,
                 writes.as_ptr(),
                 0,
                 std::ptr::null(),
@@ -5146,6 +5433,40 @@ impl VulkanBackend {
                 self.device,
                 3,
                 writes.as_ptr(),
+                0,
+                std::ptr::null(),
+            );
+        }
+    }
+    /// The post chain's volume texture write (M8): the combined
+    /// sampler at binding 4 (the POST_GBUFFER fragment's declaration).
+    fn write_post_volume_descriptor(
+        &self,
+        set: vk::VkDescriptorSet,
+        image_view: vk::VkImageView,
+    ) {
+        let image_info = vk::VkDescriptorImageInfo {
+            sampler: self.mesh_sampler,
+            image_view,
+            image_layout: vk::ImageLayout::ShaderReadOnlyOptimal,
+        };
+        let write = vk::VkWriteDescriptorSet {
+            s_type: vk::StructureType::WriteDescriptorSet,
+            p_next: std::ptr::null(),
+            dst_set: set,
+            dst_binding: 4,
+            dst_array_element: 0,
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::CombinedImageSampler,
+            p_image_info: &image_info,
+            p_buffer_info: std::ptr::null(),
+            p_texel_buffer_view: std::ptr::null(),
+        };
+        unsafe {
+            (self.loader.vk_update_descriptor_sets.unwrap())(
+                self.device,
+                1,
+                &write,
                 0,
                 std::ptr::null(),
             );
@@ -6403,6 +6724,28 @@ impl RenderBackend for VulkanBackend {
                 );
             }
         }
+        // The volume's block: the origin, the dims, the cell size and
+        // the indirect light's toggle and intensity the POST_GBUFFER
+        // fragment's Volume block reads (the 48-byte std140 block).
+        let volume_block = VolumeUniform {
+            origin: self.volume_uniform.origin,
+            dims: self.volume_uniform.dims,
+            params: [
+                self.volume_uniform.params[0],
+                config.indirect_intensity,
+                if config.indirect_light { 1.0f32 } else { 0.0 },
+                0.0,
+            ],
+        };
+        if !self.post_volume_map.is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &volume_block as *const VolumeUniform as *const u8,
+                    self.post_volume_map as *mut u8,
+                    std::mem::size_of::<VolumeUniform>(),
+                );
+            }
+        }
         // The bound texture's view (the surface texture the geometry
         // pass samples).
         let bound_view = self
@@ -6416,6 +6759,22 @@ impl RenderBackend for VulkanBackend {
                 self.post_gbuffer_descriptor_set,
                 view,
             );
+        }
+        // The volume's sampler: the light volume's 3D texture the
+        // set_light_volume call carries (the toggle's violation when
+        // the config asks for the indirect light with no volume set).
+        if config.indirect_light {
+            match self.light_volume.as_ref() {
+                Some(volume) => {
+                    self.write_post_volume_descriptor(
+                        self.post_gbuffer_descriptor_set,
+                        volume.view,
+                    );
+                }
+                None => {
+                    self.violations += 1;
+                }
+            }
         }
         // The composite pass's two HDR attachments' samplers.
         {
@@ -7153,6 +7512,452 @@ impl RenderBackend for VulkanBackend {
             )));
         }
         Ok(true)
+    }
+
+    fn create_texture_3d(
+        &mut self,
+        desc: &Texture3DDesc,
+    ) -> Result<TextureView, RenderError> {
+        if self.shutdown {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "create_texture_3d: the backend is shut down",
+            ));
+        }
+        desc.validate()?;
+        let (image, memory, view) = self.create_offscreen_image_3d(
+            desc.width,
+            desc.height,
+            desc.depth,
+            self.to_vk_format(desc.format),
+            // The Sampled bit joins the transfer destination: the fill
+            // writes through the transfer path and the shader reads
+            // through the sampled view (the same usage pair the 2D
+            // textures carry).
+            vk::ImageUsage::TransferDst as u32 | vk::ImageUsage::Sampled as u32,
+        )?;
+        let texture = VulkanTexture2D {
+            inner: Arc::new(Mutex::new(TextureViewInner {
+                width: desc.width,
+                height: desc.height,
+                depth: desc.depth,
+                format: desc.format,
+                is_depth: false,
+                released: false,
+            })),
+            image,
+            memory,
+            view,
+            released: false,
+        };
+        let handle = TextureView {
+            inner: texture.inner.clone(),
+        };
+        self.textures_3d.push(texture);
+        Ok(handle)
+    }
+    fn release_texture_3d(&mut self, view: &TextureView) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        match self
+            .textures_3d
+            .iter()
+            .position(|x| Arc::ptr_eq(&x.inner, &view.inner))
+        {
+            Some(index) => {
+                if self.textures_3d[index].released {
+                    self.violations += 1;
+                } else {
+                    self.textures_3d[index].released = true;
+                    view.inner.lock().unwrap().released = true;
+                }
+            }
+            None => {
+                self.violations += 1;
+            }
+        }
+    }
+
+    fn fill_texture_3d(&mut self, view: &TextureView, data: &[u8])
+        -> Result<(), RenderError> {
+        if self.shutdown {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "fill_texture_3d: the backend is shut down",
+            ));
+        }
+        let index = match self
+            .textures_3d
+            .iter()
+            .position(|x| Arc::ptr_eq(&x.inner, &view.inner))
+        {
+            Some(index) => index,
+            None => {
+                self.violations += 1;
+                return Err(RenderError::from(
+                    "fill_texture_3d: the texture is not owned by this backend",
+                ));
+            }
+        };
+        let inner = view.inner.lock().unwrap();
+        let expected = (inner.width as usize) * (inner.height as usize)
+            * (inner.depth as usize) * bytes_per_pixel(inner.format) as usize;
+        let (width, height, depth) = (inner.width, inner.height, inner.depth);
+        drop(inner);
+        if data.len() != expected {
+            return Err(RenderError::from(format!(
+                "fill_texture_3d: the byte count is {} but the texture is {}",
+                data.len(),
+                expected
+            )));
+        }
+        if self.readback_command.is_null() {
+            return Err(RenderError::from(
+                "fill_texture_3d: the command path is not initialised",
+            ));
+        }
+        // The staging upload: the same one-off command buffer the 2D
+        // fill follows (the transition Undefined -> TransferDst ->
+        // the shader read).
+        let image = self.textures_3d[index].image;
+        let (staging, staging_memory) = self.create_host_buffer(
+            data.len(),
+            vk::BufferUsage::TransferSrc,
+        )?;
+        let map = self.map_memory(staging_memory)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                map as *mut u8,
+                data.len(),
+            );
+        }
+        unsafe {
+            (self.loader.vk_reset_command_buffer.unwrap())(
+                self.readback_command,
+                0,
+            );
+        }
+        let begin_info = vk::VkCommandBufferBeginInfo {
+            s_type: vk::StructureType::CommandBufferBeginInfo,
+            p_next: std::ptr::null(),
+            flags: vk::CommandBufferUsage::OneTimeSubmit as u32,
+            p_inheritance_info: std::ptr::null(),
+        };
+        let result = unsafe {
+            (self.loader.vk_begin_command_buffer.unwrap())(
+                self.readback_command,
+                &begin_info,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "fill_texture_3d: the command buffer could not begin",
+            ));
+        }
+        // The single full-depth copy: the buffer's packed layout packs
+        // the depth slices back to back and the copy's extent carries
+        // the whole depth (the driver walks the slices itself).
+        let copies = vec![vk::VkBufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::VkImageSubresourceLayers {
+                aspect_mask: vk::ImageAspect::Color as u32,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::VkOffset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::VkExtent3D {
+                width,
+                height,
+                depth,
+            },
+        }];
+        self.transition_image_layout(
+            self.readback_command,
+            image,
+            vk::ImageAspect::Color as u32,
+            vk::ImageLayout::Undefined,
+            vk::ImageLayout::TransferDstOptimal,
+        );
+        unsafe {
+            (self.loader.vk_cmd_copy_buffer_to_image.unwrap())(
+                self.readback_command,
+                staging,
+                image,
+                vk::ImageLayout::TransferDstOptimal,
+                copies.len() as u32,
+                copies.as_ptr(),
+            );
+        }
+        self.transition_image_layout(
+            self.readback_command,
+            image,
+            vk::ImageAspect::Color as u32,
+            vk::ImageLayout::TransferDstOptimal,
+            vk::ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let result = unsafe {
+            (self.loader.vk_end_command_buffer.unwrap())(
+                self.readback_command,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "fill_texture_3d: the command buffer could not end",
+            ));
+        }
+        let submit = vk::VkSubmitInfo {
+            s_type: vk::StructureType::SubmitInfo,
+            p_next: std::ptr::null(),
+            wait_semaphore_count: 0,
+            p_wait_semaphores: std::ptr::null(),
+            p_wait_dst_stage_mask: std::ptr::null(),
+            signal_semaphore_count: 0,
+            p_command_buffers: &self.readback_command,
+            command_buffer_count: 1,
+            p_signal_semaphores: std::ptr::null(),
+        };
+        unsafe {
+            (self.loader.vk_queue_submit.unwrap())(
+                self.queue,
+                1,
+                &submit,
+                std::ptr::null_mut(),
+            );
+            (self.loader.vk_queue_wait_idle.unwrap())(self.queue);
+        }
+        let _ = (width, height, depth);
+        Ok(())
+    }
+
+    fn read_texture_3d(
+        &mut self,
+        view: &TextureView,
+        data: &mut [u8],
+    ) -> Result<bool, RenderError> {
+        let index = match self
+            .textures_3d
+            .iter()
+            .position(|x| Arc::ptr_eq(&x.inner, &view.inner))
+        {
+            Some(index) => index,
+            None => {
+                return Err(RenderError::from(
+                    "read_texture_3d: the texture is not owned by this backend",
+                ));
+            }
+        };
+        if self.textures_3d[index].released {
+            return Ok(false);
+        }
+        let inner = view.inner.lock().unwrap();
+        let expected = (inner.width as usize) * (inner.height as usize)
+            * (inner.depth as usize) * bytes_per_pixel(inner.format) as usize;
+        drop(inner);
+        if data.len() != expected {
+            return Err(RenderError::from(format!(
+                "read_texture_3d: the byte count is {} but the texture is {}",
+                data.len(),
+                expected
+            )));
+        }
+        // The real readback: the same one-off command buffer the fill
+        // carries — the transfer-src handoff, the copy into a host
+        // buffer, the queue wait the fill's submit follows.
+        let image = self.textures_3d[index].image;
+        let (staging, staging_memory) = self.create_host_buffer(
+            data.len(),
+            vk::BufferUsage::TransferDst,
+        )?;
+        unsafe {
+            (self.loader.vk_reset_command_buffer.unwrap())(
+                self.readback_command,
+                0,
+            );
+        }
+        let begin_info = vk::VkCommandBufferBeginInfo {
+            s_type: vk::StructureType::CommandBufferBeginInfo,
+            p_next: std::ptr::null(),
+            flags: vk::CommandBufferUsage::OneTimeSubmit as u32,
+            p_inheritance_info: std::ptr::null(),
+        };
+        let result = unsafe {
+            (self.loader.vk_begin_command_buffer.unwrap())(
+                self.readback_command,
+                &begin_info,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "read_texture_3d: the command buffer could not begin",
+            ));
+        }
+        let (width, height, depth) = {
+            let inner = view.inner.lock().unwrap();
+            (inner.width, inner.height, inner.depth)
+        };
+        // DEBUG: one copy per slice with the z offsets (the decisive
+        // probe with the single-copy upload isolates the readback side).
+        let slice_bytes = (width * height * 4 * 2) as u32;
+        let mut copies = Vec::with_capacity(depth as usize);
+        for layer in 0..depth {
+            copies.push(vk::VkBufferImageCopy {
+                buffer_offset: (layer * slice_bytes) as u64,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: vk::VkImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspect::Color as u32,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::VkOffset3D { x: 0, y: 0, z: layer as i32 },
+                image_extent: vk::VkExtent3D {
+                    width,
+                    height,
+                    depth: 1,
+                },
+            });
+        }
+        // The transfer-src handoff: the shader-read state the fill's
+        // last transition left, into the copy's source state.
+        self.transition_image_layout(
+            self.readback_command,
+            image,
+            vk::ImageAspect::Color as u32,
+            vk::ImageLayout::ShaderReadOnlyOptimal,
+            vk::ImageLayout::TransferSrcOptimal,
+        );
+        unsafe {
+            (self.loader.vk_cmd_copy_image_to_buffer.unwrap())(
+                self.readback_command,
+                image,
+                vk::ImageLayout::TransferSrcOptimal,
+                staging,
+                copies.len() as u32,
+                copies.as_ptr(),
+            );
+        }
+        // The handback: the Undefined state the next fill's
+        // Undefined -> TransferDst transition expects.
+        self.transition_image_layout(
+            self.readback_command,
+            image,
+            vk::ImageAspect::Color as u32,
+            vk::ImageLayout::TransferSrcOptimal,
+            vk::ImageLayout::Undefined,
+        );
+        let result = unsafe {
+            (self.loader.vk_end_command_buffer.unwrap())(
+                self.readback_command,
+            )
+        };
+        if result != vk::Result::Success {
+            return Err(RenderError::from(
+                "read_texture_3d: the command buffer could not end",
+            ));
+        }
+        let submit = vk::VkSubmitInfo {
+            s_type: vk::StructureType::SubmitInfo,
+            p_next: std::ptr::null(),
+            wait_semaphore_count: 0,
+            p_wait_semaphores: std::ptr::null(),
+            p_wait_dst_stage_mask: std::ptr::null(),
+            signal_semaphore_count: 0,
+            p_command_buffers: &self.readback_command,
+            command_buffer_count: 1,
+            p_signal_semaphores: std::ptr::null(),
+        };
+        unsafe {
+            (self.loader.vk_queue_submit.unwrap())(
+                self.queue,
+                1,
+                &submit,
+                std::ptr::null_mut(),
+            );
+            (self.loader.vk_queue_wait_idle.unwrap())(self.queue);
+        }
+        let map = self.map_memory(staging_memory)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                map as *const u8,
+                data.as_mut_ptr(),
+                data.len(),
+            );
+        }
+        Ok(true)
+    }
+
+    fn set_light_volume(&mut self, volume: &LightVolume) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        if volume.dims[0] == 0 || volume.dims[1] == 0 || volume.dims[2] == 0
+            || volume.cell_size <= 0.0
+        {
+            self.violations += 1;
+            return;
+        }
+        // The volume's 3D texture: the same Rgba16F path the standalone
+        // 3D textures carry (the dims z * 6 layers, the face `f` of the
+        // cell `(x, y, z)` at the layer `z * 6 + f`).
+        let desc = Texture3DDesc {
+            width: volume.dims[0],
+            height: volume.dims[1],
+            depth: volume.dims[2] * 6,
+            format: PixelFormat::Rgba16F,
+        };
+        let view = match self.create_texture_3d(&desc) {
+            Ok(view) => view,
+            Err(_) => {
+                self.violations += 1;
+                return;
+            }
+        };
+        let packed = volume.pack_texture_3d();
+        if self.fill_texture_3d(&view, &packed).is_err() {
+            self.violations += 1;
+            return;
+        }
+        // The uniform block's values: the origin, the grid's dims (the
+        // depth carrying the z * 6 layers) and the cell size (the
+        // indirect intensity and the toggle the submit writes).
+        self.volume_uniform = VolumeUniform {
+            origin: [
+                volume.origin[0],
+                volume.origin[1],
+                volume.origin[2],
+                0.0,
+            ],
+            dims: [
+                volume.dims[0] as f32,
+                volume.dims[1] as f32,
+                (volume.dims[2] * 6) as f32,
+                0.0,
+            ],
+            params: [volume.cell_size, 0.0, 0.0, 0.0],
+        };
+        // The old volume's texture releases (the one-volume rule the
+        // contract's set_light_volume carries).
+        if let Some(old) = self.light_volume.take() {
+            let handle = TextureView {
+                inner: old.inner.clone(),
+            };
+            self.release_texture_3d(&handle);
+        }
+        self.light_volume = Some(VulkanTexture2D {
+            inner: view.inner,
+            image: self.textures_3d.last().unwrap().image,
+            memory: self.textures_3d.last().unwrap().memory,
+            view: self.textures_3d.last().unwrap().view,
+            released: false,
+        });
     }
 
     fn set_camera(&mut self, camera: CameraParams) {

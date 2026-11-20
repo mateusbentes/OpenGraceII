@@ -330,6 +330,8 @@ struct GbufferVsOut {\n\
 Texture2D surface_texture : register(t0);\n\
 SamplerState surface_sampler : register(s0);\n\
 \n\
+Texture3D volume_texture : register(t1);\n\
+\n\
 cbuffer Lights : register(b1) {\n\
 \x20   float4 sun_direction;\n\
 \x20   float4 sun_color_intensity;\n\
@@ -338,11 +340,88 @@ cbuffer Lights : register(b1) {\n\
 \x20   float4 params;\n\
 };\n\
 \n\
+cbuffer Volume : register(b2) {\n\
+\x20   float4 volume_origin;\n\
+\x20   float4 volume_dims;\n\
+\x20   float4 volume_params;\n\
+};\n\
+\n\
 struct PostGbufferOut {\n\
 \x20   float4 radiance : SV_TARGET0;\n\
 \x20   float4 world : SV_TARGET1;\n\
 };\n\
 \n\
+// The light volume's face selection: the face the normal faces (the\n\
+// same rule the CPU reference's face_for_normal carries). The six\n\
+// comparisons unroll (no local array indexing — the vkd3d-shader\n\
+// compiler the Wine builds carry crashes on the dynamic local-array\n\
+// subscript the loop form would need).\n\
+int volume_face(float3 normal) {\n\
+\x20   float best_dot = dot(normal, float3(1.0, 0.0, 0.0));\n\
+\x20   int best = 0;\n\
+\x20   float d;\n\
+\x20   d = dot(normal, float3(-1.0, 0.0, 0.0));\n\
+\x20   if (d > best_dot) { best_dot = d; best = 1; }\n\
+\x20   d = dot(normal, float3(0.0, 1.0, 0.0));\n\
+\x20   if (d > best_dot) { best_dot = d; best = 2; }\n\
+\x20   d = dot(normal, float3(0.0, -1.0, 0.0));\n\
+\x20   if (d > best_dot) { best_dot = d; best = 3; }\n\
+\x20   d = dot(normal, float3(0.0, 0.0, 1.0));\n\
+\x20   if (d > best_dot) { best_dot = d; best = 4; }\n\
+\x20   d = dot(normal, float3(0.0, 0.0, -1.0));\n\
+\x20   if (d > best_dot) { best_dot = d; best = 5; }\n\
+\x20   return best;\n\
+}\n\
+// The light volume's trilinear sample: the face the normal faces'\n\
+// radiance, interpolated between the 8 surrounding cells. The three\n\
+// axes' base-and-frac computation unrolls (no dynamic local-array\n\
+// subscripting — the vkd3d-shader compiler the Wine builds carry\n\
+// crashes on it); the 8 corners' loop keeps the scalar weights only.\n\
+float3 volume_sample(float3 position, float3 normal) {\n\
+\x20   int face = volume_face(normal);\n\
+\x20   int cells_z = int(volume_dims.z / 6.0);\n\
+\x20   float3 continuous = (position - volume_origin.xyz)\n\
+\x20       / volume_params.x - 0.5;\n\
+\x20   int bx; float fx;\n\
+\x20   if (continuous.x <= 0.0) { bx = 0; fx = 0.0; }\n\
+\x20   else if (continuous.x >= volume_dims.x - 1.0) { bx = int(volume_dims.x) - 1; fx = 0.0; }\n\
+\x20   else { bx = int(floor(continuous.x)); fx = continuous.x - floor(continuous.x); }\n\
+\x20   int by; float fy;\n\
+\x20   if (continuous.y <= 0.0) { by = 0; fy = 0.0; }\n\
+\x20   else if (continuous.y >= volume_dims.y - 1.0) { by = int(volume_dims.y) - 1; fy = 0.0; }\n\
+\x20   else { by = int(floor(continuous.y)); fy = continuous.y - floor(continuous.y); }\n\
+\x20   int bz; float fz;\n\
+\x20   if (continuous.z <= 0.0) { bz = 0; fz = 0.0; }\n\
+\x20   else if (continuous.z >= float(cells_z) - 1.0) { bz = cells_z - 1; fz = 0.0; }\n\
+\x20   else { bz = int(floor(continuous.z)); fz = continuous.z - floor(continuous.z); }\n\
+\x20   float3 result = float3(0.0, 0.0, 0.0);\n\
+\x20   for (int corner = 0; corner < 8; corner++) {\n\
+\x20       int cx = bx + ((corner & 1) != 0 ? 1 : 0);\n\
+\x20       int cy = by + ((corner & 2) != 0 ? 1 : 0);\n\
+\x20       int cz = bz + ((corner & 4) != 0 ? 1 : 0);\n\
+\x20       float wx = cx >= int(volume_dims.x) ? 0.0\n\
+\x20           : ((corner & 1) != 0 ? fx : 1.0 - fx);\n\
+\x20       float wy = cy >= int(volume_dims.y) ? 0.0\n\
+\x20           : ((corner & 2) != 0 ? fy : 1.0 - fy);\n\
+\x20       float wz = cz >= cells_z ? 0.0\n\
+\x20           : ((corner & 4) != 0 ? fz : 1.0 - fz);\n\
+\x20       float weight = wx * wy * wz;\n\
+\x20       if (weight == 0.0) {\n\
+\x20           continue;\n\
+\x20       }\n\
+\x20       int clamped_x = min(cx, int(volume_dims.x) - 1);\n\
+\x20       int clamped_y = min(cy, int(volume_dims.y) - 1);\n\
+\x20       int clamped_z = min(cz, cells_z - 1);\n\
+\x20       float3 texel = float3(\n\
+\x20           float(clamped_x) + 0.5,\n\
+\x20           float(clamped_y) + 0.5,\n\
+\x20           float(clamped_z * 6 + face) + 0.5\n\
+\x20       ) / float3(volume_dims.x, volume_dims.y, volume_dims.z);\n\
+\x20       result += weight * volume_texture.Sample(\n\
+\x20           surface_sampler, texel).rgb;\n\
+\x20   }\n\
+\x20   return result;\n\
+}\n\
 PostGbufferOut psMain(GbufferVsOut input) {\n\
 \x20   PostGbufferOut output;\n\
 \x20   float3 normal = normalize(input.normal);\n\
@@ -367,6 +446,10 @@ PostGbufferOut psMain(GbufferVsOut input) {\n\
 \x20       float diffuse = max(dot(normal, to_light), 0.0);\n\
 \x20       colour += base * point_color_intensity[i].rgb\n\
 \x20           * point_color_intensity[i].a * attenuation * diffuse;\n\
+\x20   }\n\
+\x20   if (volume_params.z > 0.5) {\n\
+\x20       float3 indirect = volume_sample(input.world, normal);\n\
+\x20       colour += base * indirect * volume_params.y;\n\
 \x20   }\n\
 \x20   output.radiance = float4(colour, 1.0);\n\
 \x20   output.world = float4(input.world, 1.0);\n\

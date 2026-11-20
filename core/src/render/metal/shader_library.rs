@@ -406,9 +406,40 @@ struct PostGbufferOut
     float4 radiance [[color(0)]];
     float4 world [[color(1)]];
 };
+struct Volume
+{
+    float4 origin;
+    float4 dims;
+    float4 params;
+};
+// The light volume's face selection: the face the normal faces (the
+// same rule the CPU reference's face_for_normal carries — the six
+// axis directions' largest dot product).
+int volume_face(float3 normal)
+{
+    float3 directions[6];
+    directions[0] = float3(1.0, 0.0, 0.0);
+    directions[1] = float3(-1.0, 0.0, 0.0);
+    directions[2] = float3(0.0, 1.0, 0.0);
+    directions[3] = float3(0.0, -1.0, 0.0);
+    directions[4] = float3(0.0, 0.0, 1.0);
+    directions[5] = float3(0.0, 0.0, -1.0);
+    int best = 0;
+    float best_dot = -1e10;
+    for (int face = 0; face < 6; face++) {
+        float current = dot(normal, directions[face]);
+        if (current > best_dot) {
+            best_dot = current;
+            best = face;
+        }
+    }
+    return best;
+}
 fragment PostGbufferOut postGbufferFragmentMain(GbufferVertexOut in [[stage_in]],
                                                 constant Lights& lights [[buffer(1)]],
+                                                constant Volume& volume [[buffer(2)]],
                                                 texture2d<float> surface_texture [[texture(0)]],
+                                                texture3d<float> volume_texture [[texture(1)]],
                                                 sampler surface_sampler [[sampler(0)]])
 {
     PostGbufferOut out;
@@ -437,6 +468,61 @@ fragment PostGbufferOut postGbufferFragmentMain(GbufferVertexOut in [[stage_in]]
         float diffuse = max(dot(normal, to_light), 0.0);
         colour += base * lights.point_color_intensity[i].rgb
             * lights.point_color_intensity[i].a * attenuation * diffuse;
+    }
+    // The indirect light's term (M8): the volume's radiance shades the
+    // surface's albedo (the `albedo * irradiance` rule the direct
+    // lighting's diffuse carries) — the face the normal faces'
+    // trilinear sample, scaled by the config's indirect intensity.
+    if (volume.params.z > 0.5) {
+        int face = volume_face(normal);
+        int cells_z = int(volume.dims.z / 6.0);
+        float3 continuous = (in.world - volume.origin.xyz)
+            / volume.params.x - 0.5;
+        int base[3];
+        float fracs[3];
+        for (int axis = 0; axis < 3; axis++) {
+            float limit = axis == 0 ? volume.dims.x
+                : (axis == 1 ? volume.dims.y : float(cells_z));
+            if (continuous[axis] <= 0.0) {
+                base[axis] = 0;
+                fracs[axis] = 0.0;
+            } else if (continuous[axis] >= limit - 1.0) {
+                base[axis] = int(limit) - 1;
+                fracs[axis] = 0.0;
+            } else {
+                base[axis] = int(floor(continuous[axis]));
+                fracs[axis] = continuous[axis] - floor(continuous[axis]);
+            }
+        }
+        float3 result = float3(0.0);
+        for (int corner = 0; corner < 8; corner++) {
+            int cx = base.x + ((corner & 1) != 0 ? 1 : 0);
+            int cy = base.y + ((corner & 2) != 0 ? 1 : 0);
+            int cz = base.z + ((corner & 4) != 0 ? 1 : 0);
+            float wx = cx >= int(volume.dims.x) ? 0.0
+                : ((corner & 1) != 0 ? fracs.x : 1.0 - fracs.x);
+            float wy = cy >= int(volume.dims.y) ? 0.0
+                : ((corner & 2) != 0 ? fracs.y : 1.0 - fracs.y);
+            float wz = cz >= cells_z ? 0.0
+                : ((corner & 4) != 0 ? fracs.z : 1.0 - fracs.z);
+            float weight = wx * wy * wz;
+            if (weight == 0.0) {
+                continue;
+            }
+            int clamped_x = min(cx, int(volume.dims.x) - 1);
+            int clamped_y = min(cy, int(volume.dims.y) - 1);
+            int clamped_z = min(cz, cells_z - 1);
+            // The face the normal faces' layer: the depth layer
+            // `z * 6 + face` (the same pack the upload carries).
+            float3 texel = float3(
+                float(clamped_x) + 0.5,
+                float(clamped_y) + 0.5,
+                float(clamped_z * 6 + face) + 0.5
+            ) / float3(volume.dims.x, volume.dims.y, volume.dims.z);
+            result += weight * volume_texture.sample(
+                surface_sampler, texel).rgb;
+        }
+        colour += base * result * volume.params.y;
     }
     out.radiance = float4(colour, 1.0);
     out.world = float4(in.world, 1.0);

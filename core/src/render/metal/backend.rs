@@ -37,7 +37,7 @@ use super::mtl_loader::{
     MTLSMF_NEAREST, MTLSAM_CLAMP_TO_EDGE, MTLLA_LOAD,
     MTLIT_UINT32, MTLCF_LESS,
     MTLBLOPT_DEPTH_FROM_DEPTH_STENCIL, MTLBLOPT_STENCIL_FROM_DEPTH_STENCIL,
-    MTLCU_RENDER_TARGET, MTLCU_SHADER_READ,
+    MTLCU_SHADER_READ,
 };
 use super::super::{
     bytes_per_pixel, CameraParams, ClearBuffer, ClearColor,
@@ -45,10 +45,11 @@ use super::super::{
     PixelFormat, PostChainConfig, ReadbackSample, RenderBackend,
     RenderError, RenderTarget,
     RenderTargetDesc, RenderTargetInner, ShaderProgram, ShaderProgramInner,
-    Texture2DDesc, TextureView, TextureViewInner, VertexLayout,
+    Texture2DDesc, Texture3DDesc, TextureView, TextureViewInner, VertexLayout,
     DEPTH_ATTACHMENT,
 };
 use crate::math::{Mat4, Vec3};
+use crate::lightvolume::LightVolume;
 use std::os::raw::c_void;
 use std::sync::{Arc, Mutex};
 
@@ -263,6 +264,7 @@ pub struct MetalBackend {
     violations: u64,
     targets: Vec<MetalRenderTarget>,
     textures_2d: Vec<MetalTexture2D>,
+    textures_3d: Vec<MetalTexture2D>,
     next_mesh_id: usize,
     /// The generic mesh path's state: one slot per create_gpu_mesh, the
     /// mesh pipeline's resources and the default texture the draws fall
@@ -301,6 +303,9 @@ pub struct MetalBackend {
     post_composite_pipeline: super::mtl_loader::MtlRenderPipelineStateHandle,
     post_lights_buffer: *mut c_void,
     post_config_buffer: *mut c_void,
+    post_volume_buffer: *mut c_void,
+    light_volume: Option<MetalTexture2D>,
+    volume_uniform: [f32; 12],
     post_ready: bool,
     post_error: String,
     /// The default texture's index into `textures_2d` (the 1x1 white
@@ -388,6 +393,7 @@ impl MetalBackend {
             violations: 0,
             targets: Vec::new(),
             textures_2d: Vec::new(),
+            textures_3d: Vec::new(),
             next_mesh_id: 0,
             meshes: Vec::new(),
             mesh_resources: None,
@@ -407,6 +413,9 @@ impl MetalBackend {
             post_composite_pipeline: std::ptr::null_mut(),
             post_lights_buffer: std::ptr::null_mut(),
             post_config_buffer: std::ptr::null_mut(),
+            post_volume_buffer: std::ptr::null_mut(),
+            light_volume: None,
+            volume_uniform: [0.0; 12],
             post_ready: false,
             post_error: String::new(),
             default_texture: None,
@@ -490,6 +499,21 @@ impl MetalBackend {
         height: u32,
         format: super::mtl_loader::NsUInteger,
     ) -> Result<super::mtl_loader::MtlTextureHandle, RenderError> {
+        self.create_device_texture_3d(width, height, 1, format)
+    }
+
+    /// The 3D texture's creation path: the same descriptor the 2D path
+    /// builds, with the texture type set to the 3D type and the depth
+    /// carrying the volume's layers (the usage is the sampled-read one
+    /// the fill path's replaceRegion writes through; the 3D texture is
+    /// never a render target).
+    fn create_device_texture_3d(
+        &mut self,
+        width: u32,
+        height: u32,
+        depth: u32,
+        format: super::mtl_loader::NsUInteger,
+    ) -> Result<super::mtl_loader::MtlTextureHandle, RenderError> {
         let descriptor = unsafe {
             self.loader.alloc_init(self.loader.cls_mtl_texture_descriptor)
         };
@@ -511,6 +535,16 @@ impl MetalBackend {
             );
             self.loader.send_void_ul(
                 descriptor,
+                self.loader.sel("setDepth:"),
+                depth as super::mtl_loader::NsUInteger,
+            );
+            self.loader.send_void_ul(
+                descriptor,
+                self.loader.sel("setTextureType:"),
+                super::mtl_loader::MTLT_3D,
+            );
+            self.loader.send_void_ul(
+                descriptor,
                 self.loader.sel("setPixelFormat:"),
                 format,
             );
@@ -522,7 +556,7 @@ impl MetalBackend {
             self.loader.send_void_ul(
                 descriptor,
                 self.loader.sel("setUsage:"),
-                MTLCU_RENDER_TARGET | MTLCU_SHADER_READ,
+                MTLCU_SHADER_READ,
             );
         }
         let texture = unsafe {
@@ -1898,10 +1932,19 @@ impl MetalBackend {
                 "the post config buffer could not be allocated".to_string();
             return false;
         }
+        // The volume's shared buffer (one 48-byte block the geometry
+        // pass writes and the fragment stage's [[buffer(2)]] reads).
+        let volume_buffer = self.create_shared_buffer(&[0u8; 48]);
+        if volume_buffer.is_null() {
+            self.post_error =
+                "the post volume buffer could not be allocated".to_string();
+            return false;
+        }
         self.post_gbuffer_pipeline = gbuffer_pipeline;
         self.post_composite_pipeline = composite_pipeline;
         self.post_lights_buffer = lights_buffer;
         self.post_config_buffer = config_buffer;
+        self.post_volume_buffer = volume_buffer;
         self.post_ready = true;
         true
     }
@@ -3740,6 +3783,257 @@ impl RenderBackend for MetalBackend {
         Ok(false)
     }
 
+    fn create_texture_3d(
+        &mut self,
+        desc: &Texture3DDesc,
+    ) -> Result<TextureView, RenderError> {
+        if self.shutdown {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "create_texture_3d: the backend is shut down",
+            ));
+        }
+        desc.validate()?;
+        let texture = self.create_device_texture_3d(
+            desc.width,
+            desc.height,
+            desc.depth,
+            self.to_mtl_format(desc.format),
+        )?;
+        let view = MetalTexture2D {
+            inner: Arc::new(Mutex::new(TextureViewInner {
+                width: desc.width,
+                height: desc.height,
+                depth: desc.depth,
+                format: desc.format,
+                is_depth: false,
+                released: false,
+            })),
+            texture,
+            released: false,
+        };
+        let handle = TextureView {
+            inner: Arc::clone(&view.inner),
+        };
+        self.textures_3d.push(view);
+        Ok(handle)
+    }
+
+    fn release_texture_3d(&mut self, view: &TextureView) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        match self
+            .textures_3d
+            .iter_mut()
+            .find(|t| Arc::ptr_eq(&t.inner, &view.inner))
+        {
+            Some(t) => {
+                if t.released {
+                    self.violations += 1;
+                } else {
+                    t.released = true;
+                    view.inner.lock().unwrap().released = true;
+                }
+            }
+            None => {
+                self.violations += 1;
+            }
+        }
+    }
+
+    fn fill_texture_3d(
+        &mut self,
+        view: &TextureView,
+        data: &[u8],
+    ) -> Result<(), RenderError> {
+        if self.shutdown {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "fill_texture_3d: the backend is shut down",
+            ));
+        }
+        let index = self
+            .textures_3d
+            .iter()
+            .position(|t| Arc::ptr_eq(&t.inner, &view.inner))
+            .ok_or_else(|| {
+                RenderError::from(
+                    "fill_texture_3d: the texture is not owned by this \
+                     backend",
+                )
+            })?;
+        if self.textures_3d[index].released {
+            self.violations += 1;
+            return Err(RenderError::from(
+                "fill_texture_3d: the texture is released",
+            ));
+        }
+        let inner = view.inner.lock().unwrap();
+        let expected = (inner.width as usize)
+            * (inner.height as usize)
+            * (inner.depth as usize)
+            * bytes_per_pixel(inner.format) as usize;
+        let (width, height, depth, format) =
+            (inner.width, inner.height, inner.depth, inner.format);
+        drop(inner);
+        if data.len() != expected {
+            return Err(RenderError::from(format!(
+                "fill_texture_3d: expected {} bytes, got {}",
+                expected,
+                data.len()
+            )));
+        }
+        // The upload: the texture's replaceRegion call (the same CPU
+        // write path the 2D fill follows, with the region's depth
+        // carrying the volume's layers and the bytesPerImage covering
+        // one layer's slice — the MtlRegion and the
+        // replaceRegion:mipmapLevel:withBytes:bytesPerRow:bytesPerImage:
+        // selector the 3D upload takes).
+        let texture = self.textures_3d[index].texture;
+        let region = MtlRegion {
+            origin: MtlOrigin {
+                x: 0,
+                y: 0,
+                z: 0,
+            },
+            size: MtlSize {
+                width: width as super::mtl_loader::NsUInteger,
+                height: height as super::mtl_loader::NsUInteger,
+                depth: depth as super::mtl_loader::NsUInteger,
+            },
+        };
+        let bytes_per_row = width * bytes_per_pixel(format) as u32;
+        let bytes_per_image = bytes_per_row * height;
+        unsafe {
+            let f: unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                MtlRegion,
+                super::mtl_loader::NsUInteger,
+                *const c_void,
+                super::mtl_loader::NsUInteger,
+                super::mtl_loader::NsUInteger,
+            ) = std::mem::transmute(self.loader.objc_msg_send.unwrap());
+            f(
+                texture,
+                self.loader.sel(
+                    "replaceRegion:mipmapLevel:withBytes:bytesPerRow:\
+                     bytesPerImage:",
+                ),
+                region,
+                0,
+                data.as_ptr() as *const c_void,
+                bytes_per_row as super::mtl_loader::NsUInteger,
+                bytes_per_image as super::mtl_loader::NsUInteger,
+            );
+        }
+        Ok(())
+    }
+
+    fn read_texture_3d(
+        &mut self,
+        view: &TextureView,
+        data: &mut [u8],
+    ) -> Result<bool, RenderError> {
+        let index = self
+            .textures_3d
+            .iter()
+            .position(|t| Arc::ptr_eq(&t.inner, &view.inner));
+        let index = match index {
+            Some(index) => index,
+            None => {
+                return Err(RenderError::from(
+                    "read_texture_3d: the texture is not owned by this \
+                     backend",
+                ));
+            }
+        };
+        if self.textures_3d[index].released {
+            return Ok(false);
+        }
+        let inner = view.inner.lock().unwrap();
+        let expected = (inner.width as usize)
+            * (inner.height as usize)
+            * (inner.depth as usize)
+            * bytes_per_pixel(inner.format) as usize;
+        drop(inner);
+        if data.len() != expected {
+            return Err(RenderError::from(format!(
+                "read_texture_3d: expected {} bytes, got {}",
+                expected,
+                data.len()
+            )));
+        }
+        // The readback is validation-only for now (the same rule the
+        // 2D path records).
+        Ok(false)
+    }
+
+    fn set_light_volume(&mut self, volume: &LightVolume) {
+        if self.shutdown {
+            self.violations += 1;
+            return;
+        }
+        // The volume's 3D texture: the same Rgba16F path the standalone
+        // 3D textures carry (the dims z * 6 layers, the face `f` of the
+        // cell `(x, y, z)` at the layer `z * 6 + f`).
+        let desc = Texture3DDesc {
+            width: volume.dims[0],
+            height: volume.dims[1],
+            depth: volume.dims[2] * 6,
+            format: PixelFormat::Rgba16F,
+        };
+        let view = match self.create_texture_3d(&desc) {
+            Ok(view) => view,
+            Err(_) => {
+                self.violations += 1;
+                return;
+            }
+        };
+        let packed = volume.pack_texture_3d();
+        if self.fill_texture_3d(&view, &packed).is_err() {
+            self.violations += 1;
+            return;
+        }
+        // The uniform block's values: the origin, the dims (the depth
+        // carrying the z * 6 layers) and the cell size (the indirect
+        // intensity and the toggle the submit writes).
+        self.volume_uniform = [
+            volume.origin[0],
+            volume.origin[1],
+            volume.origin[2],
+            0.0,
+            volume.dims[0] as f32,
+            volume.dims[1] as f32,
+            (volume.dims[2] * 6) as f32,
+            0.0,
+            volume.cell_size,
+            0.0,
+            0.0,
+            0.0,
+        ];
+        // The old volume's texture releases (the one-volume rule the
+        // contract's set_light_volume carries).
+        if let Some(old) = self.light_volume.take() {
+            let handle = TextureView {
+                inner: old.inner.clone(),
+            };
+            self.release_texture_3d(&handle);
+        }
+        let index = self
+            .textures_3d
+            .iter()
+            .position(|t| Arc::ptr_eq(&t.inner, &view.inner))
+            .unwrap_or(self.textures_3d.len());
+        self.light_volume = Some(MetalTexture2D {
+            inner: view.inner,
+            texture: self.textures_3d[index].texture,
+            released: false,
+        });
+    }
+
     fn set_camera(&mut self, camera: CameraParams) {
         if self.shutdown {
             self.violations += 1;
@@ -4259,6 +4553,40 @@ impl RenderBackend for MetalBackend {
                 }
             }
         }
+        // The volume's block: the origin, the dims, the cell size, the
+        // indirect intensity and the toggle the fragment stage's
+        // [[buffer(2)]] reads (the 48-byte std140 block).
+        let volume_block: [f32; 12] = [
+            self.volume_uniform[0],
+            self.volume_uniform[1],
+            self.volume_uniform[2],
+            0.0,
+            self.volume_uniform[4],
+            self.volume_uniform[5],
+            self.volume_uniform[6],
+            0.0,
+            self.volume_uniform[8],
+            config.indirect_intensity,
+            if config.indirect_light { 1.0f32 } else { 0.0 },
+            0.0,
+        ];
+        if !self.post_volume_buffer.is_null() {
+            let contents = unsafe {
+                self.loader.send0(
+                    self.post_volume_buffer,
+                    self.loader.sel("contents"),
+                )
+            };
+            if !contents.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        volume_block.as_ptr() as *const u8,
+                        contents as *mut u8,
+                        volume_block.len() * 4,
+                    );
+                }
+            }
+        }
         // The camera block: the view-projection matrix from the
         // set_camera state and the model matrix the submission carries
         // (the same bytes the mesh path's uniform buffer carries).
@@ -4317,6 +4645,12 @@ impl RenderBackend for MetalBackend {
         let post_composite_pipeline = self.post_composite_pipeline;
         let post_lights_buffer = self.post_lights_buffer;
         let post_config_buffer = self.post_config_buffer;
+        let post_volume_buffer = self.post_volume_buffer;
+        let volume_texture = self
+            .light_volume
+            .as_ref()
+            .map(|t| t.texture)
+            .unwrap_or(std::ptr::null_mut());
         let hdr_views: Vec<_> = {
             let target = &self.targets[target_index];
             let views: Vec<_> = target
@@ -4338,6 +4672,12 @@ impl RenderBackend for MetalBackend {
         // zero — the alpha 0 marks the background).
         let pass_descriptor = self.hdr_pass_descriptor(target_index);
         if pass_descriptor.is_null() {
+            return;
+        }
+        // The volume's toggle with no volume set: the protocol
+        // violation the contract's set_light_volume rule carries.
+        if config.indirect_light && volume_texture.is_null() {
+            self.violations += 1;
             return;
         }
         let encoder = unsafe {
@@ -4391,6 +4731,15 @@ impl RenderBackend for MetalBackend {
                 0,
                 1,
             );
+            // The volume's block at the fragment stage's buffer index 2
+            // (the post geometry fragment shader's `buffer(2)` qualifier).
+            self.loader.send_void_ptr_ul2(
+                encoder,
+                self.loader.sel("setFragmentBuffer:offset:atIndex:"),
+                post_volume_buffer,
+                0,
+                2,
+            );
             // The bound texture and the sampler at the fragment stage's
             // slot 0 (the post geometry fragment shader's `texture(0)` and
             // `sampler(0)` qualifiers).
@@ -4405,6 +4754,14 @@ impl RenderBackend for MetalBackend {
                 self.loader.sel("setFragmentSamplerState:atIndex:"),
                 sampler,
                 0,
+            );
+            // The volume's 3D texture at the fragment stage's slot 1 (the
+            // post geometry fragment shader's `texture(1)` qualifier).
+            self.loader.send_void_ptr_ul(
+                encoder,
+                self.loader.sel("setFragmentTexture:atIndex:"),
+                volume_texture,
+                1,
             );
             // The indexed draw: the same call the mesh path carries.
             self.loader.send_void_ul3_ptr_ul(

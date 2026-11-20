@@ -297,11 +297,100 @@ layout(set = 0, binding = 1, std140) uniform Lights
     vec4 params;
 };
 layout(set = 0, binding = 2) uniform sampler2D surface_texture;
+layout(set = 0, binding = 3, std140) uniform Volume
+{
+    vec4 volume_origin; // xyz + pad
+    vec4 volume_dims; // x, y, z * 6 (the depth layers), pad
+    vec4 volume_params; // x = the cell size, y = the indirect intensity, z = the toggle
+};
+layout(set = 0, binding = 4) uniform sampler3D volume_texture;
 layout(location = 0) in vec3 v_normal;
 layout(location = 1) in vec2 v_uv;
 layout(location = 2) in vec3 v_world;
 layout(location = 0) out vec4 outRadiance;
 layout(location = 1) out vec4 outWorld;
+// The light volume's face selection: the face the normal faces (the
+// same rule the CPU reference's face_for_normal carries — the six
+// axis directions' largest dot product).
+int volume_face(vec3 normal)
+{
+    vec3 directions[6];
+    directions[0] = vec3(1.0, 0.0, 0.0);
+    directions[1] = vec3(-1.0, 0.0, 0.0);
+    directions[2] = vec3(0.0, 1.0, 0.0);
+    directions[3] = vec3(0.0, -1.0, 0.0);
+    directions[4] = vec3(0.0, 0.0, 1.0);
+    directions[5] = vec3(0.0, 0.0, -1.0);
+    int best = 0;
+    float best_dot = -1e10;
+    for (int face = 0; face < 6; face++) {
+        float current = dot(normal, directions[face]);
+        if (current > best_dot) {
+            best_dot = current;
+            best = face;
+        }
+    }
+    return best;
+}
+// The light volume's trilinear sample: the face the normal faces'
+// radiance, interpolated between the 8 surrounding cells. The fetches
+// land on the texels' centres (the sampler's NEAREST keeps each fetch
+// exact) and the weights the CPU reference's sample carries; the
+// position clamps into the grid (a position outside returns the
+// border cell's radiance).
+vec3 volume_sample(vec3 position, vec3 normal)
+{
+    int face = volume_face(normal);
+    int cells_z = int(volume_dims.z / 6.0);
+    vec3 continuous = (position - volume_origin.xyz) / volume_params.x - 0.5;
+    ivec3 base = ivec3(0);
+    vec3 frac = vec3(0.0);
+    for (int axis = 0; axis < 3; axis++) {
+        if (continuous[axis] <= 0.0) {
+            base[axis] = 0;
+            frac[axis] = 0.0;
+        } else if (continuous[axis] >= (axis == 0 ? volume_dims.x :
+            (axis == 1 ? volume_dims.y : cells_z)) - 1.0) {
+            base[axis] = int(axis == 0 ? volume_dims.x :
+                (axis == 1 ? volume_dims.y : cells_z)) - 1;
+            frac[axis] = 0.0;
+        } else {
+            base[axis] = int(floor(continuous[axis]));
+            frac[axis] = continuous[axis] - floor(continuous[axis]);
+        }
+    }
+    vec3 result = vec3(0.0);
+    for (int corner = 0; corner < 8; corner++) {
+        int cx = base.x + ((corner & 1) != 0 ? 1 : 0);
+        int cy = base.y + ((corner & 2) != 0 ? 1 : 0);
+        int cz = base.z + ((corner & 4) != 0 ? 1 : 0);
+        float wx = cx >= int(volume_dims.x) ? 0.0
+            : ((corner & 1) != 0 ? frac.x : 1.0 - frac.x);
+        float wy = cy >= int(volume_dims.y) ? 0.0
+            : ((corner & 2) != 0 ? frac.y : 1.0 - frac.y);
+        float wz = cz >= cells_z ? 0.0
+            : ((corner & 4) != 0 ? frac.z : 1.0 - frac.z);
+        float weight = wx * wy * wz;
+        if (weight == 0.0) {
+            continue;
+        }
+        int clamped_x = min(cx, int(volume_dims.x) - 1);
+        int clamped_y = min(cy, int(volume_dims.y) - 1);
+        int clamped_z = min(cz, cells_z - 1);
+        vec3 texel = vec3(
+            float(clamped_x) + 0.5,
+            float(clamped_y) + 0.5,
+            float(clamped_z * 6 + face) + 0.5
+        ) / vec3(volume_dims.x, volume_dims.y, volume_dims.z);
+        // The explicit LOD (the same rule the GLSL's textureLod carries):
+        // the loop's control flow depends on the fragment's position (the
+        // non-uniform branches), so the implicit-derivative sampling would
+        // be undefined behaviour — the explicit level keeps the fetch
+        // defined.
+        result += weight * textureLod(volume_texture, texel, 0.0).rgb;
+    }
+    return result;
+}
 void main()
 {
     vec3 base = texture(surface_texture, v_uv).rgb;
@@ -326,6 +415,13 @@ void main()
         float diffuse = max(dot(normal, to_light), 0.0);
         colour += base * point_color_intensity[i].rgb
             * point_color_intensity[i].a * attenuation * diffuse;
+    }
+    // The indirect light's term (M8): the volume's radiance shades the
+    // surface's albedo (the same `albedo * irradiance` rule the direct
+    // lighting's diffuse carries) — the face the normal faces'
+    // radiance, scaled by the config's indirect intensity.
+    if (volume_params.z > 0.5) {
+        colour += base * volume_sample(v_world, normal) * volume_params.y;
     }
     outRadiance = vec4(colour, 1.0);
     outWorld = vec4(v_world, 1.0);

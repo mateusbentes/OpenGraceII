@@ -28,11 +28,12 @@
 //! texture are separate subresources, so the readback copies each plane
 //! with its own CopyTextureRegion call (the same one-plane-per-copy rule
 //! the VUID 09103 fix records on the Vulkan side); the depth plane reads
-//! as one 32-bit word per pixel with the depth in the top three bytes,
-//! the stencil plane reads as one byte per texel with its own 256-byte
-//! row pitch; the second frame's barriers bring the resources back from
-//! COPY_SOURCE into the render states before the clears (the two-frame
-//! probe validated that path).
+//! as one 32-bit word per pixel with the depth in the low 24 bits (the
+//! planar staging rule's R32_TYPELESS family), the stencil plane reads
+//! one byte per texel with its own 256-byte-aligned row pitch (the
+//! planar staging rule's R8_TYPELESS family); the second frame's
+//! barriers bring the resources back from COPY_SOURCE into the render
+//! states before the clears (the two-frame probe validated that path).
 //!
 //! Validation scope: the module compiles on any platform (the loader
 //! declares its own types, so no Windows SDK is needed) and the hardware
@@ -89,6 +90,7 @@ use super::d3d12_loader::{
     IID_ID3D12_COMMAND_ALLOCATOR_WORDS, IID_ID3D12_COMMAND_QUEUE_WORDS,
     IID_ID3D12_DESCRIPTOR_HEAP_WORDS, IID_ID3D12_DEVICE_WORDS, IID_ID3D12_FENCE_WORDS,
     IID_ID3D12_GRAPHICS_COMMAND_LIST_WORDS, IID_ID3D12_PIPELINE_STATE_WORDS,
+    IID_ID3D12_DEBUG_WORDS, IID_ID3D12_INFO_QUEUE_WORDS,
     IID_ID3D12_RESOURCE_WORDS, IID_ID3D12_ROOT_SIGNATURE_WORDS, IID_IDXGI_FACTORY1_WORDS,
     IID_IDXGI_ADAPTER1_WORDS, IID_IDXGI_FACTORY4_WORDS,
 };
@@ -118,6 +120,23 @@ const DEVICE_CREATE_SHADER_RESOURCE_VIEW: usize = 18;
 const DEVICE_GET_DESCRIPTOR_HANDLE_INCREMENT_SIZE: usize = 15;
 const DEVICE_CREATE_COMMITTED_RESOURCE: usize = 27;
 const DEVICE_CREATE_FENCE: usize = 36;
+// The fix10's diagnostic: the device's GetDeviceRemovedReason (the
+// vtable's slot 37, directly after the CreateFence 36: the IUnknown's
+// 0-2, the ID3D12Object's 3-6, the GetNodeCount 7, the CreateCommandQueue
+// 8, the CreateCommandAllocator 9, the CreateGraphicsPipelineState 10,
+// the CreateComputePipelineState 11, the CreateCommandList 12, the
+// CheckFeatureSupport 13, the CreateDescriptorHeap 14, the
+// GetDescriptorHandleIncrementSize 15, the CreateRootSignature 16, the
+// CreateConstantBufferView 17, the CreateShaderResourceView 18, the
+// CreateUnorderedAccessView 19, the CreateRenderTargetView 20, the
+// CreateDepthStencilView 21, the CreateSampler 22, the CopyDescriptors 23,
+// the CopyDescriptorsSimple 24, the GetResourceAllocationInfo 25, the
+// GetCustomHeapProperties 26, the CreateCommittedResource 27, the
+// CreateHeap 28, the CreatePlacedResource 29, the CreateReservedResource
+// 30, the CreateSharedHandle 31, the OpenSharedHandle 32, the
+// OpenSharedHandleByName 33, the MakeResident 34, the Evict 35, the
+// CreateFence 36, the GetDeviceRemovedReason 37).
+const DEVICE_GET_DEVICE_REMOVED_REASON: usize = 37;
 // ID3D12CommandQueue.
 const QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
 const QUEUE_SIGNAL: usize = 14;
@@ -148,6 +167,7 @@ const RESOURCE_MAP: usize = 8;
 const RESOURCE_UNMAP: usize = 9;
 const RESOURCE_GET_GPU_VIRTUAL_ADDRESS: usize = 11;
 // ID3D12Fence.
+const FENCE_GET_COMPLETED_VALUE: usize = 8;
 const FENCE_SET_EVENT_ON_COMPLETION: usize = 9;
 // ID3D12DescriptorHeap.
 const HEAP_GET_CPU_DESCRIPTOR_HANDLE: usize = 9;
@@ -176,7 +196,8 @@ const BLOB_GET_BUFFER_SIZE: usize = 4;
 const STAGING_COLOUR_BYTES: usize = 320 * 240 * 4;
 /// The depth plane's words (one 32-bit word per pixel).
 const STAGING_DEPTH_BYTES: usize = 320 * 240 * 4;
-/// The stencil plane's row pitch (256 * ceil(width / 256) = 512 for the
+/// The stencil plane's row pitch (one byte per texel, the same
+/// 256-byte alignment: 256 * ceil(width / 256) = 512 for the
 /// 320-wide frame).
 const STAGING_STENCIL_PITCH: usize = 256 * ((320 + 255) / 256);
 /// The stencil plane's bytes (240 rows of the 256-byte pitch).
@@ -658,6 +679,98 @@ unsafe fn self_create_device(
     Ok(device)
 }
 
+/// Enables the debug layer before the device creation (the ID3D12Debug's
+/// EnableDebugLayer, the vtable's slot 3 after the IUnknown's 0-2): the
+/// real driver's validation then records every invalid call into the
+/// InfoQueue. The entry point is optional (the Wine's vkd3d may not
+/// export it; the diagnostics degrade gracefully).
+pub(crate) unsafe fn self_enable_debug_layer(loader: &D3d12Loader) {
+    let get_debug = match loader.d3d12_get_debug_interface {
+        Some(f) => f,
+        None => {
+            // The fix11's diagnostic: the debug layer's absence (the
+            // InfoQueue then carries nothing — the invalid call's naming
+            // depends on the layer's presence).
+            eprintln!(
+                "d3d12: the debug layer's entry point is absent (the \
+                 InfoQueue's dump carries nothing)"
+            );
+            return;
+        }
+    };
+    let mut debug: *mut c_void = std::ptr::null_mut();
+    let hr = get_debug(
+        IID_ID3D12_DEBUG_WORDS.as_ptr() as *const u32,
+        &mut debug,
+    );
+    if hr != S_OK || debug.is_null() {
+        eprintln!(
+            "d3d12: the debug layer's GetDebugInterface failed (hr=0x{:08x})",
+            hr
+        );
+        return;
+    }
+    eprintln!("d3d12: the debug layer is enabled");
+    call_slot_i32_0(debug as ComObject, 3);
+}
+
+/// Dumps the debug layer's message queue to stderr: the hardware run's
+/// diagnostic path — the real driver names the invalid call (the
+/// same D3D12GetDebugInterface entry point with the InfoQueue's IID
+/// returns the ID3D12InfoQueue; the GetMessage slot 5 carries the text).
+pub(crate) unsafe fn self_dump_debug_messages(loader: &D3d12Loader) {
+    let get_debug = match loader.d3d12_get_debug_interface {
+        Some(f) => f,
+        None => return,
+    };
+    let mut info_queue: *mut c_void = std::ptr::null_mut();
+    let hr = get_debug(
+        IID_ID3D12_INFO_QUEUE_WORDS.as_ptr() as *const u32,
+        &mut info_queue as *mut *mut c_void,
+    );
+    if hr != S_OK || info_queue.is_null() {
+        return;
+    }
+    // The GetNumStoredMessages slot 8 counts the queue (the IUnknown's
+    // 0-2, the SetMessageCountLimit 3, the ClearStoredMessages 4, the
+    // GetMessage 5, the GetNumMessagesAllowedByStorageFilter 6, the
+    // GetNumMessagesDeniedByStorageFilter 7, the GetNumStoredMessages 8).
+    let count = call_slot_u64_0(info_queue as ComObject, 8);
+    for index in 0..count.min(64) {
+        // The GetMessage call with a null message returns the length;
+        // the second call with the buffer carries the text (the
+        // D3D12_MESSAGE struct's pDescription at its fourth word).
+        let mut message: *mut c_void = std::ptr::null_mut();
+        let mut length: u64 = 0;
+        let hr = call_slot_i32_3(
+            info_queue as ComObject,
+            5,
+            index as *mut c_void,
+            &mut message as *mut *mut c_void as *mut c_void,
+            &mut length as *mut u64 as *mut c_void,
+        );
+        if hr != S_OK {
+            continue;
+        }
+        let mut buffer = vec![0u8; length as usize];
+        let hr = call_slot_i32_3(
+            info_queue as ComObject,
+            5,
+            index as *mut c_void,
+            &mut message as *mut *mut c_void as *mut c_void,
+            buffer.as_mut_ptr() as *mut c_void,
+        );
+        if hr != S_OK {
+            continue;
+        }
+        let p_desc = *std::mem::transmute::<*mut c_void, *mut *const c_char>(message);
+        let text = unsafe {
+            std::ffi::CStr::from_ptr(p_desc)
+        };
+        eprintln!("d3d12-debug: {}", text.to_string_lossy());
+    }
+}
+
 /// Reads the device's highest supported feature level (the
 /// CheckFeatureSupport slot 13, the FEATURE levels query): the
 /// describe() report's feature level.
@@ -1136,7 +1249,11 @@ impl D3d12Backend {
         // describe() report. The machine without a D3D12-capable GPU
         // falls back to the WARP adapter: the Microsoft Basic Render
         // Driver's own software rasterizer, the D3D12 runtime's
-        // guaranteed path.
+        // guaranteed path. The debug layer enables before the device
+        // creation when the runtime exports the entry point: the real
+        // driver's validation then records every invalid call into the
+        // InfoQueue the diagnostics dump.
+        unsafe { self_enable_debug_layer(&loader) };
         let factory = unsafe { self_create_factory(&loader)? };
         let (_adapter, adapter_desc, adapter_vendor, device) = {
             let (adapter, adapter_desc, adapter_vendor) =
@@ -3770,6 +3887,14 @@ impl D3d12Backend {
     /// mapped staging buffer carries the pixel.
     fn readback_pixel(&mut self, x: u32, y: u32) {
         if self.color_texture.is_null() || self.depth_texture.is_null() {
+            // The fix9 diagnostic: the silent exit the Windows run's
+            // zero-sample failure hides.
+            eprintln!(
+                "d3d12: readback silent exit: the frame's textures are \
+                 not created (colour null: {}, depth null: {})",
+                self.color_texture.is_null(),
+                self.depth_texture.is_null()
+            );
             return;
         }
         // The readback's copies need an open command list: a previous
@@ -3778,6 +3903,11 @@ impl D3d12Backend {
         if !self.frame_open {
             let hr = unsafe { call_slot_i32_0(self.allocator as ComObject, ALLOCATOR_RESET) };
             if hr != S_OK {
+                eprintln!(
+                    "d3d12: readback silent exit: the allocator's reset \
+                     failed (hr=0x{:08x})",
+                    hr
+                );
                 return;
             }
             let hr = unsafe {
@@ -3789,6 +3919,11 @@ impl D3d12Backend {
                 )
             };
             if hr != S_OK {
+                eprintln!(
+                    "d3d12: readback silent exit: the command list's \
+                     reset failed (hr=0x{:08x})",
+                    hr
+                );
                 return;
             }
         }
@@ -3801,27 +3936,39 @@ impl D3d12Backend {
                 width: self.config.width,
                 height: self.config.height,
                 depth: 1,
-                row_pitch: colour_pitch,
+                row_pitch: colour_pitch as u64,
             },
         };
         let depth_footprint = D3d12PlacedFootprint {
             offset: STAGING_COLOUR_BYTES as u64,
             footprint: D3d12SubresourceFootprint {
+                // The planar depth-stencil staging rule (the spec's
+                // Planar Depth Stencil): the depth plane's placed texture
+                // data uses a format from the R32_TYPELESS family (one
+                // 32-bit element per pixel, the depth in the low 24
+                // bits); the SRV-family formats are not the staging
+                // formats and the real driver rejects the copy.
                 format: DXGI_FORMAT_R32_FLOAT,
                 width: self.config.width,
                 height: self.config.height,
                 depth: 1,
-                row_pitch: colour_pitch,
+                row_pitch: colour_pitch as u64,
             },
         };
         let stencil_footprint = D3d12PlacedFootprint {
             offset: STAGING_STENCIL_OFFSET as u64,
             footprint: D3d12SubresourceFootprint {
+                // The stencil plane's copy family (the same typeless
+                // group; the X24_TYPELESS_G8_UINT's words carry the
+                // stencil in the top byte).
+                // The planar depth-stencil staging rule: the stencil
+                // plane's placed texture data uses a format from the
+                // R8_TYPELESS family (one byte per texel).
                 format: DXGI_FORMAT_R8_UINT,
                 width: self.config.width,
                 height: self.config.height,
                 depth: 1,
-                row_pitch: stencil_pitch,
+                row_pitch: stencil_pitch as u64,
             },
         };
         let colour_dst = D3d12TextureCopyLocation {
@@ -3899,56 +4046,80 @@ impl D3d12Backend {
             flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
             transition: D3d12ResourceTransitionBarrier {
                 resource: self.depth_texture,
-                subresource: 0,
+                // Both planes move: the depth copy reads subresource 0
+                // and the stencil copy reads subresource 1, so the
+                // D24S8's state tracking must cover the whole resource
+                // (the real driver rejects a transition that leaves the
+                // stencil plane in DEPTH_WRITE while the copy reads it).
+                subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                 state_before: D3D12_RESOURCE_STATE_DEPTH_WRITE,
                 state_after: D3D12_RESOURCE_STATE_COPY_SOURCE,
             },
         };
+        // The bisect stages (the honest sequence): the OG2_M9_BISECT env
+        // var picks the recorded prefix — 0 nothing, 1 the colour
+        // barrier, 2 the colour copy, 3 the depth barrier, 4 the depth
+        // copy, 5 the stencil copy (the full path). The first stage whose
+        // Close fails names the offending call.
+        let bisect = std::env::var("OG2_M9_BISECT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(5);
         unsafe {
-            call_slot_i32_3(
-                self.command_list as ComObject,
-                COMMAND_LIST_RESOURCE_BARRIER,
-                1 as *mut c_void,
-                &colour_barrier as *const D3d12ResourceBarrier as *mut c_void,
-                std::ptr::null_mut(),
-            );
-            call_slot_i32_6(
-                self.command_list as ComObject,
-                COMMAND_LIST_COPY_TEXTURE_REGION,
-                &colour_dst as *const D3d12TextureCopyLocation as *mut c_void,
-                0 as *mut c_void,
-                0 as *mut c_void,
-                0 as *mut c_void,
-                &colour_src as *const D3d12TextureCopyLocation as *mut c_void,
-                std::ptr::null_mut(),
-            );
-            call_slot_i32_3(
-                self.command_list as ComObject,
-                COMMAND_LIST_RESOURCE_BARRIER,
-                1 as *mut c_void,
-                &depth_barrier as *const D3d12ResourceBarrier as *mut c_void,
-                std::ptr::null_mut(),
-            );
-            call_slot_i32_6(
-                self.command_list as ComObject,
-                COMMAND_LIST_COPY_TEXTURE_REGION,
-                &depth_dst as *const D3d12TextureCopyLocation as *mut c_void,
-                0 as *mut c_void,
-                0 as *mut c_void,
-                0 as *mut c_void,
-                &depth_src as *const D3d12TextureCopyLocation as *mut c_void,
-                std::ptr::null_mut(),
-            );
-            call_slot_i32_6(
-                self.command_list as ComObject,
-                COMMAND_LIST_COPY_TEXTURE_REGION,
-                &stencil_dst as *const D3d12TextureCopyLocation as *mut c_void,
-                0 as *mut c_void,
-                0 as *mut c_void,
-                0 as *mut c_void,
-                &stencil_src as *const D3d12TextureCopyLocation as *mut c_void,
-                std::ptr::null_mut(),
-            );
+            if bisect >= 1 {
+                call_slot_i32_3(
+                    self.command_list as ComObject,
+                    COMMAND_LIST_RESOURCE_BARRIER,
+                    1 as *mut c_void,
+                    &colour_barrier as *const D3d12ResourceBarrier as *mut c_void,
+                    std::ptr::null_mut(),
+                );
+            }
+            if bisect >= 2 {
+                call_slot_i32_6(
+                    self.command_list as ComObject,
+                    COMMAND_LIST_COPY_TEXTURE_REGION,
+                    &colour_dst as *const D3d12TextureCopyLocation as *mut c_void,
+                    0 as *mut c_void,
+                    0 as *mut c_void,
+                    0 as *mut c_void,
+                    &colour_src as *const D3d12TextureCopyLocation as *mut c_void,
+                    std::ptr::null_mut(),
+                );
+            }
+            if bisect >= 3 {
+                call_slot_i32_3(
+                    self.command_list as ComObject,
+                    COMMAND_LIST_RESOURCE_BARRIER,
+                    1 as *mut c_void,
+                    &depth_barrier as *const D3d12ResourceBarrier as *mut c_void,
+                    std::ptr::null_mut(),
+                );
+            }
+            if bisect >= 4 {
+                call_slot_i32_6(
+                    self.command_list as ComObject,
+                    COMMAND_LIST_COPY_TEXTURE_REGION,
+                    &depth_dst as *const D3d12TextureCopyLocation as *mut c_void,
+                    0 as *mut c_void,
+                    0 as *mut c_void,
+                    0 as *mut c_void,
+                    &depth_src as *const D3d12TextureCopyLocation as *mut c_void,
+                    std::ptr::null_mut(),
+                );
+            }
+            if bisect >= 5 {
+                call_slot_i32_6(
+                    self.command_list as ComObject,
+                    COMMAND_LIST_COPY_TEXTURE_REGION,
+                    &stencil_dst as *const D3d12TextureCopyLocation as *mut c_void,
+                    0 as *mut c_void,
+                    0 as *mut c_void,
+                    0 as *mut c_void,
+                    &stencil_src as *const D3d12TextureCopyLocation as *mut c_void,
+                    std::ptr::null_mut(),
+                );
+            }
         }
         // The copies left both resources in COPY_SOURCE: the next
         // clear_frame's return barriers bring them back (the probe C's
@@ -3961,11 +4132,28 @@ impl D3d12Backend {
         // The frame executes: the Close, the ExecuteCommandLists, the
         // queue's Signal and the wait (the GPU-side completion is what
         // the wait sees).
+        eprintln!("d3d12: bisect stage {} recording the readback's copies", bisect);
         let hr = unsafe { call_slot_i32_0(self.command_list as ComObject, COMMAND_LIST_CLOSE) };
         if hr != S_OK {
+            // The hardware run's diagnostic path: the real driver names
+            // the invalid call into the debug layer's message queue.
+            eprintln!("d3d12: bisect stage {} close failed (hr=0x{:08x})", bisect, hr);
+            unsafe { self_dump_debug_messages(&self.loader) };
             return;
         }
         let lists = [self.command_list];
+        // The fix9 diagnostic: the fence wait's own report — the fence's
+        // completed value (the GetCompletedValue slot 8) before and after
+        // the wait, and a zero-timeout probe after the wait (WAIT_OBJECT_0
+        // = 0 the still-signalled event, WAIT_TIMEOUT = 258 the cleared
+        // auto-reset event). A wait that returns immediately with the
+        // completed value below the target names the race: the event set
+        // while the fence never reached the value, or the event stuck
+        // signalled from a previous wait.
+        let completed_before = unsafe {
+            call_slot_u64_0(self.fence as ComObject, FENCE_GET_COMPLETED_VALUE)
+        };
+        let wait_returned;
         unsafe {
             call_slot_i32_3(
                 self.queue as ComObject,
@@ -3995,8 +4183,37 @@ impl D3d12Backend {
                 .expect("the loader resolved WaitForSingleObject")(
                 self.fence_event, 5000
             );
+            wait_returned = self
+                .loader
+                .wait_for_single_object
+                .expect("the loader resolved WaitForSingleObject")(
+                self.fence_event, 0
+            );
         }
+        eprintln!(
+            "d3d12: readback wait returned 0x{:x} (0x0 WAIT_OBJECT_0, 0x102 \
+             WAIT_TIMEOUT, 0x1 WAIT_ABANDONED)",
+            wait_returned
+        );
         // The mapped staging buffer carries the three planes.
+        let completed_after = unsafe {
+            call_slot_u64_0(self.fence as ComObject, FENCE_GET_COMPLETED_VALUE)
+        };
+        let wait_probe = unsafe {
+            self.loader
+                .wait_for_single_object
+                .expect("the loader resolved WaitForSingleObject")(
+                self.fence_event, 0
+            )
+        };
+        eprintln!(
+            "d3d12: readback fence target {} completed before {} after {} \
+             (event probe 0ms: 0x{:x})",
+            self.fence_value,
+            completed_before,
+            completed_after,
+            wait_probe
+        );
         let mut map: *mut c_void = std::ptr::null_mut();
         let mapped = unsafe {
             call_slot_i32_4(
@@ -4012,6 +4229,20 @@ impl D3d12Backend {
             )
         };
         if mapped != S_OK || map.is_null() {
+            eprintln!(
+                "d3d12: readback silent exit: the staging buffer's map \
+                 failed (hr=0x{:08x}, map null: {})",
+                mapped, map.is_null()
+            );
+            // The fix10's diagnostic: the device's removed reason (the
+            // GetDeviceRemovedReason slot 37) names the GPU-side cause
+            // when the device is removed (the 0x887a0005 the fix9's run
+            // carried).
+            let removed = unsafe {
+                call_slot_i32_0(self.device as ComObject, DEVICE_GET_DEVICE_REMOVED_REASON)
+            };
+            eprintln!("d3d12: device removed reason (hr=0x{:08x})", removed);
+            unsafe { self_dump_debug_messages(&self.loader) };
             return;
         }
         let map = map as *mut u8;
@@ -4033,9 +4264,56 @@ impl D3d12Backend {
             *words.add(cy * row_words + cx)
         };
         let depth = (depth_word & 0x00ff_ffff) as f32 / 16_777_215.0;
+        // The fix9 diagnostic: the raw words the three planes carry at
+        // the sample's address (the corruption hunt — the word values
+        // name which plane actually holds the colour data: the staging
+        // copy's landed address).
+        let raw_colour = unsafe {
+            let words = map as *const u32;
+            let row_words = colour_pitch as usize / 4;
+            *words.add(cy * row_words + cx)
+        };
+        let raw_depth = depth_word;
+        let raw_stencil = unsafe {
+            let bytes = map.add(STAGING_STENCIL_OFFSET);
+            let row = bytes.add(cy * stencil_pitch as usize);
+            *row.add(cx)
+        };
+        // The fix9's two-address probe: the depth plane's words at the
+        // sample's address AND at the corner (4,4) — the depth copy copies
+        // the whole texture, so the corner's word names the copy's actual
+        // source (the depth texture's 0x00ffffff, or the colour texture's
+        // converted 0x00000000).
+        let corner_depth = unsafe {
+            let words = map.add(STAGING_DEPTH_OFFSET) as *const u32;
+            let row_words = colour_pitch as usize / 4;
+            *words.add(4 * row_words + 4)
+        };
+        let corner_colour = unsafe {
+            let words = map as *const u32;
+            let row_words = colour_pitch as usize / 4;
+            *words.add(4 * row_words + 4)
+        };
+        let corner_stencil = unsafe {
+            let bytes = map.add(STAGING_STENCIL_OFFSET);
+            let row = bytes.add(4 * stencil_pitch as usize);
+            *row.add(4)
+        };
+        eprintln!(
+            "d3d12: readback ({}, {}) raw words: colour 0x{:08x} depth \
+             0x{:08x} stencil 0x{:02x}",
+            cx, cy, raw_colour, raw_depth, raw_stencil
+        );
+        eprintln!(
+            "d3d12: readback corner (4,4) raw words: colour 0x{:08x} \
+             depth 0x{:08x} stencil 0x{:02x}",
+            corner_colour, corner_depth, corner_stencil
+        );
         let stencil = unsafe {
             let bytes = map.add(STAGING_STENCIL_OFFSET);
             let row = bytes.add(cy * stencil_pitch as usize);
+            // The stencil plane's staging layout is one byte per texel
+            // (the planar staging rule's R8_TYPELESS family).
             *row.add(cx) as i32
         };
         unsafe {
@@ -4444,6 +4722,12 @@ impl RenderBackend for D3d12Backend {
         // reset, the clears and the diagnostic draw are recorded.
         let hr = unsafe { call_slot_i32_0(self.allocator as ComObject, ALLOCATOR_RESET) };
         if hr != S_OK {
+            eprintln!("d3d12: clear: the allocator's reset failed (hr=0x{:08x})", hr);
+            let removed = unsafe {
+                call_slot_i32_0(self.device as ComObject, DEVICE_GET_DEVICE_REMOVED_REASON)
+            };
+            eprintln!("d3d12: device removed reason (hr=0x{:08x})", removed);
+            unsafe { self_dump_debug_messages(&self.loader) };
             self.violations += 1;
             return;
         }
@@ -4456,6 +4740,12 @@ impl RenderBackend for D3d12Backend {
             )
         };
         if hr != S_OK {
+            eprintln!("d3d12: clear: the command list's reset failed (hr=0x{:08x})", hr);
+            let removed = unsafe {
+                call_slot_i32_0(self.device as ComObject, DEVICE_GET_DEVICE_REMOVED_REASON)
+            };
+            eprintln!("d3d12: device removed reason (hr=0x{:08x})", removed);
+            unsafe { self_dump_debug_messages(&self.loader) };
             self.violations += 1;
             return;
         }
@@ -5387,6 +5677,7 @@ impl RenderBackend for D3d12Backend {
             self.violations += 1;
             return;
         }
+        let violation_start = self.violations;
         for light in &submission.lights {
             if light.validate().is_err() {
                 self.violations += 1;
@@ -5416,6 +5707,11 @@ impl RenderBackend for D3d12Backend {
             return;
         }
         if !self.frame_open {
+            eprintln!(
+                "d3d12: submit_post_chain: the frame is not open (violations \
+                 before {} after {})",
+                violation_start, self.violations
+            );
             self.violations += 1;
             return;
         }
@@ -5961,7 +6257,7 @@ impl RenderBackend for D3d12Backend {
                     },
                     union_tail_padding: [0, 0],
                 };
-                call_slot_i32_3(
+                let volume_srv_hr = call_slot_i32_3(
                     self.device as ComObject,
                     DEVICE_CREATE_SHADER_RESOURCE_VIEW,
                     volume_resource,
@@ -5975,6 +6271,19 @@ impl RenderBackend for D3d12Backend {
                     )
                     .ptr as *mut c_void,
                 );
+                if volume_srv_hr != S_OK {
+                    // The volume's SRV's failure is fatal: the g-buffer
+                    // pass samples the descriptor, and an invalid
+                    // descriptor's read names the device's removal (the
+                    // 0x887a0001 the Windows run's first readback
+                    // carried). The error surfaces here, at the write.
+                    eprintln!(
+                        "d3d12: the volume's SRV create failed \
+                         (hr=0x{:08x})",
+                        volume_srv_hr
+                    );
+                    self.violations += 1;
+                }
             }
             if self.post_volume_buffer.is_null() {
                 match {
@@ -6634,7 +6943,7 @@ impl RenderBackend for D3d12Backend {
                     width,
                     height,
                     depth: 1,
-                    row_pitch,
+                    row_pitch: row_pitch as u64,
                 },
             },
         };
@@ -6730,6 +7039,23 @@ impl RenderBackend for D3d12Backend {
                 .expect("the loader resolved WaitForSingleObject")(
                 self.fence_event, 5000
             );
+        }
+        // The fix11's death hunt: the fence's completed value after the
+        // wait (the u64::MAX sentinel names the device's removal) and the
+        // device's removed reason (the invalid call that dropped the GPU).
+        let completed = unsafe {
+            call_slot_u64_0(self.fence as ComObject, FENCE_GET_COMPLETED_VALUE)
+        };
+        let removed = unsafe {
+            call_slot_i32_0(self.device as ComObject, DEVICE_GET_DEVICE_REMOVED_REASON)
+        };
+        eprintln!(
+            "d3d12: fill_texture_2d fence target {} completed {} removed \
+             reason (hr=0x{:08x})",
+            self.fence_value, completed, removed
+        );
+        if removed != S_OK {
+            unsafe { self_dump_debug_messages(&self.loader) };
         }
         self.frame_open = false;
         Ok(())
@@ -6938,7 +7264,13 @@ impl RenderBackend for D3d12Backend {
             flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
             transition: D3d12ResourceTransitionBarrier {
                 resource,
-                subresource: 0,
+                // The volume's copy writes every depth slice (the
+                // footprint's depth carries the volume's layers), and a
+                // 3D texture's slices are separate subresources: the
+                // transition covers all of them (the subresource 0
+                // barrier leaves slices 1..depth in COMMON, a state the
+                // copy's write may not target).
+                subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                 state_before: current_state,
                 state_after: D3D12_RESOURCE_STATE_COPY_DEST,
             },
@@ -6948,7 +7280,7 @@ impl RenderBackend for D3d12Backend {
             flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
             transition: D3d12ResourceTransitionBarrier {
                 resource,
-                subresource: 0,
+                subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                 state_before: D3D12_RESOURCE_STATE_COPY_DEST,
                 state_after: D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             },
@@ -6977,7 +7309,7 @@ impl RenderBackend for D3d12Backend {
                     width,
                     height,
                     depth,
-                    row_pitch,
+                    row_pitch: row_pitch as u64,
                 },
             },
         };
@@ -6987,6 +7319,11 @@ impl RenderBackend for D3d12Backend {
                 // list reset (the same rule the 2D fill records).
                 let hr = call_slot_i32_0(self.allocator as ComObject, ALLOCATOR_RESET);
                 if hr != S_OK {
+                    eprintln!(
+                        "d3d12: fill_texture_3d: the allocator's reset \
+                         failed (hr=0x{:08x})",
+                        hr
+                    );
                     return Err(RenderError::from(
                         "fill_texture_3d: the allocator's reset failed",
                     ));
@@ -6998,6 +7335,11 @@ impl RenderBackend for D3d12Backend {
                     self.tri_pipeline,
                 );
                 if hr != S_OK {
+                    eprintln!(
+                        "d3d12: fill_texture_3d: the command list's reset \
+                         failed (hr=0x{:08x})",
+                        hr
+                    );
                     return Err(RenderError::from(
                         "fill_texture_3d: the command list's reset failed",
                     ));
@@ -7039,11 +7381,18 @@ impl RenderBackend for D3d12Backend {
         // records).
         let hr = unsafe { call_slot_i32_0(self.command_list as ComObject, COMMAND_LIST_CLOSE) };
         if hr != S_OK {
+            eprintln!(
+                "d3d12: fill_texture_3d: the command list's close failed \
+                 (hr=0x{:08x})",
+                hr
+            );
+            unsafe { self_dump_debug_messages(&self.loader) };
             return Err(RenderError::from(
                 "fill_texture_3d: the command list's close failed",
             ));
         }
         let lists = [self.command_list];
+        let wait_returned;
         unsafe {
             call_slot_i32_3(
                 self.queue as ComObject,
@@ -7073,6 +7422,34 @@ impl RenderBackend for D3d12Backend {
                 .expect("the loader resolved WaitForSingleObject")(
                 self.fence_event, 5000
             );
+            wait_returned = self
+                .loader
+                .wait_for_single_object
+                .expect("the loader resolved WaitForSingleObject")(
+                self.fence_event, 0
+            );
+        }
+        eprintln!(
+            "d3d12: fill_texture_3d wait returned 0x{:x} (0x0 WAIT_OBJECT_0, \
+             0x102 WAIT_TIMEOUT)",
+            wait_returned
+        );
+        // The fix11's death hunt: the fence's completed value after the
+        // wait (the u64::MAX sentinel names the device's removal) and the
+        // device's removed reason (the invalid call that dropped the GPU).
+        let completed = unsafe {
+            call_slot_u64_0(self.fence as ComObject, FENCE_GET_COMPLETED_VALUE)
+        };
+        let removed = unsafe {
+            call_slot_i32_0(self.device as ComObject, DEVICE_GET_DEVICE_REMOVED_REASON)
+        };
+        eprintln!(
+            "d3d12: fill_texture_3d fence target {} completed {} removed \
+             reason (hr=0x{:08x})",
+            self.fence_value, completed, removed
+        );
+        if removed != S_OK {
+            unsafe { self_dump_debug_messages(&self.loader) };
         }
         self.frame_open = false;
         Ok(())
@@ -7174,7 +7551,7 @@ impl RenderBackend for D3d12Backend {
                     width,
                     height,
                     depth,
-                    row_pitch,
+                    row_pitch: row_pitch as u64,
                 },
             },
         };
@@ -7335,13 +7712,17 @@ impl RenderBackend for D3d12Backend {
         };
         let view = match self.create_texture_3d(&desc) {
             Ok(view) => view,
-            Err(_) => {
+            Err(e) => {
+                // The fix9 diagnostic: the swallowed error the Windows
+                // run's violations: 1 hides.
+                eprintln!("d3d12: set_light_volume: the create failed: {}", e);
                 self.violations += 1;
                 return;
             }
         };
         let packed = volume.pack_texture_3d();
-        if self.fill_texture_3d(&view, &packed).is_err() {
+        if let Err(e) = self.fill_texture_3d(&view, &packed) {
+            eprintln!("d3d12: set_light_volume: the fill failed: {}", e);
             self.violations += 1;
             return;
         }

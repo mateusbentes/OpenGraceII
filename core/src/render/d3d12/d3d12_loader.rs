@@ -65,7 +65,11 @@ pub const DXGI_FORMAT_R16G16B16A16_FLOAT: u32 = 10;
 pub const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
 pub const DXGI_FORMAT_R8_UNORM: u32 = 61;
 pub const DXGI_FORMAT_R32_FLOAT: u32 = 41;
-pub const DXGI_FORMAT_R8_UINT: u32 = 30;
+// The DXGI enum's real value: 62 (R8_TYPELESS = 60). The old 30 is
+// R8G8B8A8_UINT, four bytes per texel, and the real driver rejects the
+// planar stencil copy's footprint when the format is not in the
+// R8_TYPELESS family (the Planar Depth Stencil spec's rule).
+pub const DXGI_FORMAT_R8_UINT: u32 = 62;
 pub const DXGI_FORMAT_R24_UNORM_X8_TYPELESS: u32 = 46;
 pub const DXGI_FORMAT_X24_TYPELESS_G8_UINT: u32 = 47;
 pub const DXGI_FORMAT_D24_UNORM_S8_UINT: u32 = 45;
@@ -116,7 +120,7 @@ pub const D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER: u32 = 3;
 pub const D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE: u32 = 0;
 
 pub const D3D12_SRV_DIMENSION_TEXTURE2D: u32 = 4;
-pub const D3D12_SRV_DIMENSION_TEXTURE3D: u32 = 5;
+pub const D3D12_SRV_DIMENSION_TEXTURE3D: u32 = 8;
 pub const D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING: u32 = 0x1688;
 
 pub const D3D12_FILTER_MIN_MAG_MIP_POINT: u32 = 0x0;
@@ -300,7 +304,12 @@ pub struct D3d12SubresourceFootprint {
     pub width: u32,
     pub height: u32,
     pub depth: u32,
-    pub row_pitch: u32,
+    // The ABI's row pitch is a UINT64: the struct's 24 bytes carry four
+    // bytes of padding after the depth word, and the runtime reads the
+    // pitch at the offset the u64 field reserves (a u32 field shifts the
+    // pitch into the padding and the Close's validation reads the Height
+    // in its place).
+    pub row_pitch: u64,
 }
 
 /// The published struct: the placed footprint (the buffer offset plus the
@@ -740,6 +749,12 @@ pub const IID_ID3D12_DESCRIPTOR_HEAP_WORDS: [u32; 4] = [
 pub const IID_ID3D12_DEBUG_WORDS: [u32; 4] = [
     0x344488b7, 0x474b6846, 0xf027b989, 0xe0458244,
 ];
+// The ID3D12InfoQueue's GUID (the DEFINE_GUID's little-endian memory
+// layout, the same rule the other IID words carry): the debug layer's
+// message queue the hardware run's diagnostics read.
+pub const IID_ID3D12_INFO_QUEUE_WORDS: [u32; 4] = [
+    0x0742a90b, 0x483fc387, 0xa73046b9, 0x5814e6e4,
+];
 pub const IID_IDXGI_FACTORY1_WORDS: [u32; 4] = [
     0x770aae78, 0x4dbaf26f, 0x3c2529a8, 0x87b3d183,
 ];
@@ -772,6 +787,13 @@ pub type FnD3D12SerializeRootSignature = unsafe extern "system" fn(
     version: u32,
     blob: *mut D3dBlobHandle,
     error_blob: *mut D3dBlobHandle,
+) -> i32;
+/// The debug layer's entry point (the published signature): the
+/// hardware run's diagnostics resolve it to query the InfoQueue's
+/// messages when the driver rejects a command list.
+pub type FnD3D12GetDebugInterface = unsafe extern "system" fn(
+    riid: *const u32,
+    debug: *mut *mut c_void,
 ) -> i32;
 pub type FnD3DCompile = unsafe extern "system" fn(
     src_data: *const c_void,
@@ -1167,6 +1189,7 @@ pub struct D3d12Loader {
     pub d3d12_create_device: Option<FnD3D12CreateDevice>,
     pub create_dxgi_factory1: Option<FnCreateDXGIFactory1>,
     pub d3d12_serialize_root_signature: Option<FnD3D12SerializeRootSignature>,
+    pub d3d12_get_debug_interface: Option<FnD3D12GetDebugInterface>,
     pub d3d_compile: Option<FnD3DCompile>,
     // The kernel32 surface (the process's own library).
     pub load_library_a: Option<FnLoadLibraryA>,
@@ -1189,6 +1212,7 @@ impl D3d12Loader {
             d3d12_create_device: None,
             create_dxgi_factory1: None,
             d3d12_serialize_root_signature: None,
+            d3d12_get_debug_interface: None,
             d3d_compile: None,
             load_library_a: None,
             get_proc_address: None,
@@ -1299,6 +1323,18 @@ impl D3d12Loader {
             d3d12,
             "D3D12SerializeRootSignature"
         );
+        // The debug layer's entry point is optional: the Wine's vkd3d
+        // d3d12.dll may not export it, and the diagnostics degrade
+        // gracefully when it is absent (the same rule the factory4's
+        // optional interface carries).
+        let debug_symbol = unsafe {
+            get_proc_address(d3d12, b"D3D12GetDebugInterface\0".as_ptr() as *const c_char)
+        };
+        if !debug_symbol.is_null() {
+            self.d3d12_get_debug_interface = Some(unsafe {
+                std::mem::transmute::<*mut c_void, FnD3D12GetDebugInterface>(debug_symbol)
+            });
+        }
         resolve!(d3d_compile, d3dcompiler, "D3DCompile");
         self.loaded = true;
         true

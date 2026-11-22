@@ -20,8 +20,8 @@ The `.docx` files in this directory are generated from the `.md` sources with
 | 5 | Forward lighting: light types, shadow mapping | Done (the Blinn-Phong path with the sun and up to four point lights runs on all four backends; the shadow mapping follows in a later milestone) |
 | 6 | Deferred lighting: MRT G-buffer, the lighting pass | Done (the three-attachment geometry pass and the fullscreen lighting pass run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
 | 7 | Post-processing chain: HDR, bloom, filmic tonemapping, depth of field, morphological anti-aliasing, SSAO-STF | Done (the HDR geometry pass and the five-effect composite pass run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
-| 8 | Global illumination by light volume propagation | Done (the radiance volume, the indirect term in the post chain and the set_light_volume texture cache run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
-| 9 | Platform layer: the engine's own windowing, input and events, replacing SDL2 | Done (the X11 platform backend runs on Linux hardware — the Xvfb validation and the windowed Vulkan swapchain's acquire/present cycle confirmed; the Win32 and the Cocoa backends follow in a later milestone) |
+| 8 | Global illumination by light volume propagation | Done (the radiance volume, the indirect term in the post chain and the set_light_volume texture cache run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 on the Windows hardware run (Intel UHD) and under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
+| 9 | Platform layer: the engine's own windowing, input and events, replacing SDL2 | Done (the X11 platform backend runs on Linux hardware — the Xvfb validation and the windowed Vulkan swapchain's acquire/present cycle confirmed; the full D3D12 suite runs on the real Windows hardware (Intel UHD) through the run-tests.bat runner; the Win32 and the Cocoa backends follow in a later milestone) |
 | 10 | Audio: the engine's own backend per platform, the WAV and Ogg Vorbis decoders | Planned |
 | 11 | Physics: the classical layer and the extra layer, in the engine's own code | Planned |
 | 12 | Scripting: the engine's own scripting language and VM | Planned |
@@ -32,7 +32,7 @@ The `.docx` files in this directory are generated from the `.md` sources with
 | 17 | AI and gameplay: the agent behaviours and the gameplay services | Planned |
 | 18 | Video: the own playback service and the Ogg Theora decode layer | Planned |
 | 19 | OWD: the reader, the writer, the filters, the checksums, the overlay loader and the standalone compression/decompression tool (docs/resource-container.md) | Planned |
-| 20 | Windows validation: the MinGW-w64 cross-compile (or the Windows toolchain) and the Windows backends | Planned |
+| 20 | Windows validation: the MinGW-w64 cross-compile (or the Windows toolchain) and the Windows backends | Done (the real Windows 10 machine runs the full D3D12 suite on the Intel UHD hardware through the run-tests.bat runner; the native Vulkan and OpenGL Windows paths follow) |
 | 21 | Editor: the scene and asset editor with a live preview through the same render pipeline | Planned |
 | 22 | Network tools: connection, session and state replication as a separate layer | Planned |
 | 23 | Hardware validation: the full platform matrix on hardware | Planned |
@@ -660,9 +660,10 @@ The validation runs, all through the same contract:
   and the fill paths) name `GL_HALF_FLOAT` for the half-float data —
   the readback mirrors it through a `glGetTexImage` call the loader
   gained.
-- **Direct3D 12** (`cube_volume_d3d12`, Wine with vkd3d on both
+- **Direct3D 12** (`cube_volume_d3d12`, the real Windows hardware run
+  — Intel UHD Graphics, Windows 10 — and Wine with vkd3d on the Linux
   machines): centre 221, 221, 221, depth 1.0, corner clear, zero
-  violations. The run's own findings, fixed in the same milestone: the
+  violations. The run's own findings, fixed across the milestones: the
   3D texture fill copies per row at the 256-byte row pitch (a
   contiguous per-layer copy leaves the rows 1..n in the pitch's
   padding — the C-side ground truth with the real d3d12.dll headers
@@ -671,7 +672,18 @@ The validation runs, all through the same contract:
   and the per-row unmap). The gbuffer pass binds the mesh srv_heap's
   five slots (the camera CBV, the texture SRV, the lights CBV, the
   volume SRV and the volume CBV), and the composite keeps its own
-  three-slot heap.
+  three-slot heap. The Windows hardware run's own finding, fixed in
+  the M9 follow-up: the loader's `D3D12_SRV_DIMENSION_TEXTURE3D`
+  constant carried 5 (the enum's TEXTURE2DARRAY value) where the API
+  declares 8 — the wrong dimension made the volume's SRV descriptor
+  invalid and the first execute that sampled it removed the device
+  (0x887a0001) on the real driver, while the Wine layer had silently
+  accepted the same call (the SRV's hr check now follows the COM
+  convention: only a negative HRESULT names a failure, because vkd3d
+  returns a non-standard success code there). The 3D fill's barriers
+  cover all the depth slices too (a depth-24 volume holds 24
+  subresources; the subresource-0 barrier left slices 1..23 outside
+  the transition the SRV's read needs).
 - **Metal** (`cube_volume_mtl`, the A18 Pro's hardware run): centre
   221, 221, 221, depth 1.0, corner clear, zero violations. The runs'
   own findings, fixed in the same milestone: the 2D device texture's
@@ -780,6 +792,24 @@ as a value (`Atom`) where the API's header declares a pointer
 platform's libX11 (the `_XData32` dereference the backtrace pinned).
 The loader now carries the pointer form and the call passes the atom's
 address.
+
+**The Windows hardware run (the borrowed Windows 10 machine, Intel UHD
+Graphics)**: the full D3D12 suite runs on the real driver for the first
+time through the `run-tests.bat` runner the M9 carries (the MinGW
+toolchain via rustup, the clones from GitHub, the per-example exit
+codes into `log.txt`). Every headless example passes with zero
+violations — the triangle smoke, the textured cube, the lit cube, the
+post chain and the deferred scene — and the volume example's device
+removal (the M8 record's finding above) surfaced and was fixed here.
+The D3D12 backend's WARP fallback (the M9 software-rasterizer path for
+machines without a D3D12 GPU) stands ready behind the hardware device's
+detection. The Windows run also records the Wine-side limitation the
+fixes exposed: the repeated readbacks of one process can hand back a
+depth plane whose words alias the colour plane's bytes (the
+`0x00dcdcdc`-style reads on the volume run's second and third samples)
+under vkd3d on lavapipe — an artefact the real driver does not carry
+(the same binary's hardware run reads depth 1.0 cleanly), on top of the
+recorded lavapipe startup flake the runner's retry absorbs.
 
 ---
 

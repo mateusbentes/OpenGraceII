@@ -33,6 +33,13 @@ the post chain's reference math and the light volume's packing,
 injection, propagation and sampling carry their unit tests, and every
 milestone's integration test pins the pixels its own reference produces.
 
+Milestone 9 (the platform layer) is done: the engine's own X11 windowing,
+input and event path runs on Linux hardware, the windowed Vulkan
+swapchain presents through the same contract, and the full D3D12 suite
+now runs on real Windows hardware (Intel UHD Graphics, Windows 10)
+through the repository's run-tests.bat runner — the D3D12 path's
+validation no longer rests on Wine alone.
+
 ## The lessons from OpenGrace
 
 OpenGrace is a complete C++ reimplementation of the GRACE 2 engine

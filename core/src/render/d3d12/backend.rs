@@ -6271,7 +6271,14 @@ impl RenderBackend for D3d12Backend {
                     )
                     .ptr as *mut c_void,
                 );
-                if volume_srv_hr != S_OK {
+                // The COM convention: only a negative HRESULT (the
+                // severity bit set) names a failure. The vkd3d layer the
+                // Wine runs exercise returns a non-standard success code
+                // (0x00000002) for this call — the view works (the
+                // LucDev's volume sample reads the indirect term's
+                // pixels), so the equality test against S_OK would flag
+                // a healthy descriptor as a violation.
+                if volume_srv_hr < 0 {
                     // The volume's SRV's failure is fatal: the g-buffer
                     // pass samples the descriptor, and an invalid
                     // descriptor's read names the device's removal (the

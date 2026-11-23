@@ -22,7 +22,7 @@ The `.docx` files in this directory are generated from the `.md` sources with
 | 7 | Post-processing chain: HDR, bloom, filmic tonemapping, depth of field, morphological anti-aliasing, SSAO-STF | Done (the HDR geometry pass and the five-effect composite pass run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
 | 8 | Global illumination by light volume propagation | Done (the radiance volume, the indirect term in the post chain and the set_light_volume texture cache run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 on the Windows hardware run (Intel UHD) and under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
 | 9 | Platform layer: the engine's own windowing, input and events, replacing SDL2 | Done (the X11 platform backend runs on Linux hardware — the Xvfb validation and the windowed Vulkan swapchain's acquire/present cycle confirmed; the full D3D12 suite runs on the real Windows hardware (Intel UHD) through the run-tests.bat runner; the Win32 and the Cocoa backends follow in a later milestone) |
-| 10 | Audio: the engine's own backend per platform, the WAV and Ogg Vorbis decoders | Done (the audio contract with the deterministic null backend, the engine's own WAV and Ogg Vorbis decoders and the ALSA backend run on all four platforms — the real ALSA mix on Linux hardware with zero violations, the decoders' path on the Windows hardware (Intel UHD), under Wine, on the A18 Pro's macOS run and on the Galaxy A56's arm64 NDK run; WASAPI, CoreAudio and AAudio follow in the later hardware milestones) |
+| 10 | Audio: the engine's own backend per platform, the WAV and Ogg Vorbis decoders | Done (the audio contract with the deterministic null backend, the engine's own WAV and Ogg Vorbis decoders and the three real backends run on all four platforms — ALSA on Linux hardware, WASAPI on the Windows hardware (Intel UHD) and under Wine, CoreAudio on the A18 Pro's macOS run, each mixing through the same loop with zero violations; the AAudio backend follows with the Android minSdk decision) |
 | 11 | Physics: the classical layer and the extra layer, in the engine's own code | Planned |
 | 12 | Scripting: the engine's own scripting language and VM | Planned |
 | 13 | Visual scripting: the graph representation on the engine's own language | Planned |
@@ -877,15 +877,33 @@ interleaved layout, `snd_pcm_writei` feeding the shared mix loop's
 frames with `snd_pcm_recover` for the EPIPE and the ESTRPIPE underruns,
 and `snd_pcm_close` in the `Drop`. Gated behind
 `#[cfg(all(unix, feature = "audio-alsa"))]`, the same rule the X11
-backend carries; the WASAPI, the CoreAudio and the AAudio backends
-follow in the later hardware milestones.
+backend carries.
+**The WASAPI backend**: the engine's own loader (LoadLibraryA of the
+platform's ole32.dll and mmdevapi.dll, the D3D12 loader's own surface),
+`CoInitializeEx` and `CoCreateInstance` of the device enumerator, the
+default render endpoint, the shared-mode `IAudioClient` with the
+interleaved s16 format and the auto-convert flags, the polling write
+model (`GetCurrentPadding` names the device's filled frames, the
+backend writes what the buffer has room for and sleeps while it is
+full), and the release/teardown in reverse in the `Drop`. The COM vtable
+slots and the GUIDs are the published ABI the D3D12 loader verifies
+against. Gated behind `#[cfg(all(windows, feature = "audio-wasapi"))]`.
+**The CoreAudio backend**: the engine's own loader (dlopen of the
+system's CoreAudio framework), the default-output AudioComponent, the
+AudioUnit instance, the interleaved s16 stream format at the config's
+rate and channels, and the render callback the OS's render thread pulls
+the frames through (the pending queue's cap keeps the latency bounded;
+the short fill renders the honest silence). Gated behind
+`#[cfg(all(target_os = "macos", feature = "audio-coreaudio"))]`.
 **The integration test** (`audio_smoke`): the null walk (the contract's
 voices, the placements, the listener, the deterministic mix and its
 pinned peaks), the WAV decode (44.1 kHz mono, 44100 frames), the Vorbis
-decode (48 kHz mono, 24000 frames, the peak 0.1316 pinned) and — on
-Linux with the `audio-alsa` feature — the real ALSA mix through the
-same mix loop. The test vectors embed with `include_bytes!` so the
-example runs standalone on a device without the source tree.
+decode (48 kHz mono, 24000 frames, the peak 0.1316 pinned) and — when the
+platform's audio feature is enabled and the device opens — the real
+mix through the ALSA, the WASAPI or the CoreAudio backend's own loop
+(the same mix arithmetic every backend runs). The test vectors embed
+with `include_bytes!` so the example runs standalone on a device
+without the source tree.
 The validation runs, all through the same contract:
 - **The headless suite**: the og2-core suite (73 tests: the contract
   walk, the decoders' unit tests, the two reference vectors against the
@@ -895,14 +913,19 @@ The validation runs, all through the same contract:
   device): `describe: alsa sample_rate=44100 channels=2 period=512`,
   `alsa mixed frames: 12288`, `alsa violations: 0` — the sound left the
   speakers.
-- **The Wine cross-build** (x86_64-pc-windows-gnu): the decoders and
-  the null backend run clean, and no ALSA line appears (the cfg gate
-  holds under the Windows target).
+- **The Wine cross-build** (x86_64-pc-windows-gnu): the WASAPI path's
+  full COM stack opens under Wine —
+  `describe: wasapi sample_rate=44100 channels=2 period=512 buffer=2048`,
+  `wasapi mixed frames: 12288`, `wasapi violations: 0` — and no ALSA
+  line appears (the cfg gate holds under the Windows target).
 - **The Windows hardware run** (DESKTOP-DFS7FIQ, Intel UHD Graphics,
-  the rustup GNU toolchain): the decoders and the null backend run
-  clean on the real machine.
-- **The macOS hardware run** (the A18 Pro): the decoders and the null
-  backend run clean.
+  the rustup GNU toolchain): the WASAPI backend mixes through the real
+  driver — the same `buffer=2048` describe, `12288` frames,
+  `violations: 0` — re-confirmed on the committed 10c tree.
+- **The macOS hardware run** (the A18 Pro): the CoreAudio backend
+  mixes through the default output unit —
+  `describe: coreaudio sample_rate=44100 channels=2 period=512`,
+  `coreaudio mixed frames: 12288`, `coreaudio violations: 0`.
 - **The Android hardware run** (the Galaxy A56, arm64, the NDK
   30.0.16248370 through the `aarch64-linux-android24` linker): the full
   cycle decodes both vectors on the real arm64 hardware with the
@@ -917,6 +940,18 @@ attribute onto every function; and the cross-compiles for the
 windows-gnu and the aarch64-apple-darwin targets exposed the ALSA
 module compiling outside its unix gate, fixed by the
 `#[cfg(all(unix, feature = "audio-alsa"))]` the module now carries.
+The WASAPI and the CoreAudio backends' own hardware runs (the 10c
+campaign) found the ABI's own traps: the CoreAudio's first run aborted
+on the default-output component's find — the engine carried the
+OfflineEffect's FourCC (`auol`) where the output unit's type
+(`auou`) belongs, a finding the standalone diagnostic probe
+(`dbg_ca`) pinned by walking the component registry's own answers —
+and then persisted on the unknown-property error (`who?`) until the
+engine stopped passing FourCC codes where the AudioUnit's properties
+carry numbered enums (`kAudioUnitProperty_StreamFormat` is 8,
+`SetRenderCallback` is 23), with the scopes' own values
+(Global = 0, Input = 1, Output = 2) verified against the SDK's headers
+alongside. The committed tree re-ran clean on all four platforms.
 ---
 ## Lessons carried from OpenGrace
 

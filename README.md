@@ -41,12 +41,14 @@ through the repository's run-tests.bat runner — the D3D12 path's
 validation no longer rests on Wine alone.
 Milestone 10 (the audio foundation) is done: the engine's own audio
 contract and deterministic null backend, the engine's own WAV and Ogg
-Vorbis decoders (no OpenAL, no SDL2_audio) and the first real backend
-(ALSA through dlopen) run on all four platforms — the real ALSA mix on
-Linux hardware with zero violations, and the decoders' path on the
-Windows hardware (Intel UHD), under Wine, on the A18 Pro and on the
-Galaxy A56's arm64 NDK run; WASAPI, CoreAudio and AAudio follow in the
-later hardware milestones.
+Vorbis decoders (no OpenAL, no SDL2_audio) and the three real backends
+— ALSA through dlopen, WASAPI through the platform's own COM surface
+and CoreAudio through the system's framework — run on all four
+platforms, each mixing through the same loop with zero violations: the
+ALSA mix on Linux hardware, the WASAPI mix on the Windows hardware
+(Intel UHD) and under Wine, and the CoreAudio mix on the A18 Pro's
+macOS run (the decoders' path also runs on the Galaxy A56's arm64 NDK
+run; the AAudio backend follows with the Android minSdk decision).
 
 ## The lessons from OpenGrace
 

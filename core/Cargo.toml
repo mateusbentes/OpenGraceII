@@ -18,6 +18,10 @@ audio-wasapi = []
 # the dlopen/dlsym surface (the unix-only target gate keeps the manifest
 # warning-free on the windows-gnu cross-check).
 audio-coreaudio = ["dep:libc"]
+# The AAudio loader dlopen()s the platform's libaaudio.so (the same libc
+# surface; the library exists from API 26 onward, so the minSdk stays 24
+# and the earlier machines gracefully skip through the open error).
+audio-aaudio = ["dep:libc"]
 vulkan = ["dep:libc"]
 opengl = ["dep:libc"]
 metal = ["dep:libc"]

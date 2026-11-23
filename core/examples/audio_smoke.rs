@@ -190,5 +190,36 @@ fn main() {
         }
     }
 
+    // The AAudio hardware path: the same mix loop through the
+    // platform's own stream builder (the machines before API 26 and
+    // the runs without the audio permission report the open error and
+    // the smoke moves on).
+    #[cfg(feature = "audio-aaudio")]
+    match og2_core::audio::aaudio::AAudioBackend::new(AudioConfig::default())
+    {
+        Ok(mut device) => {
+            println!("describe: {}", device.describe());
+            let tone = sine_buffer(48000, 0.25, 440.0);
+            let voice =
+                device.create_voice(&tone).expect("the AAudio voice");
+            device.play_voice(voice, false).expect("the AAudio play");
+            for _ in 0..(48000 / 512 * 2) {
+                let peaks = device.mix_frames(512);
+                // The device consumed the mixed block; the run fails
+                // on a contract violation only.
+                let _ = peaks;
+                if device.voice_state(voice) == VoiceState::Stopped {
+                    break;
+                }
+            }
+            println!("aaudio mixed frames: {}", device.mixed_frames());
+            device.shutdown();
+            println!("aaudio violations: {}", device.violation_count());
+        }
+        Err(error) => {
+            println!("aaudio: skipped ({})", error);
+        }
+    }
+
     println!("OK");
 }

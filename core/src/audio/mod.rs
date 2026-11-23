@@ -451,9 +451,7 @@ pub mod vorbis_bitreader;
 pub mod mix;
 #[cfg(feature = "audio-vorbis")]
 pub mod vorbis;
-// The ALSA backend is the Linux/Unix hardware path; the Windows
-// (WASAPI), the macOS (CoreAudio) and the Android (AAudio) outputs
-// follow with their own hardware runs.
+// The ALSA backend is the Linux/Unix hardware path.
 #[cfg(all(unix, feature = "audio-alsa"))]
 pub mod alsa;
 // The WASAPI backend is the Windows hardware path.
@@ -462,3 +460,8 @@ pub mod wasapi;
 // The CoreAudio backend is the macOS hardware path.
 #[cfg(all(target_os = "macos", feature = "audio-coreaudio"))]
 pub mod coreaudio;
+// The AAudio backend is the Android hardware path (the dlopen of
+// libaaudio.so keeps the minSdk at 24; the machines before API 26
+// report the open error and stay on the null path).
+#[cfg(all(target_os = "android", feature = "audio-aaudio"))]
+pub mod aaudio;

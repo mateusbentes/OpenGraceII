@@ -9,6 +9,8 @@ path = "src/lib.rs"
 
 [features]
 default = []
+audio-vorbis = []
+audio-alsa = ["dep:libc"]
 vulkan = ["dep:libc"]
 opengl = ["dep:libc"]
 metal = ["dep:libc"]
@@ -126,3 +128,7 @@ required-features = ["d3d12"]
 [[example]]
 name = "cube_volume_mtl"
 required-features = ["metal"]
+
+[[example]]
+name = "audio_smoke"
+required-features = []

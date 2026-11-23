@@ -456,3 +456,9 @@ pub mod vorbis;
 // follow with their own hardware runs.
 #[cfg(all(unix, feature = "audio-alsa"))]
 pub mod alsa;
+// The WASAPI backend is the Windows hardware path.
+#[cfg(all(windows, feature = "audio-wasapi"))]
+pub mod wasapi;
+// The CoreAudio backend is the macOS hardware path.
+#[cfg(all(target_os = "macos", feature = "audio-coreaudio"))]
+pub mod coreaudio;

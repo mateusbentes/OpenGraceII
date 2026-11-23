@@ -131,5 +131,64 @@ fn main() {
         }
     }
 
+    // The WASAPI hardware path: the same mix loop through the
+    // platform's own render client (a machine without an active audio
+    // endpoint reports the open error and the smoke moves on).
+    #[cfg(feature = "audio-wasapi")]
+    match og2_core::audio::wasapi::WasapiAudioBackend::new(AudioConfig::default())
+    {
+        Ok(mut device) => {
+            println!("describe: {}", device.describe());
+            let tone = sine_buffer(48000, 0.25, 440.0);
+            let voice = device.create_voice(&tone).expect("the WASAPI voice");
+            device.play_voice(voice, false).expect("the WASAPI play");
+            for _ in 0..(48000 / 512 * 2) {
+                let peaks = device.mix_frames(512);
+                // The device consumed the mixed block; the run fails
+                // on a contract violation only.
+                let _ = peaks;
+                if device.voice_state(voice) == VoiceState::Stopped {
+                    break;
+                }
+            }
+            println!("wasapi mixed frames: {}", device.mixed_frames());
+            device.shutdown();
+            println!("wasapi violations: {}", device.violation_count());
+        }
+        Err(error) => {
+            println!("wasapi: skipped ({})", error);
+        }
+    }
+
+    // The CoreAudio hardware path: the same mix loop through the
+    // platform's own AudioUnit (a machine without an active output
+    // device reports the open error and the smoke moves on).
+    #[cfg(feature = "audio-coreaudio")]
+    match og2_core::audio::coreaudio::CoreAudioBackend::new(AudioConfig::default())
+    {
+        Ok(mut device) => {
+            println!("describe: {}", device.describe());
+            let tone = sine_buffer(48000, 0.25, 440.0);
+            let voice =
+                device.create_voice(&tone).expect("the CoreAudio voice");
+            device.play_voice(voice, false).expect("the CoreAudio play");
+            for _ in 0..(48000 / 512 * 2) {
+                let peaks = device.mix_frames(512);
+                // The device consumed the mixed block; the run fails
+                // on a contract violation only.
+                let _ = peaks;
+                if device.voice_state(voice) == VoiceState::Stopped {
+                    break;
+                }
+            }
+            println!("coreaudio mixed frames: {}", device.mixed_frames());
+            device.shutdown();
+            println!("coreaudio violations: {}", device.violation_count());
+        }
+        Err(error) => {
+            println!("coreaudio: skipped ({})", error);
+        }
+    }
+
     println!("OK");
 }

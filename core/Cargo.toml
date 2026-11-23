@@ -11,6 +11,13 @@ path = "src/lib.rs"
 default = []
 audio-vorbis = []
 audio-alsa = ["dep:libc"]
+# The WASAPI loader resolves everything through LoadLibraryA/GetProcAddress
+# (kernel32 extern "system"), the D3D12 loader's own surface.
+audio-wasapi = []
+# The CoreAudio loader dlopen()s the system's CoreAudio framework; libc is
+# the dlopen/dlsym surface (the unix-only target gate keeps the manifest
+# warning-free on the windows-gnu cross-check).
+audio-coreaudio = ["dep:libc"]
 vulkan = ["dep:libc"]
 opengl = ["dep:libc"]
 metal = ["dep:libc"]

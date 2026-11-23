@@ -22,7 +22,7 @@ The `.docx` files in this directory are generated from the `.md` sources with
 | 7 | Post-processing chain: HDR, bloom, filmic tonemapping, depth of field, morphological anti-aliasing, SSAO-STF | Done (the HDR geometry pass and the five-effect composite pass run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
 | 8 | Global illumination by light volume propagation | Done (the radiance volume, the indirect term in the post chain and the set_light_volume texture cache run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 on the Windows hardware run (Intel UHD) and under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
 | 9 | Platform layer: the engine's own windowing, input and events, replacing SDL2 | Done (the X11 platform backend runs on Linux hardware — the Xvfb validation and the windowed Vulkan swapchain's acquire/present cycle confirmed; the full D3D12 suite runs on the real Windows hardware (Intel UHD) through the run-tests.bat runner; the Win32 and the Cocoa backends follow in a later milestone) |
-| 10 | Audio: the engine's own backend per platform, the WAV and Ogg Vorbis decoders | Planned |
+| 10 | Audio: the engine's own backend per platform, the WAV and Ogg Vorbis decoders | Done (the audio contract with the deterministic null backend, the engine's own WAV and Ogg Vorbis decoders and the ALSA backend run on all four platforms — the real ALSA mix on Linux hardware with zero violations, the decoders' path on the Windows hardware (Intel UHD), under Wine, on the A18 Pro's macOS run and on the Galaxy A56's arm64 NDK run; WASAPI, CoreAudio and AAudio follow in the later hardware milestones) |
 | 11 | Physics: the classical layer and the extra layer, in the engine's own code | Planned |
 | 12 | Scripting: the engine's own scripting language and VM | Planned |
 | 13 | Visual scripting: the graph representation on the engine's own language | Planned |
@@ -67,6 +67,8 @@ cargo build --features og2-core/metal
 cargo test -p og2-tests --features og2-tests/vulkan,og2-tests/opengl,og2-tests/metal
 cargo build --features og2-core/d3d12
 cargo test -p og2-tests --features og2-tests/vulkan,og2-tests/opengl,og2-tests/metal,og2-tests/d3d12
+cargo test -p og2-core --features og2-core/audio-vorbis,og2-core/audio-alsa
+cargo build --target x86_64-pc-windows-gnu --features og2-core/audio-vorbis --examples
 ```
 
 The render suite's source imports the backends' types, so the render
@@ -813,6 +815,109 @@ recorded lavapipe startup flake the runner's retry absorbs.
 
 ---
 
+## Milestone 10: Audio foundation
+Milestone 10 replaces the audio middlewares — OpenAL and SDL2_audio in
+OpenGrace — with the engine's own audio stack: the audio contract, the
+deterministic null backend, the engine's own WAV and Ogg Vorbis
+decoders, the shared mix loop and the first real backend (ALSA through
+dlopen).
+**The audio contract**: one trait (`AudioBackend`) with the API-neutral
+surface the app logic consumes: the backend's creation from the
+`AudioConfig` (the sample rate, the channel count, the period), the
+voice lifecycle (`play`, `pause`, `stop_voice`) over the `VoiceHandle`s
+the backend hands back, the spatial placement (`set_voice_placement`,
+`set_listener`) through the `VoicePlacement` and the `ListenerState`,
+the mixing (`mix_frames` filling a caller `PcmBuffer`,
+`mixed_frames` reporting what the real backend consumed), the
+`violation_count` and the shutdown. The shared module carries only the
+trait and the pure-Rust types (the `AudioConfig`, the `PcmBuffer`, the
+`VoiceHandle`, the `VoiceState`, the `VoicePlacement`, the
+`ListenerState`, the `AudioError`); the per-platform implementations
+live in their own files gated behind their own features, the same rule
+the platform layer and the render backends' loaders carry. The
+`NullAudioBackend` is deterministic: the same voice walk produces the
+same mixed samples on every machine, and the contract's tests read the
+mixed buffer back instead of trusting the hardware.
+**The shared mix loop** (`mix.rs`): one mix routine the null backend and
+the real backends run — the per-voice sample cursors, the per-voice
+gain, the 3D attenuation (the linear falloff from the reference
+distance to the max distance, clamped past the max), the per-channel
+peak the contract reports. A contract-walk test drives the null
+backend and the arithmetic through the same scenario and pins the
+mixed peaks, so a real backend's mix cannot drift from the contract's
+own definition.
+**The decoders**: the engine's own WAV reader (the RIFF chunk walk, the
+PCM16 and the float32 payloads, byte-exact against the reference) and
+the engine's own Ogg Vorbis path — the demuxer (the page parser and
+the packet assembler per RFC 3533, including the legality of a packet
+whose segment count is zero), the bit reader (the LSB-first order the
+Vorbis specification pins), the codebooks (the Huffman tables decoded
+in the specification's canonical ordering), the floor 1 curve, the
+residues 0, 1 and 2, the mapping 0 channel coupling, the two block
+sizes, the MDCT ported verbatim from the reference library's
+`mdct_backward` into `f64`, and the blockin lapping with the
+granule-driven window trims.
+**The reference rule**: the test vectors' reference PCM comes from the
+real libvorbis — the reference library built from the xiph clone with
+dump instrumentation — not from a demuxer's view of the file. The
+finding the rule closes: ffmpeg's demuxer applies its own end trim (256
+samples, a PTS-bookkeeping artefact computed through the packet's
+prev-flag bit rather than the previous block's real samples) on top of
+dropping the decoder's first frame, and rewriting the granule never
+changed its output because of it. The decoder's honest contract is the
+reference library's output (24000 samples at 48 kHz mono for the 1 kHz
+vector, regenerated from libvorbis); the Rust decode lands at RMS
+1.1e-8 against the real libvorbis PCM — 0.29 LSB on the s16
+quantisation. The 440 Hz stereo vector already agreed with both views
+(the demuxer's 440-sample trim equals raw minus granule there).
+**The ALSA backend**: the engine's own loader (dlopen of the platform's
+libasound.so.2, no third-party binding), `snd_pcm_open` on the
+"default" PCM, `snd_pcm_set_params` with the native-endian S16
+interleaved layout, `snd_pcm_writei` feeding the shared mix loop's
+frames with `snd_pcm_recover` for the EPIPE and the ESTRPIPE underruns,
+and `snd_pcm_close` in the `Drop`. Gated behind
+`#[cfg(all(unix, feature = "audio-alsa"))]`, the same rule the X11
+backend carries; the WASAPI, the CoreAudio and the AAudio backends
+follow in the later hardware milestones.
+**The integration test** (`audio_smoke`): the null walk (the contract's
+voices, the placements, the listener, the deterministic mix and its
+pinned peaks), the WAV decode (44.1 kHz mono, 44100 frames), the Vorbis
+decode (48 kHz mono, 24000 frames, the peak 0.1316 pinned) and — on
+Linux with the `audio-alsa` feature — the real ALSA mix through the
+same mix loop. The test vectors embed with `include_bytes!` so the
+example runs standalone on a device without the source tree.
+The validation runs, all through the same contract:
+- **The headless suite**: the og2-core suite (73 tests: the contract
+  walk, the decoders' unit tests, the two reference vectors against the
+  real libvorbis's PCM) passes with the `audio-vorbis` and the
+  `audio-alsa` features; the docs suite passes.
+- **The ALSA hardware run** (Linux x86_64, the LucDev, the default PCM
+  device): `describe: alsa sample_rate=44100 channels=2 period=512`,
+  `alsa mixed frames: 12288`, `alsa violations: 0` — the sound left the
+  speakers.
+- **The Wine cross-build** (x86_64-pc-windows-gnu): the decoders and
+  the null backend run clean, and no ALSA line appears (the cfg gate
+  holds under the Windows target).
+- **The Windows hardware run** (DESKTOP-DFS7FIQ, Intel UHD Graphics,
+  the rustup GNU toolchain): the decoders and the null backend run
+  clean on the real machine.
+- **The macOS hardware run** (the A18 Pro): the decoders and the null
+  backend run clean.
+- **The Android hardware run** (the Galaxy A56, arm64, the NDK
+  30.0.16248370 through the `aarch64-linux-android24` linker): the full
+  cycle decodes both vectors on the real arm64 hardware with the
+  embedded vectors and pins the same 0.1316 peak.
+**The run's own findings, fixed in the same milestone**: the Android
+run's first attempt aborted on the missing test-vector files (the
+device has no source tree), fixed by embedding the vectors in the
+example binary (93 KB, ~800 KB of binary); the LucDev's rustc exposed
+the MDCT functions' `#[allow(non_snake_case)]` attached only to the
+containing type instead of each function, fixed by moving the
+attribute onto every function; and the cross-compiles for the
+windows-gnu and the aarch64-apple-darwin targets exposed the ALSA
+module compiling outside its unix gate, fixed by the
+`#[cfg(all(unix, feature = "audio-alsa"))]` the module now carries.
+---
 ## Lessons carried from OpenGrace
 
 The five lessons recorded at the close of OpenGrace's first full campaign

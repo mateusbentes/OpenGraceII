@@ -22,7 +22,7 @@ The `.docx` files in this directory are generated from the `.md` sources with
 | 7 | Post-processing chain: HDR, bloom, filmic tonemapping, depth of field, morphological anti-aliasing, SSAO-STF | Done (the HDR geometry pass and the five-effect composite pass run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
 | 8 | Global illumination by light volume propagation | Done (the radiance volume, the indirect term in the post chain and the set_light_volume texture cache run on all four backends — Vulkan and OpenGL on Linux hardware, Direct3D 12 on the Windows hardware run (Intel UHD) and under Wine with vkd3d, Metal on the A18 Pro's hardware run) |
 | 9 | Platform layer: the engine's own windowing, input and events, replacing SDL2 | Done (the X11 platform backend runs on Linux hardware — the Xvfb validation and the windowed Vulkan swapchain's acquire/present cycle confirmed; the full D3D12 suite runs on the real Windows hardware (Intel UHD) through the run-tests.bat runner; the Win32 and the Cocoa backends follow in a later milestone) |
-| 10 | Audio: the engine's own backend per platform, the WAV and Ogg Vorbis decoders | Done (the audio contract with the deterministic null backend, the engine's own WAV and Ogg Vorbis decoders and the three real backends run on all four platforms — ALSA on Linux hardware, WASAPI on the Windows hardware (Intel UHD) and under Wine, CoreAudio on the A18 Pro's macOS run, each mixing through the same loop with zero violations; the AAudio backend follows with the Android minSdk decision) |
+| 10 | Audio: the engine's own backend per platform, the WAV and Ogg Vorbis decoders | Done (the audio contract with the deterministic null backend, the engine's own WAV and Ogg Vorbis decoders and the four real backends run on all four platforms — ALSA on Linux hardware, WASAPI on the Windows hardware (Intel UHD) and under Wine, CoreAudio on the A18 Pro's macOS run, AAudio on the Galaxy A56's Android run, each mixing through the same loop with zero violations; the AAudio path's dlopen keeps the build's minSdk at 24) |
 | 11 | Physics: the classical layer and the extra layer, in the engine's own code | Planned |
 | 12 | Scripting: the engine's own scripting language and VM | Planned |
 | 13 | Visual scripting: the graph representation on the engine's own language | Planned |
@@ -895,12 +895,27 @@ rate and channels, and the render callback the OS's render thread pulls
 the frames through (the pending queue's cap keeps the latency bounded;
 the short fill renders the honest silence). Gated behind
 `#[cfg(all(target_os = "macos", feature = "audio-coreaudio"))]`.
+**The AAudio backend**: the engine's own loader (dlopen of the
+platform's libaaudio.so, the ALSA loader's own surface),
+`AAudio_createStreamBuilder` with the output direction, the shared
+mode, the interleaved s16 format at the config's rate and channels and
+the device buffer at four periods, `AAudioStreamBuilder_openStream` and
+the builder's delete, `AAudioStream_requestStart`, and the blocking
+`AAudioStream_write` pushing each mixed block (the same polling-write
+model the WASAPI and the ALSA backends carry; the engine keeps no
+callback thread of its own), and `AAudioStream_close` in the `Drop`.
+The dlopen surface keeps the build's minSdk at 24: the library exists
+from API 26 onward, and the machines before it report the open error
+and stay on the null path (the same graceful-skip rule the CoreAudio
+backend follows when the device is missing). Gated behind
+`#[cfg(all(target_os = "android", feature = "audio-aaudio"))]`.
 **The integration test** (`audio_smoke`): the null walk (the contract's
 voices, the placements, the listener, the deterministic mix and its
 pinned peaks), the WAV decode (44.1 kHz mono, 44100 frames), the Vorbis
 decode (48 kHz mono, 24000 frames, the peak 0.1316 pinned) and — when the
 platform's audio feature is enabled and the device opens — the real
-mix through the ALSA, the WASAPI or the CoreAudio backend's own loop
+mix through the ALSA, the WASAPI, the CoreAudio or the AAudio backend's
+own loop
 (the same mix arithmetic every backend runs). The test vectors embed
 with `include_bytes!` so the example runs standalone on a device
 without the source tree.
@@ -926,10 +941,17 @@ The validation runs, all through the same contract:
   mixes through the default output unit —
   `describe: coreaudio sample_rate=44100 channels=2 period=512`,
   `coreaudio mixed frames: 12288`, `coreaudio violations: 0`.
-- **The Android hardware run** (the Galaxy A56, arm64, the NDK
+- **The Android decoder run** (the Galaxy A56, arm64, the NDK
   30.0.16248370 through the `aarch64-linux-android24` linker): the full
   cycle decodes both vectors on the real arm64 hardware with the
   embedded vectors and pins the same 0.1316 peak.
+- **The Android hardware run** (the same Galaxy A56, Android 8.0's
+  AAudio onward): the AAudio backend mixes through the platform's own
+  stream —
+  `describe: aaudio sample_rate=44100 channels=2 period=512`,
+  `aaudio mixed frames: 12288`, `aaudio violations: 0` — on the
+  committed 10e tree, with the ALSA regression re-run clean beside it
+  (the same 12288 frames, `violations: 0`, the 73-test suite passing).
 **The run's own findings, fixed in the same milestone**: the Android
 run's first attempt aborted on the missing test-vector files (the
 device has no source tree), fixed by embedding the vectors in the
